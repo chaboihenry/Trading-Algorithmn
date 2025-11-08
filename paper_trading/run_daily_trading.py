@@ -29,7 +29,7 @@ import sys
 # Add parent directory to path for imports
 sys.path.append(str(Path(__file__).parent.parent))
 
-from strategies.pairs_paper_trading import PairsPaperTrader
+from paper_trading.pairs_paper_trading import PairsPaperTrader
 
 # Configure logging
 log_dir = Path(__file__).parent / 'logs'
