@@ -1,6 +1,0 @@
-__pycache__/
-*.pyc
-logs/
-.DS_Store
-api_keys.rtf
-.claude/
