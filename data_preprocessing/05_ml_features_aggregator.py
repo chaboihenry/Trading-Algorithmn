@@ -107,8 +107,8 @@ class MLFeaturesAggregator:
         conn = self._get_db_connection()
 
         query = """
-            SELECT price_date, close_price
-            FROM price_data
+            SELECT price_date, close
+            FROM raw_price_data
             WHERE symbol_ticker = ?
             ORDER BY price_date DESC
             LIMIT ?
@@ -121,9 +121,9 @@ class MLFeaturesAggregator:
             return pd.DataFrame()
 
         df = df.sort_values('price_date')
-        df['return_1d'] = df['close_price'].pct_change()
-        df['return_5d'] = df['close_price'].pct_change(periods=5)
-        df['return_20d'] = df['close_price'].pct_change(periods=20)
+        df['return_1d'] = df['close'].pct_change()
+        df['return_5d'] = df['close'].pct_change(periods=5)
+        df['return_20d'] = df['close'].pct_change(periods=20)
 
         return df[['price_date', 'return_1d', 'return_5d', 'return_20d']]
 
@@ -141,7 +141,8 @@ class MLFeaturesAggregator:
                 bb_upper,
                 bb_middle,
                 bb_lower,
-                bb_width
+                bb_width,
+                atr_14
             FROM technical_indicators
             WHERE symbol_ticker = ?
             ORDER BY indicator_date DESC
@@ -166,14 +167,15 @@ class MLFeaturesAggregator:
 
         query = """
             SELECT
-                metric_date,
-                volatility_10d,
-                volatility_20d,
-                volatility_30d,
-                atr_14
+                vol_date,
+                close_to_close_vol_10d,
+                close_to_close_vol_20d,
+                close_to_close_vol_60d,
+                yang_zhang_vol_10d,
+                yang_zhang_vol_20d
             FROM volatility_metrics
             WHERE symbol_ticker = ?
-            ORDER BY metric_date DESC
+            ORDER BY vol_date DESC
             LIMIT ?
         """
 
@@ -182,6 +184,14 @@ class MLFeaturesAggregator:
 
         if df.empty:
             return pd.DataFrame()
+
+        # Rename columns to match expected names
+        df.rename(columns={
+            'vol_date': 'metric_date',
+            'close_to_close_vol_10d': 'volatility_10d',
+            'close_to_close_vol_20d': 'volatility_20d',
+            'close_to_close_vol_60d': 'volatility_30d'
+        }, inplace=True)
 
         # Determine volatility regime
         # High volatility: > 75th percentile
@@ -335,7 +345,7 @@ class MLFeaturesAggregator:
                 merged_df = pd.merge(merged_df, divergence_df, on='date', how='left')
 
         # Forward-fill missing data (common for sentiment/fundamentals)
-        merged_df = merged_df.fillna(method='ffill')
+        merged_df = merged_df.ffill()
 
         # Create lag features
         merged_df = self._create_lag_features(merged_df)
