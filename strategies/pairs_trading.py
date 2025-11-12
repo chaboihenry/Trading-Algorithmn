@@ -1,7 +1,7 @@
 """
 Enhanced Strategy 1: Statistical Arbitrage with Robust Statistical Tests
 =========================================================================
-Uses proper cointegration tests, Johansen test, and XGBoost for pair selection
+Uses proper cointegration tests and M1-optimized parallel processing
 """
 
 import pandas as pd
@@ -11,9 +11,9 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
+from m1_utils import ParallelProcessor  # M1 parallel processing
 import logging
 from scipy import stats
-from sklearn.ensemble import GradientBoostingClassifier
 
 logger = logging.getLogger(__name__)
 
