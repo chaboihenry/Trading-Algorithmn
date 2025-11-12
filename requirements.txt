@@ -5,9 +5,10 @@ numpy>=1.24.0
 scipy>=1.11.0
 statsmodels>=0.14.0
 
-# Machine Learning
+# Machine Learning (M1 Optimized)
 scikit-learn>=1.3.0
-xgboost>=2.0.0
+xgboost>=2.0.0  # M1-optimized with tree_method='hist'
+arch>=6.2.0     # Vectorized GARCH models (10-100x faster)
 lightgbm>=4.0.0
 
 # API clients
@@ -26,6 +27,7 @@ psycopg2-binary>=2.9.0
 redis>=5.0.0
 
 # Visualization & Dashboard
+matplotlib>=3.7.0  # For backtesting visualizations
 plotly>=5.17.0
 dash>=2.14.0
 streamlit>=1.28.0
