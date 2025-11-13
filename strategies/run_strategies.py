@@ -13,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from pairs_trading import PairsTradingStrategy
 from sentiment_trading import SentimentTradingStrategy
 from volatility_trading import VolatilityTradingStrategy
+from ensemble_strategy import EnsembleStrategy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -22,12 +23,13 @@ logger = logging.getLogger(__name__)
 
 
 def main():
-    """Run all strategies"""
+    """Run all strategies including ensemble"""
 
     strategies = [
         ("Pairs Trading", PairsTradingStrategy()),
         ("Sentiment Trading", SentimentTradingStrategy()),
-        ("Volatility Trading", VolatilityTradingStrategy())
+        ("Volatility Trading", VolatilityTradingStrategy()),
+        ("Ensemble Strategy", EnsembleStrategy())
     ]
 
     logger.info("="*60)
