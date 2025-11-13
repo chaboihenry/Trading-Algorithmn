@@ -53,7 +53,7 @@ class RelativeValuationCollector:
         """
         conn = self._get_db_connection()
         query = """
-            SELECT DISTINCT a.symbol_ticker, a.sector, a.industry
+            SELECT DISTINCT a.symbol_ticker, a.sector
             FROM assets a
             INNER JOIN fundamental_data f ON a.symbol_ticker = f.symbol_ticker
             WHERE a.asset_type = 'Stock'
