@@ -34,6 +34,13 @@ All strategies are highly optimized for M1 MacBook performance:
 - ✅ **Memory-efficient batch processing** - 50-70% less RAM usage
 - ✅ **Multi-core processing** with `n_jobs=-1` - Uses all performance cores
 
+### Risk Management Optimizations (NEW)
+- ✅ **Dynamic confidence thresholds** - Adapts to market volatility automatically
+- ✅ **Kelly Criterion position sizing** - Mathematically optimal capital allocation
+- ✅ **Market regime detection** - Uses VIX or SPY volatility for real-time adjustment
+- ✅ **Half-Kelly safety** - Reduces risk while maintaining geometric growth
+- ✅ **Integrated into base class** - All strategies benefit from risk management
+
 ### NumPy Vectorization (Built into Strategies)
 All M1 optimizations are integrated directly into each strategy:
 
@@ -86,6 +93,20 @@ Combines signals from all three base strategies using a sophisticated weighted v
 2. **Captures different market conditions**: Statistical arbitrage + ML + volatility regime
 3. **Higher confidence**: 100% agreement on all current signals
 4. **Better risk-adjusted returns**: Combines complementary approaches
+5. **Dynamic filtering**: Adaptive thresholds based on market volatility
+6. **Kelly position sizing**: Optimal capital allocation for long-term growth
+
+**Dynamic Filtering & Position Sizing**:
+The ensemble now includes sophisticated risk management:
+- 📊 **Market-adaptive thresholds**: 55-85% confidence based on VIX/volatility
+  - High volatility (>30%): 85% threshold (only extreme confidence)
+  - Normal volatility (15-25%): 65% threshold
+  - Low volatility (<15%): 55% threshold (accept more signals)
+- 💰 **Kelly Criterion**: Optimal position sizing based on edge
+  - Formula: f* = (p×b - q) / b where p = win probability, b = win/loss ratio
+  - Half-Kelly for safety (reduces risk while maintaining growth)
+  - Maximum 25% position cap, minimum 2% position floor
+- 🎯 **Risk-adjusted allocation**: Larger positions on high-confidence signals
 
 ### 1. Sentiment Trading (★ Optimized)
 **XGBoost trained on ALL historical data for balanced signals**
@@ -209,15 +230,15 @@ sqlite3 /Volumes/Vault/85_assets_prediction.db \
 ```
 strategies/
 ├── README.md                # This file
-├── base_strategy.py         # Base class (2.7 KB)
-├── ensemble_strategy.py     # Weighted voting (12 KB) ★ RECOMMENDED
+├── base_strategy.py         # Base class with dynamic filtering (12 KB) ★ NEW
+├── ensemble_strategy.py     # Weighted voting + Kelly sizing (13 KB) ★ RECOMMENDED
 ├── sentiment_trading.py     # XGBoost ML (14 KB) ★ FULLY OPTIMIZED
 ├── pairs_trading.py         # Statistical arbitrage (15 KB) ★ FULLY OPTIMIZED
 ├── volatility_trading.py    # GARCH + XGBoost (15 KB) ★ FULLY OPTIMIZED
 └── run_strategies.py        # Run all including ensemble (1.8 KB)
 ```
 
-All M1 optimizations (vectorization, memory efficiency, batch processing) are built directly into each strategy file.
+All M1 optimizations (vectorization, memory efficiency, batch processing) and risk management (dynamic filtering, Kelly sizing) are built directly into each strategy file.
 
 ## Performance Philosophy
 
