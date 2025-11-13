@@ -94,10 +94,26 @@ class SentimentTradingStrategy(BaseStrategy):
                 ed.eps_surprise_percent,
                 ed.reported_revenue,
                 ed.estimated_revenue,
+                -- Revenue surprise (derived)
+                CASE
+                    WHEN ed.estimated_revenue > 0 THEN
+                        ((ed.reported_revenue - ed.estimated_revenue) / ed.estimated_revenue) * 100
+                    ELSE NULL
+                END as revenue_surprise_percent,
                 -- INSIDER TRADING (added - aggregated)
                 it.insider_buy_count,
                 it.insider_sell_count,
-                it.insider_net_sentiment
+                it.insider_net_sentiment,
+                it.total_shares_traded,
+                it.insider_ownership_change,
+                -- OPTIONS DATA (added - key volatility signals)
+                od.implied_volatility_30d,
+                od.iv_percentile_1y,
+                od.put_call_ratio,
+                -- ECONOMIC INDICATORS (added - macro context)
+                ei.vix as market_vix,
+                ei.treasury_10y,
+                ei.yield_curve_10y_2y
             FROM ml_features mf
             LEFT JOIN raw_price_data rpd
                 ON mf.symbol_ticker = rpd.symbol_ticker
@@ -139,11 +155,30 @@ class SentimentTradingStrategy(BaseStrategy):
                     SUM(CASE WHEN transaction_type = 'buy' THEN 1 ELSE 0 END) as insider_buy_count,
                     SUM(CASE WHEN transaction_type = 'sell' THEN 1 ELSE 0 END) as insider_sell_count,
                     (SUM(CASE WHEN transaction_type = 'buy' THEN 1 ELSE 0 END) -
-                     SUM(CASE WHEN transaction_type = 'sell' THEN 1 ELSE 0 END)) as insider_net_sentiment
+                     SUM(CASE WHEN transaction_type = 'sell' THEN 1 ELSE 0 END)) as insider_net_sentiment,
+                    SUM(ABS(shares_traded)) as total_shares_traded,
+                    SUM(CASE WHEN transaction_type = 'buy' THEN shares_traded
+                             WHEN transaction_type = 'sell' THEN -shares_traded
+                             ELSE 0 END) as insider_ownership_change
                 FROM insider_trading
                 WHERE transaction_date >= date('now', '-90 days')
                 GROUP BY symbol_ticker
             ) it ON mf.symbol_ticker = it.symbol_ticker
+            LEFT JOIN (
+                SELECT symbol_ticker, options_date,
+                       implied_volatility_30d, iv_percentile_1y, put_call_ratio
+                FROM options_data
+                WHERE (symbol_ticker, options_date) IN (
+                    SELECT symbol_ticker, MAX(options_date)
+                    FROM options_data
+                    GROUP BY symbol_ticker
+                )
+            ) od ON mf.symbol_ticker = od.symbol_ticker
+            LEFT JOIN (
+                SELECT indicator_date, vix, treasury_10y, yield_curve_10y_2y
+                FROM economic_indicators
+                WHERE indicator_date = (SELECT MAX(indicator_date) FROM economic_indicators)
+            ) ei ON 1=1
             WHERE mf.sentiment_score IS NOT NULL
             ORDER BY mf.symbol_ticker, mf.feature_date
         """
@@ -225,19 +260,112 @@ class SentimentTradingStrategy(BaseStrategy):
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD EARNINGS SURPRISE FEATURES
-        earnings_features = ['eps_surprise_percent']  # Most important
+        # ADD EARNINGS SURPRISE FEATURES (revenue + EPS)
+        earnings_features = ['eps_surprise_percent', 'revenue_surprise_percent']
         for feat in earnings_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD INSIDER TRADING FEATURES
-        insider_features = ['insider_buy_count', 'insider_sell_count', 'insider_net_sentiment']
+        # ADD INSIDER TRADING FEATURES (expanded)
+        insider_features = [
+            'insider_buy_count', 'insider_sell_count', 'insider_net_sentiment',
+            'total_shares_traded', 'insider_ownership_change'
+        ]
         for feat in insider_features:
             if feat in df.columns:
                 df[feat] = df[feat].fillna(0)  # No insider trading = 0
                 feature_cols.append(feat)
+
+        # ADD OPTIONS DATA FEATURES (volatility signals)
+        options_features = ['implied_volatility_30d', 'iv_percentile_1y', 'put_call_ratio']
+        for feat in options_features:
+            if feat in df.columns:
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
+                feature_cols.append(feat)
+
+        # ADD ECONOMIC INDICATORS (macro context)
+        economic_features = ['market_vix', 'treasury_10y', 'yield_curve_10y_2y']
+        for feat in economic_features:
+            if feat in df.columns:
+                df[feat] = df[feat].ffill()  # Forward fill macro data
+                feature_cols.append(feat)
+
+        # === ADVANCED DERIVED FEATURES ===
+
+        # 1. Earnings momentum (EPS + Revenue surprise combined)
+        if 'eps_surprise_percent' in df.columns and 'revenue_surprise_percent' in df.columns:
+            df['earnings_momentum'] = (
+                df['eps_surprise_percent'].fillna(0) * 0.6 +
+                df['revenue_surprise_percent'].fillna(0) * 0.4
+            )
+            feature_cols.append('earnings_momentum')
+
+        # 2. Insider conviction (weighted by ownership change)
+        if 'insider_net_sentiment' in df.columns and 'total_shares_traded' in df.columns:
+            df['insider_conviction'] = (
+                df['insider_net_sentiment'] * np.log1p(df['total_shares_traded'].fillna(0))
+            )
+            feature_cols.append('insider_conviction')
+
+        # 3. Analyst-fundamental divergence (overvalued/undervalued signal)
+        if 'upside_to_target' in df.columns and 'pe_ratio' in df.columns:
+            # High upside with low PE = strong buy signal
+            df['value_opportunity'] = df['upside_to_target'].fillna(0) / (df['pe_ratio'].fillna(15) + 1)
+            feature_cols.append('value_opportunity')
+
+        # 4. Risk-adjusted sentiment (sentiment normalized by volatility)
+        if 'sentiment_score' in df.columns and 'volatility_20d' in df.columns:
+            df['risk_adj_sentiment'] = (
+                df['sentiment_score'] / (df['volatility_20d'].fillna(0.2) + 0.01)
+            )
+            feature_cols.append('risk_adj_sentiment')
+
+        # 5. Options market fear (put/call ratio × IV percentile)
+        if 'put_call_ratio' in df.columns and 'iv_percentile_1y' in df.columns:
+            df['options_fear_index'] = (
+                df['put_call_ratio'].fillna(1.0) * df['iv_percentile_1y'].fillna(50) / 100
+            )
+            feature_cols.append('options_fear_index')
+
+        # 6. Macro risk factor (VIX × yield curve inversion)
+        if 'market_vix' in df.columns and 'yield_curve_10y_2y' in df.columns:
+            # Negative yield curve + high VIX = recession risk
+            df['macro_risk'] = (
+                (df['market_vix'].fillna(20) / 100) *
+                (1 - df['yield_curve_10y_2y'].fillna(0.5))  # Inverted curve = risk
+            )
+            feature_cols.append('macro_risk')
+
+        # 7. Quality score (profitability + growth + stability)
+        if all(feat in df.columns for feat in ['profit_margin', 'revenue_growth', 'debt_to_equity']):
+            df['quality_score'] = (
+                df['profit_margin'].fillna(0) * 0.4 +
+                df['revenue_growth'].fillna(0) * 0.3 -
+                (df['debt_to_equity'].fillna(1) / 10) * 0.3  # Lower debt = better
+            )
+            feature_cols.append('quality_score')
+
+        # 8. Momentum × Quality interaction
+        if 'return_20d' in df.columns and 'quality_score' in df.columns:
+            df['momentum_quality'] = df['return_20d'] * df['quality_score']
+            feature_cols.append('momentum_quality')
+
+        # 9. Analyst-Insider agreement
+        if 'upside_to_target' in df.columns and 'insider_net_sentiment' in df.columns:
+            # Both positive or both negative = strong signal
+            df['analyst_insider_agree'] = (
+                np.sign(df['upside_to_target'].fillna(0)) *
+                np.sign(df['insider_net_sentiment'].fillna(0))
+            )
+            feature_cols.append('analyst_insider_agree')
+
+        # 10. Relative IV rank (stock IV vs market VIX)
+        if 'implied_volatility_30d' in df.columns and 'market_vix' in df.columns:
+            df['relative_iv'] = (
+                df['implied_volatility_30d'].fillna(20) / (df['market_vix'].fillna(20) + 1)
+            )
+            feature_cols.append('relative_iv')
 
         # Drop rows with missing labels only
         df_clean = df.dropna(subset=['label'])
@@ -256,7 +384,15 @@ class SentimentTradingStrategy(BaseStrategy):
         X = df_clean[feature_cols].values
         y = df_clean['label'].values
 
-        logger.info(f"Using {len(feature_cols)} features (including fundamentals, analyst, earnings, insider)")
+        logger.info(f"Using {len(feature_cols)} features:")
+        logger.info(f"  - Core features: 20")
+        logger.info(f"  - Fundamentals: 10")
+        logger.info(f"  - Analyst ratings: 2")
+        logger.info(f"  - Earnings: 2")
+        logger.info(f"  - Insider trading: 5")
+        logger.info(f"  - Options data: 3")
+        logger.info(f"  - Economic indicators: 3")
+        logger.info(f"  - Advanced derived: 10+")
         return X, y, df_clean, feature_cols
 
     def _train_optimized_model(self, X: np.ndarray, y: np.ndarray) -> None:
