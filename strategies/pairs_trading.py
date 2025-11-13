@@ -22,7 +22,7 @@ class PairsTradingStrategy(BaseStrategy):
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
                  lookback_days: int = 60,
-                 zscore_entry: float = 2.0,
+                 zscore_entry: float = 1.5,
                  min_correlation: float = 0.7,
                  use_relative_valuation: bool = True):
         super().__init__(db_path)
@@ -322,15 +322,12 @@ class PairsTradingStrategy(BaseStrategy):
 
         # NumPy-optimized z-score calculation (3-5x faster)
         spread_values = spread.values
-        window = self.lookback_days
+        window = min(self.lookback_days, len(spread_values))
 
-        # Vectorized rolling mean and std using NumPy stride tricks
-        spread_mean = np.convolve(spread_values, np.ones(window)/window, mode='same')
-
-        # Vectorized rolling std
-        spread_sq = spread_values ** 2
-        rolling_sq_mean = np.convolve(spread_sq, np.ones(window)/window, mode='same')
-        spread_std = np.sqrt(rolling_sq_mean - spread_mean ** 2)
+        # Vectorized rolling mean and std using pandas (more reliable for varying lengths)
+        spread_series = pd.Series(spread_values)
+        spread_mean = spread_series.rolling(window, min_periods=1).mean().values
+        spread_std = spread_series.rolling(window, min_periods=1).std().values
 
         # Avoid division by zero
         spread_std = np.where(spread_std < 1e-10, 1e-10, spread_std)

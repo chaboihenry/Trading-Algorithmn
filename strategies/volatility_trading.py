@@ -87,25 +87,25 @@ class VolatilityTradingStrategy(BaseStrategy):
                 mf.return_20d,
                 rpd.close as current_price,
                 -- OPTIONS DATA (added)
-                od.implied_volatility_call,
-                od.implied_volatility_put,
-                od.option_volume_call,
-                od.option_volume_put,
-                od.open_interest_call,
-                od.open_interest_put,
+                od.implied_volatility_30d,
+                od.implied_volatility_60d,
+                od.implied_volatility_90d,
+                od.iv_percentile_1y,
+                od.iv_percentile_3y,
+                od.put_call_ratio,
                 od.put_call_ratio_volume,
                 od.put_call_ratio_oi,
-                od.iv_percentile_30d,
-                od.iv_percentile_1y,
-                od.iv_skew,
+                od.put_volume,
+                od.call_volume,
+                od.total_options_volume,
+                od.atm_iv,
+                od.skew_25delta,
                 -- ECONOMIC INDICATORS (added)
-                ei.vix_level,
-                ei.treasury_10y_yield,
-                ei.treasury_2y_yield,
-                ei.yield_curve_spread,
-                ei.sp500_return_1d,
-                ei.dollar_index,
-                ei.oil_price_return_5d
+                ei.vix,
+                ei.treasury_10y,
+                ei.treasury_2y,
+                ei.yield_curve_10y_2y,
+                ei.dollar_index
             FROM volatility_metrics vm
             LEFT JOIN technical_indicators ti
                 ON vm.symbol_ticker = ti.symbol_ticker
@@ -118,11 +118,11 @@ class VolatilityTradingStrategy(BaseStrategy):
                 AND vm.vol_date = rpd.price_date
             LEFT JOIN (
                 SELECT symbol_ticker, options_date,
-                       implied_volatility_call, implied_volatility_put,
-                       option_volume_call, option_volume_put,
-                       open_interest_call, open_interest_put,
-                       put_call_ratio_volume, put_call_ratio_oi,
-                       iv_percentile_30d, iv_percentile_1y, iv_skew
+                       implied_volatility_30d, implied_volatility_60d, implied_volatility_90d,
+                       iv_percentile_1y, iv_percentile_3y,
+                       put_call_ratio, put_call_ratio_volume, put_call_ratio_oi,
+                       put_volume, call_volume, total_options_volume,
+                       atm_iv, skew_25delta
                 FROM options_data
                 WHERE (symbol_ticker, options_date) IN (
                     SELECT symbol_ticker, MAX(options_date)
@@ -131,8 +131,8 @@ class VolatilityTradingStrategy(BaseStrategy):
                 )
             ) od ON vm.symbol_ticker = od.symbol_ticker
             LEFT JOIN (
-                SELECT indicator_date, vix_level, treasury_10y_yield, treasury_2y_yield,
-                       yield_curve_spread, sp500_return_1d, dollar_index, oil_price_return_5d
+                SELECT indicator_date, vix, treasury_10y, treasury_2y,
+                       yield_curve_10y_2y, dollar_index
                 FROM economic_indicators
                 WHERE (indicator_date) IN (
                     SELECT MAX(indicator_date) FROM economic_indicators
@@ -240,7 +240,8 @@ class VolatilityTradingStrategy(BaseStrategy):
         return df
 
     def _prepare_ml_features(self, df: pd.DataFrame) -> tuple:
-        """Prepare feature matrix for Random Forest"""
+        """Prepare feature matrix with ALL available features (including options and economic)"""
+        # Core volatility features
         feature_cols = [
             'close_to_close_vol_10d', 'close_to_close_vol_20d', 'close_to_close_vol_60d',
             'parkinson_vol_10d', 'parkinson_vol_20d',
@@ -251,22 +252,64 @@ class VolatilityTradingStrategy(BaseStrategy):
             'volatility_acceleration', 'volume_weighted_volatility',
             'abnormal_volume_count_20d', 'gap_frequency_60d',
             'rsi_14', 'atr_14', 'bb_width', 'adx_14',
-            'return_1d', 'return_5d', 'return_20d',
-            'garch_cond_vol', 'garch_forecast', 'vol_surprise'
+            'return_1d', 'return_5d', 'return_20d'
         ]
+
+        # Add GARCH features if available (many stocks may not have these)
+        garch_features = ['garch_cond_vol', 'garch_forecast', 'vol_surprise']
+        for feat in garch_features:
+            if feat in df.columns and df[feat].notna().sum() > 10:  # At least 10 non-null values
+                feature_cols.append(feat)
 
         # Convert volatility_trend to numeric
         trend_map = {'decreasing': -1, 'stable': 0, 'increasing': 1}
         df['volatility_trend_num'] = df['volatility_trend'].map(trend_map).fillna(0)
         feature_cols.append('volatility_trend_num')
 
-        # Clean data
-        df_clean = df.dropna(subset=feature_cols + ['regime_label'])
+        # Add OPTIONS features if available (forward fill within ticker)
+        options_features = [
+            'implied_volatility_30d', 'implied_volatility_60d', 'implied_volatility_90d',
+            'iv_percentile_1y', 'put_call_ratio', 'total_options_volume', 'atm_iv'
+        ]
+        for feat in options_features:
+            if feat in df.columns:
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
+                if df[feat].notna().sum() > 10:  # At least 10 non-null values
+                    feature_cols.append(feat)
 
-        X = df_clean[feature_cols].values
+        # Add ECONOMIC features if available (same for all tickers on same date)
+        economic_features = ['vix', 'treasury_10y', 'yield_curve_10y_2y']
+        for feat in economic_features:
+            if feat in df.columns:
+                df[feat] = df[feat].ffill()  # Forward fill economic data
+                if df[feat].notna().sum() > 10:
+                    feature_cols.append(feat)
+
+        # Clean data - only drop rows where regime_label is missing
+        df_clean = df.dropna(subset=['regime_label'])
+
+        # Fill remaining NaN with median (robust to outliers)
+        for col in feature_cols:
+            if col in df_clean.columns:
+                # Only calculate median if column has non-NaN values (prevents "mean of empty slice" warning)
+                if df_clean[col].notna().any():
+                    median_val = df_clean[col].median()
+                    df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
+                else:
+                    # Column is entirely NaN, fill with 0
+                    df_clean[col] = 0
+
+        # Final check - ensure we have these columns
+        available_cols = [col for col in feature_cols if col in df_clean.columns]
+
+        if len(available_cols) == 0:
+            return np.array([]), np.array([]), pd.DataFrame(), []
+
+        X = df_clean[available_cols].values
         y = df_clean['regime_label'].values
 
-        return X, y, df_clean
+        logger.info(f"Using {len(available_cols)} features for volatility regime prediction")
+        return X, y, df_clean, available_cols
 
     def _train_xgboost(self, X: np.ndarray, y: np.ndarray) -> None:
         """
@@ -360,12 +403,15 @@ class VolatilityTradingStrategy(BaseStrategy):
         # Create regime labels
         df = self._create_regime_labels(df)
 
-        # Prepare ML features
-        X, y, df_clean = self._prepare_ml_features(df)
+        # Prepare ML features (now returns feature_cols list)
+        X, y, df_clean, feature_cols = self._prepare_ml_features(df)
 
         if len(X) == 0:
             logger.warning("No valid features after cleaning")
             return pd.DataFrame()
+
+        # Store feature columns for prediction
+        self.feature_cols = feature_cols
 
         # Train XGBoost (2-3x faster than RandomForest on M1)
         self._train_xgboost(X, y)
@@ -383,23 +429,12 @@ class VolatilityTradingStrategy(BaseStrategy):
         # Get latest data for prediction
         latest_data = df_clean.groupby('symbol_ticker').tail(1)
 
-        # Prepare features
-        feature_cols = [
-            'close_to_close_vol_10d', 'close_to_close_vol_20d', 'close_to_close_vol_60d',
-            'parkinson_vol_10d', 'parkinson_vol_20d',
-            'garman_klass_vol_10d', 'garman_klass_vol_20d',
-            'yang_zhang_vol_10d', 'yang_zhang_vol_20d',
-            'realized_vol_percentile_1y', 'realized_vol_percentile_3y',
-            'volatility_of_volatility_20d', 'vol_clustering_index',
-            'volatility_acceleration', 'volume_weighted_volatility',
-            'abnormal_volume_count_20d', 'gap_frequency_60d',
-            'rsi_14', 'atr_14', 'bb_width', 'adx_14',
-            'return_1d', 'return_5d', 'return_20d',
-            'garch_cond_vol', 'garch_forecast', 'vol_surprise',
-            'volatility_trend_num'
-        ]
-
-        X_latest = latest_data[feature_cols].values
+        # Use the SAME feature columns from training, fill missing with 0
+        X_latest_list = []
+        for _, row in latest_data.iterrows():
+            row_features = [row.get(col, 0) for col in feature_cols]
+            X_latest_list.append(row_features)
+        X_latest = np.array(X_latest_list)
         X_latest_scaled = self.scaler.transform(X_latest)
 
         # Predict regime

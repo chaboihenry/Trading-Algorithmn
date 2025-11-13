@@ -83,20 +83,17 @@ class SentimentTradingStrategy(BaseStrategy):
                 fd.current_ratio,
                 fd.beta,
                 -- ANALYST RATINGS (added)
-                ar.consensus_rating,
-                ar.num_buy_ratings,
-                ar.num_hold_ratings,
-                ar.num_sell_ratings,
-                ar.price_target_mean,
-                ar.price_target_high,
-                ar.price_target_low,
+                ar.rating as analyst_rating,
+                ar.rating_numeric,
+                ar.price_target,
+                ar.upside_to_target,
                 -- EARNINGS (added)
-                ed.eps_actual,
-                ed.eps_estimate,
+                ed.reported_eps,
+                ed.estimated_eps,
                 ed.eps_surprise,
-                ed.eps_surprise_pct,
-                ed.revenue_actual,
-                ed.revenue_estimate,
+                ed.eps_surprise_percent,
+                ed.reported_revenue,
+                ed.estimated_revenue,
                 -- INSIDER TRADING (added - aggregated)
                 it.insider_buy_count,
                 it.insider_sell_count,
@@ -117,9 +114,8 @@ class SentimentTradingStrategy(BaseStrategy):
                 )
             ) fd ON mf.symbol_ticker = fd.symbol_ticker
             LEFT JOIN (
-                SELECT symbol_ticker, rating_date, consensus_rating,
-                       num_buy_ratings, num_hold_ratings, num_sell_ratings,
-                       price_target_mean, price_target_high, price_target_low
+                SELECT symbol_ticker, rating_date, rating, rating_numeric,
+                       price_target, upside_to_target
                 FROM analyst_ratings
                 WHERE (symbol_ticker, rating_date) IN (
                     SELECT symbol_ticker, MAX(rating_date)
@@ -128,8 +124,8 @@ class SentimentTradingStrategy(BaseStrategy):
                 )
             ) ar ON mf.symbol_ticker = ar.symbol_ticker
             LEFT JOIN (
-                SELECT symbol_ticker, earnings_date, eps_actual, eps_estimate,
-                       eps_surprise, eps_surprise_pct, revenue_actual, revenue_estimate
+                SELECT symbol_ticker, earnings_date, reported_eps, estimated_eps,
+                       eps_surprise, eps_surprise_percent, reported_revenue, estimated_revenue
                 FROM earnings_data
                 WHERE (symbol_ticker, earnings_date) IN (
                     SELECT symbol_ticker, MAX(earnings_date)
@@ -177,19 +173,19 @@ class SentimentTradingStrategy(BaseStrategy):
         quantiles = df['future_return_5d'].quantile([0.2, 0.4, 0.6, 0.8])
 
         conditions = [
-            df['future_return_5d'] <= quantiles[0.2],   # Bottom 20% = STRONG SELL
-            df['future_return_5d'] <= quantiles[0.4],   # 20-40% = SELL
-            df['future_return_5d'] <= quantiles[0.6],   # 40-60% = HOLD
-            df['future_return_5d'] <= quantiles[0.8],   # 60-80% = BUY
+            df['future_return_5d'] <= quantiles[0.2],   # Bottom 20% = STRONG SELL (0)
+            df['future_return_5d'] <= quantiles[0.4],   # 20-40% = SELL (1)
+            df['future_return_5d'] <= quantiles[0.6],   # 40-60% = HOLD (2)
+            df['future_return_5d'] <= quantiles[0.8],   # 60-80% = BUY (3)
         ]
-        choices = [-2, -1, 0, 1]
-        df['label'] = np.select(conditions, choices, default=2)  # Top 20% = STRONG BUY
+        choices = [0, 1, 2, 3]
+        df['label'] = np.select(conditions, choices, default=4)  # Top 20% = STRONG BUY (4)
 
         # Log distribution
         label_dist = df['label'].value_counts().sort_index()
         logger.info("Label distribution:")
         for label, count in label_dist.items():
-            label_name = {-2:'STRONG SELL', -1:'SELL', 0:'HOLD', 1:'BUY', 2:'STRONG BUY'}[label]
+            label_name = {0:'STRONG SELL', 1:'SELL', 2:'HOLD', 3:'BUY', 4:'STRONG BUY'}[label]
             logger.info(f"  {label_name}: {count} ({count/len(df)*100:.1f}%)")
 
         return df
@@ -223,30 +219,14 @@ class SentimentTradingStrategy(BaseStrategy):
                 feature_cols.append(feat)
 
         # ADD ANALYST RATING FEATURES
-        if 'consensus_rating' in df.columns:
-            # Convert consensus_rating to numeric: Buy=2, Hold=1, Sell=0
-            rating_map = {'Buy': 2, 'Hold': 1, 'Sell': 0, 'Strong Buy': 3, 'Strong Sell': -1}
-            df['consensus_rating_num'] = df['consensus_rating'].map(rating_map).fillna(1)
-            df['consensus_rating_num'] = df.groupby('symbol_ticker')['consensus_rating_num'].ffill()
-            feature_cols.append('consensus_rating_num')
-
-        analyst_features = [
-            'num_buy_ratings', 'num_hold_ratings', 'num_sell_ratings',
-            'price_target_mean', 'price_target_high', 'price_target_low'
-        ]
+        analyst_features = ['rating_numeric', 'upside_to_target']
         for feat in analyst_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # Calculate price target upside if available
-        if 'price_target_mean' in df.columns and 'current_price' in df.columns:
-            df['price_target_upside'] = (df['price_target_mean'] - df['current_price']) / df['current_price']
-            df['price_target_upside'] = df['price_target_upside'].fillna(0)
-            feature_cols.append('price_target_upside')
-
         # ADD EARNINGS SURPRISE FEATURES
-        earnings_features = ['eps_surprise_pct']  # Most important
+        earnings_features = ['eps_surprise_percent']  # Most important
         for feat in earnings_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
@@ -265,14 +245,19 @@ class SentimentTradingStrategy(BaseStrategy):
         # Fill remaining NaN with median (robust to outliers)
         for col in feature_cols:
             if col in df_clean.columns:
-                median_val = df_clean[col].median()
-                df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
+                # Only calculate median if column has non-NaN values (prevents "mean of empty slice" warning)
+                if df_clean[col].notna().any():
+                    median_val = df_clean[col].median()
+                    df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
+                else:
+                    # Column is entirely NaN, fill with 0
+                    df_clean[col] = 0
 
         X = df_clean[feature_cols].values
         y = df_clean['label'].values
 
         logger.info(f"Using {len(feature_cols)} features (including fundamentals, analyst, earnings, insider)")
-        return X, y, df_clean
+        return X, y, df_clean, feature_cols
 
     def _train_optimized_model(self, X: np.ndarray, y: np.ndarray) -> None:
         """
@@ -367,15 +352,15 @@ class SentimentTradingStrategy(BaseStrategy):
         # Create balanced labels
         df_labeled = self._create_balanced_labels(df)
 
-        # Prepare features (returns feature_cols list)
-        X, y, df_clean = self._prepare_features(df_labeled)
+        # Prepare features (now returns feature_cols list)
+        X, y, df_clean, feature_cols = self._prepare_features(df_labeled)
 
         if len(X) == 0:
             logger.warning("No valid features")
             return pd.DataFrame()
 
-        # Store feature columns for later use
-        self.feature_cols = df_clean.columns.tolist()
+        # Store feature columns for prediction
+        self.feature_cols = feature_cols
 
         # Train optimized model
         self._train_optimized_model(X, y)
@@ -383,12 +368,6 @@ class SentimentTradingStrategy(BaseStrategy):
         if self.model is None:
             logger.warning("Model training failed")
             return pd.DataFrame()
-
-        # Get feature columns from training (exclude non-feature columns)
-        excluded_cols = ['symbol_ticker', 'feature_date', 'current_price', 'label', 'future_return_5d',
-                        'fundamental_date', 'rating_date', 'earnings_date', 'transaction_date',
-                        'consensus_rating', 'volatility_regime']
-        feature_cols = [col for col in df_clean.columns if col not in excluded_cols]
 
         # Log feature importance
         importance = self._get_feature_importance(feature_cols)
@@ -399,7 +378,12 @@ class SentimentTradingStrategy(BaseStrategy):
         # Get latest data for each ticker
         latest_data = df_clean.groupby('symbol_ticker').tail(1)
 
-        X_latest = latest_data[feature_cols].values
+        # Use the SAME feature columns from training, fill missing with 0
+        X_latest_list = []
+        for _, row in latest_data.iterrows():
+            row_features = [row.get(col, 0) for col in feature_cols]
+            X_latest_list.append(row_features)
+        X_latest = np.array(X_latest_list)
         X_latest_scaled = self.scaler.transform(X_latest)
 
         # Predict with probabilities
@@ -411,9 +395,10 @@ class SentimentTradingStrategy(BaseStrategy):
         confidences = np.max(probabilities, axis=1)
 
         # Filter high-confidence predictions (vectorized)
+        # Labels: 0=STRONG SELL, 1=SELL, 2=HOLD, 3=BUY, 4=STRONG BUY
         high_conf_mask = confidences >= 0.6
-        buy_mask = (predictions >= 1) & high_conf_mask
-        sell_mask = (predictions <= -1) & high_conf_mask
+        buy_mask = (predictions >= 3) & high_conf_mask  # BUY (3) or STRONG BUY (4)
+        sell_mask = (predictions <= 1) & high_conf_mask  # SELL (1) or STRONG SELL (0)
 
         # Extract NumPy arrays (much faster than row access)
         symbols = latest_data['symbol_ticker'].values

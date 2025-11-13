@@ -48,18 +48,18 @@ class RelativeValuationCollector:
 
     def _get_sector_stocks(self) -> pd.DataFrame:
         """
-        Get stocks grouped by sector for meaningful comparisons
-        Only compare stocks within the same sector
+        Get stocks grouped by category for meaningful comparisons
+        Only compare stocks within the same category (sector)
         """
         conn = self._get_db_connection()
         query = """
-            SELECT DISTINCT a.symbol_ticker, a.sector
+            SELECT DISTINCT a.symbol_ticker, a.category as sector
             FROM assets a
             INNER JOIN fundamental_data f ON a.symbol_ticker = f.symbol_ticker
             WHERE a.asset_type = 'Stock'
-            AND a.sector IS NOT NULL
-            AND a.sector != ''
-            ORDER BY a.sector, a.symbol_ticker
+            AND a.category IS NOT NULL
+            AND a.category != ''
+            ORDER BY a.category, a.symbol_ticker
         """
         df = pd.read_sql(query, conn)
         conn.close()
@@ -125,9 +125,9 @@ class RelativeValuationCollector:
             SELECT
                 symbol_ticker,
                 price_date,
-                close_price,
+                close as close_price,
                 volume
-            FROM price_data
+            FROM raw_price_data
             WHERE symbol_ticker IN ({placeholders})
             AND price_date >= date('now', '-{lookback_days} days')
             ORDER BY symbol_ticker, price_date
