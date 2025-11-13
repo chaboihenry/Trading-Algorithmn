@@ -44,9 +44,10 @@ class EnsembleStrategy(BaseStrategy):
                  sentiment_weight: float = 0.40,
                  pairs_weight: float = 0.35,
                  volatility_weight: float = 0.25,
-                 min_agreement: float = 0.6):
+                 min_agreement: float = 0.6,
+                 use_regime_detection: bool = True):
         """
-        Initialize ensemble strategy
+        Initialize ensemble strategy with market regime detection
 
         Args:
             db_path: Path to database
@@ -54,20 +55,25 @@ class EnsembleStrategy(BaseStrategy):
             pairs_weight: Weight for pairs trading (default 35%)
             volatility_weight: Weight for volatility trading (default 25%)
             min_agreement: Minimum weighted agreement score to generate signal (default 60%)
+            use_regime_detection: Enable dynamic weight adjustment based on market regime (default True)
         """
         super().__init__(db_path)
         self.name = "EnsembleStrategy"
+        self.use_regime_detection = use_regime_detection
 
-        # Strategy weights
-        self.weights = {
+        # Base strategy weights (used when regime detection is off)
+        self.base_weights = {
             'sentiment': sentiment_weight,
             'pairs': pairs_weight,
             'volatility': volatility_weight
         }
 
-        # Normalize weights to sum to 1.0
-        total_weight = sum(self.weights.values())
-        self.weights = {k: v/total_weight for k, v in self.weights.items()}
+        # Normalize base weights to sum to 1.0
+        total_weight = sum(self.base_weights.values())
+        self.base_weights = {k: v/total_weight for k, v in self.base_weights.items()}
+
+        # Active weights (will be adjusted by regime if enabled)
+        self.weights = self.base_weights.copy()
 
         self.min_agreement = min_agreement
 
@@ -76,8 +82,186 @@ class EnsembleStrategy(BaseStrategy):
         self.pairs_strategy = PairsTradingStrategy(db_path)
         self.volatility_strategy = VolatilityTradingStrategy(db_path)
 
-        logger.info(f"Initialized EnsembleStrategy with weights: {self.weights}")
+        logger.info(f"Initialized EnsembleStrategy")
+        logger.info(f"Base weights: {self.base_weights}")
+        logger.info(f"Regime detection: {'ENABLED' if use_regime_detection else 'DISABLED'}")
         logger.info(f"Minimum agreement threshold: {min_agreement:.1%}")
+
+    def _get_vix_level(self) -> float:
+        """
+        Get current VIX level from economic indicators
+
+        Returns:
+            Current VIX value (e.g., 15.5, 25.3)
+        """
+        conn = self._conn()
+        try:
+            query = """
+                SELECT vix
+                FROM economic_indicators
+                WHERE vix IS NOT NULL
+                ORDER BY indicator_date DESC
+                LIMIT 1
+            """
+            result = pd.read_sql(query, conn)
+            conn.close()
+
+            if not result.empty:
+                return result['vix'].iloc[0]
+            return 20.0  # Default: moderate volatility
+
+        except Exception as e:
+            logger.warning(f"Could not fetch VIX: {e}")
+            conn.close()
+            return 20.0
+
+    def _get_spy_trend(self) -> float:
+        """
+        Get SPY trend using 20-day vs 50-day moving average
+
+        Returns:
+            Positive = uptrend, Negative = downtrend, value indicates strength
+        """
+        conn = self._conn()
+        try:
+            query = """
+                SELECT close, price_date
+                FROM raw_price_data
+                WHERE symbol_ticker = 'SPY'
+                ORDER BY price_date DESC
+                LIMIT 50
+            """
+            prices = pd.read_sql(query, conn)
+            conn.close()
+
+            if len(prices) < 50:
+                return 0.0
+
+            # Calculate moving averages
+            prices = prices.sort_values('price_date')
+            ma_20 = prices['close'].tail(20).mean()
+            ma_50 = prices['close'].mean()
+
+            # Trend strength: % difference between MAs
+            trend = ((ma_20 - ma_50) / ma_50) * 100
+
+            return trend
+
+        except Exception as e:
+            logger.warning(f"Could not calculate SPY trend: {e}")
+            conn.close()
+            return 0.0
+
+    def _detect_market_regime(self) -> str:
+        """
+        Detect current market regime based on VIX and SPY trend
+
+        Regimes:
+        - 'crisis': VIX > 30 (extreme fear, volatility strategy dominates)
+        - 'fearful': VIX > 20 (elevated fear, pairs trading works well)
+        - 'bullish': VIX < 15 and SPY uptrend (low fear + uptrend, sentiment excels)
+        - 'bearish': SPY downtrend (downtrend, short signals weighted higher)
+        - 'neutral': Default regime (balanced weights)
+
+        Returns:
+            Regime name as string
+        """
+        vix = self._get_vix_level()
+        spy_trend = self._get_spy_trend()
+
+        logger.info(f"Market conditions: VIX={vix:.1f}, SPY trend={spy_trend:+.2f}%")
+
+        # Crisis regime: extreme volatility
+        if vix > 30:
+            return 'crisis'
+
+        # Fearful regime: elevated volatility
+        elif vix > 20:
+            return 'fearful'
+
+        # Bullish regime: low volatility + uptrend
+        elif spy_trend > 0 and vix < 15:
+            return 'bullish'
+
+        # Bearish regime: downtrend
+        elif spy_trend < -1.0:  # More than 1% below 50-day MA
+            return 'bearish'
+
+        # Neutral regime: default
+        else:
+            return 'neutral'
+
+    def _get_regime_weights(self, regime: str) -> Dict[str, float]:
+        """
+        Get strategy weights optimized for current market regime
+
+        Different strategies perform better in different market conditions:
+        - Crisis: Volatility strategy captures sharp moves
+        - Fearful: Pairs trading exploits mean reversion
+        - Bullish: Sentiment strategy rides momentum
+        - Bearish: Pairs + volatility capture reversals
+        - Neutral: Balanced approach
+
+        Args:
+            regime: Market regime name
+
+        Returns:
+            Dictionary of strategy weights
+        """
+        regime_weights = {
+            'crisis': {
+                'volatility': 0.60,  # Volatility strategy dominates in crisis
+                'pairs': 0.30,       # Pairs capture dislocations
+                'sentiment': 0.10    # Sentiment less reliable
+            },
+            'fearful': {
+                'pairs': 0.50,       # Pairs work well in fear
+                'volatility': 0.30,  # Volatility captures swings
+                'sentiment': 0.20    # Reduced sentiment weight
+            },
+            'bullish': {
+                'sentiment': 0.50,   # Sentiment excels in bull markets
+                'pairs': 0.30,       # Pairs capture pullbacks
+                'volatility': 0.20   # Less volatility in calm markets
+            },
+            'bearish': {
+                'pairs': 0.40,       # Pairs capture mean reversion
+                'volatility': 0.40,  # Volatility captures downside
+                'sentiment': 0.20    # Sentiment less reliable
+            },
+            'neutral': {
+                'sentiment': 0.40,   # Base weights
+                'pairs': 0.35,
+                'volatility': 0.25
+            }
+        }
+
+        return regime_weights.get(regime, regime_weights['neutral'])
+
+    def _adjust_weights_for_regime(self):
+        """
+        Dynamically adjust strategy weights based on current market regime
+
+        Updates self.weights based on detected market conditions
+        """
+        if not self.use_regime_detection:
+            self.weights = self.base_weights.copy()
+            return
+
+        # Detect current regime
+        regime = self._detect_market_regime()
+
+        # Get optimal weights for this regime
+        regime_weights = self._get_regime_weights(regime)
+
+        # Update active weights
+        self.weights = regime_weights
+
+        logger.info(f"📊 Market regime: {regime.upper()}")
+        logger.info(f"Adjusted weights: {self.weights}")
+        logger.info(f"  - Sentiment: {self.weights['sentiment']:.1%}")
+        logger.info(f"  - Pairs: {self.weights['pairs']:.1%}")
+        logger.info(f"  - Volatility: {self.weights['volatility']:.1%}")
 
     def _get_strategy_signals(self) -> Dict[str, pd.DataFrame]:
         """
@@ -263,6 +447,7 @@ class EnsembleStrategy(BaseStrategy):
     def generate_signals(self) -> pd.DataFrame:
         """
         Generate ensemble signals using weighted voting with dynamic filtering
+        and market regime detection
 
         Returns:
             DataFrame with high-confidence ensemble signals with Kelly position sizing
@@ -271,10 +456,14 @@ class EnsembleStrategy(BaseStrategy):
         logger.info("ENSEMBLE STRATEGY EXECUTION")
         logger.info("="*60)
 
+        # Adjust weights based on market regime (if enabled)
+        logger.info("\n=== Market Regime Detection ===")
+        self._adjust_weights_for_regime()
+
         # Run all strategies
         strategy_signals = self._get_strategy_signals()
 
-        # Aggregate with weighted voting
+        # Aggregate with weighted voting (using regime-adjusted weights)
         ensemble_signals = self._aggregate_signals(strategy_signals)
 
         if not ensemble_signals.empty:
