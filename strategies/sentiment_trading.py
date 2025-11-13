@@ -33,6 +33,7 @@ class SentimentTradingStrategy(BaseStrategy):
     def _get_all_historical_data(self, batch_size: int = 10000) -> pd.DataFrame:
         """
         Memory-efficient data loading with batching for M1 optimization
+        NOW INCLUDES: Fundamentals, Analyst Ratings, Earnings, Insider Trading
 
         Args:
             batch_size: Number of rows to load per batch (default 10000)
@@ -69,11 +70,84 @@ class SentimentTradingStrategy(BaseStrategy):
                 mf.volatility_20d_norm,
                 mf.sentiment_score_norm,
                 -- Price for labeling
-                rpd.close as current_price
+                rpd.close as current_price,
+                -- FUNDAMENTALS (added)
+                fd.pe_ratio,
+                fd.price_to_book,
+                fd.price_to_sales,
+                fd.profit_margin,
+                fd.return_on_equity,
+                fd.revenue_growth,
+                fd.earnings_growth,
+                fd.debt_to_equity,
+                fd.current_ratio,
+                fd.beta,
+                -- ANALYST RATINGS (added)
+                ar.consensus_rating,
+                ar.num_buy_ratings,
+                ar.num_hold_ratings,
+                ar.num_sell_ratings,
+                ar.price_target_mean,
+                ar.price_target_high,
+                ar.price_target_low,
+                -- EARNINGS (added)
+                ed.eps_actual,
+                ed.eps_estimate,
+                ed.eps_surprise,
+                ed.eps_surprise_pct,
+                ed.revenue_actual,
+                ed.revenue_estimate,
+                -- INSIDER TRADING (added - aggregated)
+                it.insider_buy_count,
+                it.insider_sell_count,
+                it.insider_net_sentiment
             FROM ml_features mf
             LEFT JOIN raw_price_data rpd
                 ON mf.symbol_ticker = rpd.symbol_ticker
                 AND mf.feature_date = rpd.price_date
+            LEFT JOIN (
+                SELECT symbol_ticker, fundamental_date, pe_ratio, price_to_book, price_to_sales,
+                       profit_margin, return_on_equity, revenue_growth, earnings_growth,
+                       debt_to_equity, current_ratio, beta
+                FROM fundamental_data
+                WHERE (symbol_ticker, fundamental_date) IN (
+                    SELECT symbol_ticker, MAX(fundamental_date)
+                    FROM fundamental_data
+                    GROUP BY symbol_ticker
+                )
+            ) fd ON mf.symbol_ticker = fd.symbol_ticker
+            LEFT JOIN (
+                SELECT symbol_ticker, rating_date, consensus_rating,
+                       num_buy_ratings, num_hold_ratings, num_sell_ratings,
+                       price_target_mean, price_target_high, price_target_low
+                FROM analyst_ratings
+                WHERE (symbol_ticker, rating_date) IN (
+                    SELECT symbol_ticker, MAX(rating_date)
+                    FROM analyst_ratings
+                    GROUP BY symbol_ticker
+                )
+            ) ar ON mf.symbol_ticker = ar.symbol_ticker
+            LEFT JOIN (
+                SELECT symbol_ticker, earnings_date, eps_actual, eps_estimate,
+                       eps_surprise, eps_surprise_pct, revenue_actual, revenue_estimate
+                FROM earnings_data
+                WHERE (symbol_ticker, earnings_date) IN (
+                    SELECT symbol_ticker, MAX(earnings_date)
+                    FROM earnings_data
+                    GROUP BY symbol_ticker
+                )
+            ) ed ON mf.symbol_ticker = ed.symbol_ticker
+            LEFT JOIN (
+                SELECT
+                    symbol_ticker,
+                    SUM(CASE WHEN transaction_type = 'buy' THEN 1 ELSE 0 END) as insider_buy_count,
+                    SUM(CASE WHEN transaction_type = 'sell' THEN 1 ELSE 0 END) as insider_sell_count,
+                    (SUM(CASE WHEN transaction_type = 'buy' THEN 1 ELSE 0 END) -
+                     SUM(CASE WHEN transaction_type = 'sell' THEN 1 ELSE 0 END)) as insider_net_sentiment
+                FROM insider_trading
+                WHERE transaction_date >= date('now', '-90 days')
+                GROUP BY symbol_ticker
+            ) it ON mf.symbol_ticker = it.symbol_ticker
             WHERE mf.sentiment_score IS NOT NULL
             ORDER BY mf.symbol_ticker, mf.feature_date
         """
@@ -85,7 +159,7 @@ class SentimentTradingStrategy(BaseStrategy):
 
         df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         conn.close()
-        logger.info(f"Loaded {len(df)} historical records from database (batched)")
+        logger.info(f"Loaded {len(df)} historical records with fundamentals, analyst, earnings, and insider data")
         return df
 
     def _create_balanced_labels(self, df: pd.DataFrame) -> pd.DataFrame:
@@ -121,7 +195,8 @@ class SentimentTradingStrategy(BaseStrategy):
         return df
 
     def _prepare_features(self, df: pd.DataFrame) -> tuple:
-        """Prepare feature matrix"""
+        """Prepare feature matrix with ALL available data"""
+        # Original features
         feature_cols = [
             'sentiment_score', 'sentiment_ma_7d', 'sentiment_price_divergence',
             'return_1d', 'return_5d', 'return_20d',
@@ -136,11 +211,67 @@ class SentimentTradingStrategy(BaseStrategy):
         df['volatility_regime_num'] = df['volatility_regime'].map(regime_map).fillna(1)
         feature_cols.append('volatility_regime_num')
 
-        df_clean = df.dropna(subset=feature_cols + ['label'])
+        # ADD FUNDAMENTAL FEATURES (with forward fill for missing values)
+        fundamental_features = [
+            'pe_ratio', 'price_to_book', 'price_to_sales',
+            'profit_margin', 'return_on_equity', 'revenue_growth', 'earnings_growth',
+            'debt_to_equity', 'current_ratio', 'beta'
+        ]
+        for feat in fundamental_features:
+            if feat in df.columns:
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()  # Forward fill within ticker
+                feature_cols.append(feat)
+
+        # ADD ANALYST RATING FEATURES
+        if 'consensus_rating' in df.columns:
+            # Convert consensus_rating to numeric: Buy=2, Hold=1, Sell=0
+            rating_map = {'Buy': 2, 'Hold': 1, 'Sell': 0, 'Strong Buy': 3, 'Strong Sell': -1}
+            df['consensus_rating_num'] = df['consensus_rating'].map(rating_map).fillna(1)
+            df['consensus_rating_num'] = df.groupby('symbol_ticker')['consensus_rating_num'].ffill()
+            feature_cols.append('consensus_rating_num')
+
+        analyst_features = [
+            'num_buy_ratings', 'num_hold_ratings', 'num_sell_ratings',
+            'price_target_mean', 'price_target_high', 'price_target_low'
+        ]
+        for feat in analyst_features:
+            if feat in df.columns:
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
+                feature_cols.append(feat)
+
+        # Calculate price target upside if available
+        if 'price_target_mean' in df.columns and 'current_price' in df.columns:
+            df['price_target_upside'] = (df['price_target_mean'] - df['current_price']) / df['current_price']
+            df['price_target_upside'] = df['price_target_upside'].fillna(0)
+            feature_cols.append('price_target_upside')
+
+        # ADD EARNINGS SURPRISE FEATURES
+        earnings_features = ['eps_surprise_pct']  # Most important
+        for feat in earnings_features:
+            if feat in df.columns:
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
+                feature_cols.append(feat)
+
+        # ADD INSIDER TRADING FEATURES
+        insider_features = ['insider_buy_count', 'insider_sell_count', 'insider_net_sentiment']
+        for feat in insider_features:
+            if feat in df.columns:
+                df[feat] = df[feat].fillna(0)  # No insider trading = 0
+                feature_cols.append(feat)
+
+        # Drop rows with missing labels only
+        df_clean = df.dropna(subset=['label'])
+
+        # Fill remaining NaN with median (robust to outliers)
+        for col in feature_cols:
+            if col in df_clean.columns:
+                median_val = df_clean[col].median()
+                df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
 
         X = df_clean[feature_cols].values
         y = df_clean['label'].values
 
+        logger.info(f"Using {len(feature_cols)} features (including fundamentals, analyst, earnings, insider)")
         return X, y, df_clean
 
     def _train_optimized_model(self, X: np.ndarray, y: np.ndarray) -> None:
@@ -216,27 +347,17 @@ class SentimentTradingStrategy(BaseStrategy):
             zero_division=0
         ))
 
-    def _get_feature_importance(self) -> dict:
+    def _get_feature_importance(self, feature_cols: list) -> dict:
         """Get feature importance"""
         if self.model is None:
             return {}
 
-        feature_names = [
-            'sentiment_score', 'sentiment_ma_7d', 'sentiment_price_divergence',
-            'return_1d', 'return_5d', 'return_20d',
-            'rsi_14', 'macd', 'macd_histogram', 'bb_position',
-            'volatility_10d', 'volatility_20d',
-            'return_1d_lag1', 'return_1d_lag5', 'rsi_14_lag1',
-            'return_1d_norm', 'rsi_14_norm', 'volatility_20d_norm',
-            'sentiment_score_norm', 'volatility_regime_num'
-        ]
-
-        importance = dict(zip(feature_names, self.model.feature_importances_))
+        importance = dict(zip(feature_cols, self.model.feature_importances_))
         return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
 
     def generate_signals(self) -> pd.DataFrame:
-        """Generate ML-optimized trading signals"""
-        # Get ALL historical data
+        """Generate ML-optimized trading signals with ALL available data"""
+        # Get ALL historical data (with fundamentals, analyst, earnings, insider)
         df = self._get_all_historical_data()
 
         if df.empty:
@@ -246,12 +367,15 @@ class SentimentTradingStrategy(BaseStrategy):
         # Create balanced labels
         df_labeled = self._create_balanced_labels(df)
 
-        # Prepare features
+        # Prepare features (returns feature_cols list)
         X, y, df_clean = self._prepare_features(df_labeled)
 
         if len(X) == 0:
             logger.warning("No valid features")
             return pd.DataFrame()
+
+        # Store feature columns for later use
+        self.feature_cols = df_clean.columns.tolist()
 
         # Train optimized model
         self._train_optimized_model(X, y)
@@ -260,25 +384,20 @@ class SentimentTradingStrategy(BaseStrategy):
             logger.warning("Model training failed")
             return pd.DataFrame()
 
+        # Get feature columns from training (exclude non-feature columns)
+        excluded_cols = ['symbol_ticker', 'feature_date', 'current_price', 'label', 'future_return_5d',
+                        'fundamental_date', 'rating_date', 'earnings_date', 'transaction_date',
+                        'consensus_rating', 'volatility_regime']
+        feature_cols = [col for col in df_clean.columns if col not in excluded_cols]
+
         # Log feature importance
-        importance = self._get_feature_importance()
-        logger.info("\nTop 5 features:")
-        for feat, imp in list(importance.items())[:5]:
+        importance = self._get_feature_importance(feature_cols)
+        logger.info(f"\nTop 10 features (out of {len(feature_cols)}):")
+        for feat, imp in list(importance.items())[:10]:
             logger.info(f"  {feat}: {imp:.3f}")
 
         # Get latest data for each ticker
         latest_data = df_clean.groupby('symbol_ticker').tail(1)
-
-        # Prepare features
-        feature_cols = [
-            'sentiment_score', 'sentiment_ma_7d', 'sentiment_price_divergence',
-            'return_1d', 'return_5d', 'return_20d',
-            'rsi_14', 'macd', 'macd_histogram', 'bb_position',
-            'volatility_10d', 'volatility_20d',
-            'return_1d_lag1', 'return_1d_lag5', 'rsi_14_lag1',
-            'return_1d_norm', 'rsi_14_norm', 'volatility_20d_norm',
-            'sentiment_score_norm', 'volatility_regime_num'
-        ]
 
         X_latest = latest_data[feature_cols].values
         X_latest_scaled = self.scaler.transform(X_latest)

@@ -25,12 +25,12 @@ class PairsTradingStrategy(BaseStrategy):
                  lookback_days: int = 60,
                  zscore_entry: float = 2.0,
                  min_correlation: float = 0.7,
-                 use_ml_filter: bool = True):
+                 use_relative_valuation: bool = True):
         super().__init__(db_path)
         self.lookback_days = lookback_days
         self.zscore_entry = zscore_entry
         self.min_correlation = min_correlation
-        self.use_ml_filter = use_ml_filter
+        self.use_relative_valuation = use_relative_valuation
         self.name = "PairsTradingStrategy"
 
     def _get_price_data(self) -> pd.DataFrame:
@@ -44,6 +44,43 @@ class PairsTradingStrategy(BaseStrategy):
         """
         df = pd.read_sql(query, conn)
         conn.close()
+        return df
+
+    def _get_relative_valuation_data(self) -> pd.DataFrame:
+        """
+        Get latest relative valuation metrics for stock pairs
+        This provides fundamental-based pair selection and signal enhancement
+        """
+        conn = self._conn()
+        query = """
+            SELECT
+                rv.symbol_ticker_1,
+                rv.symbol_ticker_2,
+                rv.pe_ratio_relative,
+                rv.pb_ratio_relative,
+                rv.ps_ratio_relative,
+                rv.ev_ebitda_relative,
+                rv.profit_margin_relative,
+                rv.roe_relative,
+                rv.revenue_growth_relative,
+                rv.beta_relative,
+                rv.volatility_relative,
+                rv.market_cap_ratio,
+                rv.volume_ratio,
+                rv.liquidity_divergence_score,
+                rv.valuation_spread_percentile
+            FROM relative_valuation rv
+            INNER JOIN (
+                SELECT symbol_ticker_1, symbol_ticker_2, MAX(valuation_date) as max_date
+                FROM relative_valuation
+                GROUP BY symbol_ticker_1, symbol_ticker_2
+            ) latest ON rv.symbol_ticker_1 = latest.symbol_ticker_1
+                    AND rv.symbol_ticker_2 = latest.symbol_ticker_2
+                    AND rv.valuation_date = latest.max_date
+        """
+        df = pd.read_sql(query, conn)
+        conn.close()
+        logger.info(f"Loaded relative valuation data for {len(df)} stock pairs")
         return df
 
     def _augmented_dickey_fuller(self, series: np.ndarray, maxlag: int = 10) -> Tuple[float, float]:
@@ -125,9 +162,11 @@ class PairsTradingStrategy(BaseStrategy):
             return 0.0, 1.0, np.array([]), 0.0
 
     def _calculate_pair_quality_score(self, s1_prices: np.ndarray, s2_prices: np.ndarray,
-                                     correlation: float, p_value: float) -> float:
+                                     correlation: float, p_value: float,
+                                     s1: str = None, s2: str = None,
+                                     rel_val_data: pd.DataFrame = None) -> float:
         """
-        Calculate quality score for pair using multiple criteria
+        Calculate quality score for pair using multiple criteria including relative valuation
         Higher score = better pair
         """
         # Correlation score (0-1)
@@ -168,17 +207,59 @@ class PairsTradingStrategy(BaseStrategy):
         else:
             reversion_score = 0.5
 
-        # Combined score (weighted average)
-        total_score = (
-            0.3 * corr_score +
-            0.5 * coint_score +
-            0.2 * reversion_score
-        )
+        # Relative valuation score (NEW - incorporates fundamental data)
+        rel_val_score = 0.5  # Default neutral score
+        if self.use_relative_valuation and rel_val_data is not None and s1 and s2:
+            # Look up relative valuation metrics
+            pair_data = rel_val_data[
+                ((rel_val_data['symbol_ticker_1'] == s1) & (rel_val_data['symbol_ticker_2'] == s2)) |
+                ((rel_val_data['symbol_ticker_1'] == s2) & (rel_val_data['symbol_ticker_2'] == s1))
+            ]
+
+            if not pair_data.empty:
+                pair_row = pair_data.iloc[0]
+
+                # Check if similar characteristics (better for pairs trading)
+                # Prefer pairs with similar beta, market cap, and volatility
+                beta_rel = pair_row.get('beta_relative', 1.0)
+                mcap_ratio = pair_row.get('market_cap_ratio', 1.0)
+                vol_rel = pair_row.get('volatility_relative', 1.0)
+
+                # Similarity scores (closer to 1.0 = more similar)
+                beta_similarity = 1 - min(abs(np.log(beta_rel)) if beta_rel else 0, 1.0)
+                mcap_similarity = 1 - min(abs(np.log(mcap_ratio)) if mcap_ratio else 0, 0.5)
+                vol_similarity = 1 - min(abs(np.log(vol_rel)) if vol_rel else 0, 1.0)
+
+                # Valuation divergence (higher = more opportunity)
+                val_spread = pair_row.get('valuation_spread_percentile', 0)
+
+                # Combine scores
+                rel_val_score = (
+                    0.3 * beta_similarity +
+                    0.2 * mcap_similarity +
+                    0.2 * vol_similarity +
+                    0.3 * min(val_spread / 2, 1.0)  # Higher valuation spread = more opportunity
+                )
+
+        # Combined score (weighted average with relative valuation)
+        if self.use_relative_valuation and rel_val_score != 0.5:
+            total_score = (
+                0.25 * corr_score +
+                0.35 * coint_score +
+                0.15 * reversion_score +
+                0.25 * rel_val_score  # NEW: Fundamental overlay
+            )
+        else:
+            total_score = (
+                0.3 * corr_score +
+                0.5 * coint_score +
+                0.2 * reversion_score
+            )
 
         return total_score
 
-    def _find_cointegrated_pairs(self, prices: pd.DataFrame) -> List[Tuple[str, str, float, float, float]]:
-        """Find cointegrated pairs with quality scores"""
+    def _find_cointegrated_pairs(self, prices: pd.DataFrame, rel_val_data: pd.DataFrame = None) -> List[Tuple[str, str, float, float, float]]:
+        """Find cointegrated pairs with quality scores (enhanced with relative valuation)"""
         # Pivot to get price matrix
         price_matrix = prices.pivot(index='price_date', columns='symbol_ticker', values='close')
         price_matrix = price_matrix.ffill().dropna(axis=1)
@@ -204,9 +285,10 @@ class PairsTradingStrategy(BaseStrategy):
 
                     # Significant cointegration (p < 0.05)
                     if p_value < 0.05:
-                        # Calculate quality score
+                        # Calculate quality score with relative valuation overlay
                         quality_score = self._calculate_pair_quality_score(
-                            p1, p2, correlation, p_value
+                            p1, p2, correlation, p_value,
+                            s1=s1, s2=s2, rel_val_data=rel_val_data
                         )
 
                         pairs.append((s1, s2, correlation, p_value, quality_score))
@@ -275,11 +357,21 @@ class PairsTradingStrategy(BaseStrategy):
         return result.dropna()
 
     def generate_signals(self) -> pd.DataFrame:
-        """Generate enhanced pairs trading signals"""
+        """Generate enhanced pairs trading signals with relative valuation overlay"""
         prices = self._get_price_data()
 
-        # Find high-quality cointegrated pairs
-        pairs = self._find_cointegrated_pairs(prices)
+        # Load relative valuation data if enabled
+        rel_val_data = None
+        if self.use_relative_valuation:
+            try:
+                rel_val_data = self._get_relative_valuation_data()
+                logger.info(f"Using relative valuation data for {len(rel_val_data)} pairs")
+            except Exception as e:
+                logger.warning(f"Could not load relative valuation data: {e}")
+                logger.info("Continuing with cointegration-only analysis")
+
+        # Find high-quality cointegrated pairs (with fundamental overlay if available)
+        pairs = self._find_cointegrated_pairs(prices, rel_val_data)
 
         if len(pairs) == 0:
             logger.warning("No cointegrated pairs found")

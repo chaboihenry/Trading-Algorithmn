@@ -42,7 +42,7 @@ class VolatilityTradingStrategy(BaseStrategy):
         self.name = "VolatilityTradingStrategy"
 
     def _get_volatility_features(self) -> pd.DataFrame:
-        """Get comprehensive volatility features for ML model"""
+        """Get comprehensive volatility features for ML model with OPTIONS and ECONOMIC data"""
         conn = self._conn()
         query = f"""
             SELECT
@@ -85,7 +85,27 @@ class VolatilityTradingStrategy(BaseStrategy):
                 mf.return_1d,
                 mf.return_5d,
                 mf.return_20d,
-                rpd.close as current_price
+                rpd.close as current_price,
+                -- OPTIONS DATA (added)
+                od.implied_volatility_call,
+                od.implied_volatility_put,
+                od.option_volume_call,
+                od.option_volume_put,
+                od.open_interest_call,
+                od.open_interest_put,
+                od.put_call_ratio_volume,
+                od.put_call_ratio_oi,
+                od.iv_percentile_30d,
+                od.iv_percentile_1y,
+                od.iv_skew,
+                -- ECONOMIC INDICATORS (added)
+                ei.vix_level,
+                ei.treasury_10y_yield,
+                ei.treasury_2y_yield,
+                ei.yield_curve_spread,
+                ei.sp500_return_1d,
+                ei.dollar_index,
+                ei.oil_price_return_5d
             FROM volatility_metrics vm
             LEFT JOIN technical_indicators ti
                 ON vm.symbol_ticker = ti.symbol_ticker
@@ -96,11 +116,34 @@ class VolatilityTradingStrategy(BaseStrategy):
             LEFT JOIN raw_price_data rpd
                 ON vm.symbol_ticker = rpd.symbol_ticker
                 AND vm.vol_date = rpd.price_date
+            LEFT JOIN (
+                SELECT symbol_ticker, options_date,
+                       implied_volatility_call, implied_volatility_put,
+                       option_volume_call, option_volume_put,
+                       open_interest_call, open_interest_put,
+                       put_call_ratio_volume, put_call_ratio_oi,
+                       iv_percentile_30d, iv_percentile_1y, iv_skew
+                FROM options_data
+                WHERE (symbol_ticker, options_date) IN (
+                    SELECT symbol_ticker, MAX(options_date)
+                    FROM options_data
+                    GROUP BY symbol_ticker
+                )
+            ) od ON vm.symbol_ticker = od.symbol_ticker
+            LEFT JOIN (
+                SELECT indicator_date, vix_level, treasury_10y_yield, treasury_2y_yield,
+                       yield_curve_spread, sp500_return_1d, dollar_index, oil_price_return_5d
+                FROM economic_indicators
+                WHERE (indicator_date) IN (
+                    SELECT MAX(indicator_date) FROM economic_indicators
+                )
+            ) ei ON vm.vol_date = ei.indicator_date
             WHERE vm.vol_date >= date('now', '-{self.lookback_days} days')
             ORDER BY vm.symbol_ticker, vm.vol_date
         """
         df = pd.read_sql(query, conn)
         conn.close()
+        logger.info(f"Loaded {len(df)} volatility records with options and economic data")
         return df
 
     def _calculate_garch_features_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
