@@ -262,10 +262,10 @@ class EnsembleStrategy(BaseStrategy):
 
     def generate_signals(self) -> pd.DataFrame:
         """
-        Generate ensemble signals using weighted voting
+        Generate ensemble signals using weighted voting with dynamic filtering
 
         Returns:
-            DataFrame with high-confidence ensemble signals
+            DataFrame with high-confidence ensemble signals with Kelly position sizing
         """
         logger.info("="*60)
         logger.info("ENSEMBLE STRATEGY EXECUTION")
@@ -276,6 +276,15 @@ class EnsembleStrategy(BaseStrategy):
 
         # Aggregate with weighted voting
         ensemble_signals = self._aggregate_signals(strategy_signals)
+
+        if not ensemble_signals.empty:
+            # Apply dynamic filtering with Kelly Criterion position sizing
+            logger.info("\n=== Applying Dynamic Filtering & Kelly Sizing ===")
+            ensemble_signals = self.apply_dynamic_filtering(
+                ensemble_signals,
+                min_position_size=0.02,  # Minimum 2% position
+                portfolio_value=100000.0  # $100k default portfolio
+            )
 
         logger.info("="*60)
         return ensemble_signals
@@ -301,5 +310,13 @@ if __name__ == "__main__":
         print(f"\nSignal breakdown:")
         print(signals['signal_type'].value_counts())
         print(f"\nAverage confidence: {signals['strength'].mean():.1%}")
+
+        if 'position_size' in signals.columns:
+            print(f"Average position size: {signals['position_size'].mean():.1%}")
+            print(f"Total capital allocated: ${signals['position_value'].sum():,.0f}")
+
         print(f"\nTop 10 signals:")
-        print(signals[['symbol_ticker', 'signal_type', 'strength', 'entry_price']].head(10).to_string(index=False))
+        display_cols = ['symbol_ticker', 'signal_type', 'strength', 'entry_price']
+        if 'position_size' in signals.columns:
+            display_cols.append('position_size')
+        print(signals[display_cols].head(10).to_string(index=False))
