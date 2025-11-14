@@ -1,6 +1,6 @@
 """
-ML Features Aggregator
-======================
+ML Features Aggregator (ENHANCED)
+==================================
 
 CRITICAL: Aggregates all features into ml_features table
 This is the missing link between raw data and trading signals
@@ -13,6 +13,11 @@ Features Aggregated:
 - Lag features (t-1, t-5, t-20)
 - Normalized features using StandardScaler
 
+ENHANCEMENTS:
+- Intelligent data filling (no blind forward-fill)
+- Consistent lookback windows via DataConfig
+- Data quality validation
+
 Output: ml_features table ready for signal generation
 """
 
@@ -22,6 +27,12 @@ import numpy as np
 from datetime import datetime, timedelta
 from sklearn.preprocessing import StandardScaler
 import logging
+import sys
+from pathlib import Path
+
+# Add data_collectors to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent / 'data_collectors'))
+from data_infrastructure import DataConfig, get_data_quality_manager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -31,9 +42,10 @@ class MLFeaturesAggregator:
     """Aggregate all features into unified ML features table"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db"):
-        """Initialize aggregator"""
+        """Initialize aggregator with data quality manager"""
         self.db_path = db_path
-        logger.info(f"Initialized MLFeaturesAggregator")
+        self.data_quality = get_data_quality_manager()
+        logger.info(f"Initialized MLFeaturesAggregator (ENHANCED)")
         logger.info(f"Database: {db_path}")
 
     def _get_db_connection(self) -> sqlite3.Connection:
@@ -344,8 +356,28 @@ class MLFeaturesAggregator:
             if not divergence_df.empty:
                 merged_df = pd.merge(merged_df, divergence_df, on='date', how='left')
 
-        # Forward-fill missing data (common for sentiment/fundamentals)
-        merged_df = merged_df.ffill()
+        # Intelligent data filling (prevents artificial patterns)
+        # Apply column-specific filling strategies
+        for col in merged_df.columns:
+            if col == 'date':
+                continue  # Skip date column
+
+            # Determine fill strategy based on column type
+            if col == 'sentiment_score' or col.startswith('sentiment_'):
+                # Sentiment data: max 7 days forward-fill
+                merged_df[col] = self.data_quality.smart_fill(merged_df, col, method='ffill', limit=7)
+            elif col in ['rsi_14', 'macd', 'macd_signal', 'macd_histogram', 'bb_position']:
+                # Technical indicators: max 2 days interpolation
+                merged_df[col] = self.data_quality.smart_fill(merged_df, col, method='interpolate', limit=2)
+            elif col in ['volume']:
+                # Volume: never forward-fill (use zero)
+                merged_df[col] = self.data_quality.smart_fill(merged_df, col, method='zero', limit=0)
+            elif col.startswith('return_'):
+                # Returns: never forward-fill (interpolate very small gaps only)
+                merged_df[col] = self.data_quality.smart_fill(merged_df, col, method='interpolate', limit=1)
+            else:
+                # Default: conservative 3-day forward-fill
+                merged_df[col] = self.data_quality.smart_fill(merged_df, col, method='ffill', limit=3)
 
         # Create lag features
         merged_df = self._create_lag_features(merged_df)
