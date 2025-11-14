@@ -429,14 +429,16 @@ class SentimentTradingStrategy(BaseStrategy):
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
 
-        # XGBoost with M1 optimization
+        # XGBoost with M1 optimization + regularization to prevent overfitting
         self.model = xgb.XGBClassifier(
             n_estimators=200,
             learning_rate=0.05,
-            max_depth=5,
-            min_child_weight=4,
+            max_depth=4,                     # REDUCED from 5 to prevent overfitting
+            min_child_weight=5,              # INCREASED from 4 to prevent overfitting
             subsample=0.8,
             colsample_bytree=0.8,
+            reg_alpha=0.1,                   # L1 regularization (prevents overfitting)
+            reg_lambda=1.0,                  # L2 regularization (prevents overfitting)
             # M1 OPTIMIZATIONS
             tree_method='hist',              # Histogram-based algorithm (2-3x faster on M1)
             device='cpu',                    # Use M1's unified memory architecture

@@ -21,13 +21,15 @@ class PairsTradingStrategy(BaseStrategy):
     """Statistical arbitrage with rigorous cointegration testing"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
-                 lookback_days: int = 60,
-                 zscore_entry: float = 1.5,
+                 lookback_days: int = 120,        # INCREASED from 60 for more data
+                 zscore_entry: float = 1.5,       # KEPT at 1.5 (was 2.0 before)
+                 zscore_exit: float = 0.5,        # NEW: Tighter exit for more signals
                  min_correlation: float = 0.7,
                  use_relative_valuation: bool = True):
         super().__init__(db_path)
         self.lookback_days = lookback_days
         self.zscore_entry = zscore_entry
+        self.zscore_exit = zscore_exit
         self.min_correlation = min_correlation
         self.use_relative_valuation = use_relative_valuation
         self.name = "PairsTradingStrategy"
@@ -397,7 +399,8 @@ class PairsTradingStrategy(BaseStrategy):
             spread_percentile = latest['spread_percentile']
 
             # Long spread (short s1, long s2) when spread is very high
-            if zscore > self.zscore_entry and spread_percentile > 0.9:
+            # RELAXED from 0.9 to 0.80 for more signal opportunities
+            if zscore > self.zscore_entry and spread_percentile > 0.80:
                 signals.append({
                     'symbol_ticker': s1,
                     'signal_date': latest['price_date'],
@@ -420,7 +423,8 @@ class PairsTradingStrategy(BaseStrategy):
                 })
 
             # Short spread (long s1, short s2) when spread is very low
-            elif zscore < -self.zscore_entry and spread_percentile < 0.1:
+            # RELAXED from 0.1 to 0.20 for more signal opportunities
+            elif zscore < -self.zscore_entry and spread_percentile < 0.20:
                 signals.append({
                     'symbol_ticker': s1,
                     'signal_date': latest['price_date'],

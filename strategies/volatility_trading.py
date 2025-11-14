@@ -333,14 +333,16 @@ class VolatilityTradingStrategy(BaseStrategy):
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
 
-        # XGBoost with M1 optimization (2-3x faster than RandomForest)
+        # XGBoost with M1 optimization + regularization to prevent overfitting
         self.model = xgb.XGBClassifier(
             n_estimators=150,
             learning_rate=0.1,
-            max_depth=6,
-            min_child_weight=3,
+            max_depth=5,                     # REDUCED from 6 to prevent overfitting
+            min_child_weight=4,              # INCREASED from 3 to prevent overfitting
             subsample=0.8,
             colsample_bytree=0.8,
+            reg_alpha=0.1,                   # L1 regularization (prevents overfitting)
+            reg_lambda=1.0,                  # L2 regularization (prevents overfitting)
             # M1 OPTIMIZATIONS
             tree_method='hist',              # Histogram algorithm (M1 optimized)
             device='cpu',                    # M1 unified memory
