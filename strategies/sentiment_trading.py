@@ -12,6 +12,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
 import logging
 
+# Suppress FutureWarning for fillna downcasting (we're using recommended infer_objects)
+pd.set_option('future.no_silent_downcasting', True)
+
 # M1-optimized XGBoost
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
@@ -295,10 +298,9 @@ class SentimentTradingStrategy(BaseStrategy):
 
         # 1. Earnings momentum (EPS + Revenue surprise combined)
         if 'eps_surprise_percent' in df.columns and 'revenue_surprise_percent' in df.columns:
-            df['earnings_momentum'] = (
-                df['eps_surprise_percent'].fillna(0) * 0.6 +
-                df['revenue_surprise_percent'].fillna(0) * 0.4
-            )
+            eps_filled = df['eps_surprise_percent'].fillna(0).infer_objects(copy=False)
+            rev_filled = df['revenue_surprise_percent'].fillna(0).infer_objects(copy=False)
+            df['earnings_momentum'] = eps_filled * 0.6 + rev_filled * 0.4
             feature_cols.append('earnings_momentum')
 
         # 2. Insider conviction (weighted by ownership change)
@@ -339,10 +341,13 @@ class SentimentTradingStrategy(BaseStrategy):
 
         # 7. Quality score (profitability + growth + stability)
         if all(feat in df.columns for feat in ['profit_margin', 'revenue_growth', 'debt_to_equity']):
+            profit_filled = df['profit_margin'].fillna(0).infer_objects(copy=False)
+            growth_filled = df['revenue_growth'].fillna(0).infer_objects(copy=False)
+            debt_filled = df['debt_to_equity'].fillna(1).infer_objects(copy=False)
             df['quality_score'] = (
-                df['profit_margin'].fillna(0) * 0.4 +
-                df['revenue_growth'].fillna(0) * 0.3 -
-                (df['debt_to_equity'].fillna(1) / 10) * 0.3  # Lower debt = better
+                profit_filled * 0.4 +
+                growth_filled * 0.3 -
+                (debt_filled / 10) * 0.3  # Lower debt = better
             )
             feature_cols.append('quality_score')
 

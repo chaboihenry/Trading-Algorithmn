@@ -461,9 +461,12 @@ class EnsembleStrategy(BaseStrategy):
             lookback_days=90
         )
 
-        if historical_returns.empty or len(historical_returns) < 5:
-            logger.warning("Insufficient historical data for risk parity - using default weights")
+        if historical_returns.empty or len(historical_returns) < 2:
+            logger.warning(f"Insufficient historical data for risk parity (need ≥2 days, have {len(historical_returns)}) - using default weights")
             return
+
+        if len(historical_returns) < 5:
+            logger.info(f"Using risk parity with limited data ({len(historical_returns)} days). Results will improve as more history accumulates.")
 
         # Fill missing strategies with zeros
         for strategy in ['sentiment', 'pairs', 'volatility']:

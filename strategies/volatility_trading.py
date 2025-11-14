@@ -159,7 +159,7 @@ class VolatilityTradingStrategy(BaseStrategy):
                 mask = df['symbol_ticker'] == ticker
                 ticker_data = df[mask].sort_values('vol_date')
 
-                returns = ticker_data['return_1d'].fillna(0) * 100  # Scale for numerical stability
+                returns = ticker_data['return_1d'].fillna(0).infer_objects(copy=False) * 100  # Scale for numerical stability
 
                 if len(returns) < 30:  # Need minimum data for GARCH
                     continue
