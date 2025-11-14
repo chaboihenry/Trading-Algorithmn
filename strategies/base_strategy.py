@@ -242,6 +242,17 @@ class BaseStrategy(ABC):
             )
         """)
 
+        # Add missing columns to existing table (if they don't exist)
+        try:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN position_size REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        try:
+            conn.execute(f"ALTER TABLE {table_name} ADD COLUMN position_value REAL")
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
         # NumPy-optimized batch insert (10-50x faster than iterrows)
         # Prepare data as NumPy arrays (now includes position sizing)
         data = [
