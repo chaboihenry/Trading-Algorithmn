@@ -6,6 +6,12 @@ from datetime import datetime, timedelta
 from typing import List, Optional
 import logging
 import time
+import sys
+from pathlib import Path
+
+# Add data_collectors to path for imports
+sys.path.insert(0, str(Path(__file__).parent))
+from data_infrastructure import DataConfig, get_rate_limit_manager, get_data_quality_manager
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,25 +23,38 @@ class PriceDataCollector:
 
     Database: /Volumes/Vault/85_assets_prediction.db
     Table: raw_price_data
-    Data Source: Polygon.io (with yfinance fallback)
-    Time Period: 3 years (October 2022 - October 2025)
+    Data Source: Yahoo Finance (primary) with Polygon.io fallback
+    Time Period: Consistent with DataConfig (2 years for historical data)
+
+    IMPROVEMENTS:
+    - Yahoo Finance primary (60 calls/min vs Polygon 5 calls/min)
+    - Intelligent rate limiting via RateLimitManager
+    - Data quality validation
+    - Consistent lookback windows via DataConfig
     """
 
-    def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db") -> None:
+    def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
+                 use_yfinance_primary: bool = True) -> None:
         """Initialize the collector with database path"""
         self.db_path = db_path
+        self.use_yfinance_primary = use_yfinance_primary
 
         # Polygon.io API key
         self.polygon_api_key = "GqaA97fQfGJTiMc0KX4_kpUhuuhpd5NW"
         self.polygon_base_url = "https://api.polygon.io"
 
-        # Date range for 3 years of data
-        # Use yesterday as end date to ensure data availability
-        self.end_date = datetime.now() - timedelta(days=1)
-        self.start_date = self.end_date - timedelta(days=3*365)  # Approximately 3 years
+        # Use consistent date ranges from DataConfig
+        start_date, end_date = DataConfig.get_date_range('historical')
+        self.start_date = start_date
+        self.end_date = end_date
+
+        # Get singletons
+        self.rate_limiter = get_rate_limit_manager()
+        self.data_quality = get_data_quality_manager()
 
         logger.info(f"Initialized PriceDataCollector")
-        logger.info(f"Date range: {self.start_date.date()} to {self.end_date.date()}")
+        logger.info(f"Primary source: {'Yahoo Finance' if use_yfinance_primary else 'Polygon.io'}")
+        logger.info(f"Date range: {self.start_date.date()} to {self.end_date.date()} ({DataConfig.HISTORICAL_DAYS} days)")
 
     def _get_db_connection(self) -> sqlite3.Connection:
         """Create and return database connection"""
@@ -68,6 +87,9 @@ class PriceDataCollector:
             DataFrame with OHLCV data or None if failed
         """
         try:
+            # Rate limiting
+            self.rate_limiter.wait_if_needed('polygon')
+
             logger.info(f"Collecting data for {ticker} from Polygon.io")
 
             # Polygon.io aggregates endpoint
@@ -140,7 +162,7 @@ class PriceDataCollector:
 
     def collect_daily_ohlcv_yfinance(self, ticker: str, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
         """
-        Collect daily OHLCV data using yfinance (fallback method)
+        Collect daily OHLCV data using yfinance (primary/fallback method)
 
         Args:
             ticker: Stock/ETF ticker symbol
@@ -151,7 +173,10 @@ class PriceDataCollector:
             DataFrame with OHLCV data or None if failed
         """
         try:
-            logger.info(f"Collecting data for {ticker} from yfinance (fallback)")
+            # Rate limiting
+            self.rate_limiter.wait_if_needed('yfinance')
+
+            logger.info(f"Collecting data for {ticker} from Yahoo Finance")
 
             # Download data from yfinance
             data = yf.download(ticker, start=start_date, end=end_date, progress=False, auto_adjust=False)
@@ -204,19 +229,20 @@ class PriceDataCollector:
             logger.error(f"Error collecting data for {ticker} from yfinance: {str(e)}")
             return None
 
-    def collect_all_tickers(self, batch_size: int = 10, polygon_delay: int = 12) -> pd.DataFrame:
+    def collect_all_tickers(self, batch_size: int = 10) -> pd.DataFrame:
         """
         Collect price data for all tickers from the assets table
 
         Args:
             batch_size: Number of tickers to process before logging progress
-            polygon_delay: Delay in seconds between Polygon API calls (free tier: 5 calls/min = 12 sec delay)
 
         Returns:
             Combined DataFrame with all price data
         """
-        logger.info("Starting price data collection for all tickers")
-        logger.info(f"Polygon.io rate limit: 5 calls/min (12 second delay between calls)")
+        logger.info(f"\n{'='*60}")
+        logger.info(f"COLLECTING PRICE DATA FOR ALL TICKERS")
+        logger.info(f"Primary source: {'Yahoo Finance' if self.use_yfinance_primary else 'Polygon.io'}")
+        logger.info(f"{'='*60}\n")
 
         # Get all tickers from database
         tickers = self._get_all_tickers()
@@ -226,33 +252,70 @@ class PriceDataCollector:
         failed_tickers = []
         polygon_count = 0
         yfinance_count = 0
+        start_time = time.time()
 
         for idx, ticker in enumerate(tickers, 1):
-            # Try Polygon.io first
-            ticker_data = self.collect_daily_ohlcv(ticker, self.start_date, self.end_date)
+            logger.info(f"\n[{idx}/{len(tickers)}] Processing {ticker}...")
 
-            if ticker_data is not None and not ticker_data.empty:
-                all_data.append(ticker_data)
-                success_count += 1
-                polygon_count += 1
-                # Respect Polygon.io free tier rate limit (5 calls/min)
-                time.sleep(polygon_delay)
-            else:
-                # Fallback to yfinance
+            # Try primary source first
+            if self.use_yfinance_primary:
                 ticker_data = self.collect_daily_ohlcv_yfinance(ticker, self.start_date, self.end_date)
+                if ticker_data is not None and not ticker_data.empty:
+                    # Validate data quality
+                    is_valid, error_msg = self.data_quality.validate_data_quality(
+                        ticker_data,
+                        required_cols=['symbol_ticker', 'price_date', 'close', 'volume'],
+                        min_rows=DataConfig.MINIMUM_DATA_POINTS
+                    )
+                    if is_valid:
+                        all_data.append(ticker_data)
+                        success_count += 1
+                        yfinance_count += 1
+                        logger.info(f"✓ {ticker}: Collected {len(ticker_data)} rows from Yahoo Finance")
+                    else:
+                        logger.warning(f"{ticker}: Data quality issue - {error_msg}, trying Polygon fallback")
+                        ticker_data = None
 
+                # Fallback to Polygon if Yahoo failed
+                if ticker_data is None:
+                    logger.info(f"{ticker}: Trying Polygon.io fallback")
+                    ticker_data = self.collect_daily_ohlcv(ticker, self.start_date, self.end_date)
+                    if ticker_data is not None and not ticker_data.empty:
+                        all_data.append(ticker_data)
+                        success_count += 1
+                        polygon_count += 1
+                        logger.info(f"✓ {ticker}: Collected {len(ticker_data)} rows from Polygon.io")
+                    else:
+                        failed_tickers.append(ticker)
+                        logger.warning(f"✗ {ticker}: Failed to collect data")
+            else:
+                # Polygon primary, Yahoo fallback
+                ticker_data = self.collect_daily_ohlcv(ticker, self.start_date, self.end_date)
                 if ticker_data is not None and not ticker_data.empty:
                     all_data.append(ticker_data)
                     success_count += 1
-                    yfinance_count += 1
-                    # Shorter delay for yfinance
-                    time.sleep(1)
+                    polygon_count += 1
+                    logger.info(f"✓ {ticker}: Collected {len(ticker_data)} rows from Polygon.io")
                 else:
-                    failed_tickers.append(ticker)
+                    logger.info(f"{ticker}: Trying Yahoo Finance fallback")
+                    ticker_data = self.collect_daily_ohlcv_yfinance(ticker, self.start_date, self.end_date)
+                    if ticker_data is not None and not ticker_data.empty:
+                        all_data.append(ticker_data)
+                        success_count += 1
+                        yfinance_count += 1
+                        logger.info(f"✓ {ticker}: Collected {len(ticker_data)} rows from Yahoo Finance")
+                    else:
+                        failed_tickers.append(ticker)
+                        logger.warning(f"✗ {ticker}: Failed to collect data")
 
             # Log progress every batch_size tickers
             if idx % batch_size == 0:
-                logger.info(f"Progress: {idx}/{len(tickers)} tickers processed ({success_count} successful, Polygon: {polygon_count}, yfinance: {yfinance_count})")
+                elapsed = time.time() - start_time
+                rate = idx / elapsed if elapsed > 0 else 0
+                remaining = (len(tickers) - idx) / rate if rate > 0 else 0
+                logger.info(f"\nProgress: {idx}/{len(tickers)} ({idx/len(tickers)*100:.1f}%) | "
+                           f"Success: {success_count} | Failed: {len(failed_tickers)} | "
+                           f"Rate: {rate:.1f} tickers/sec | ETA: {remaining/60:.1f} min\n")
 
         # Combine all data
         if not all_data:
@@ -262,16 +325,21 @@ class PriceDataCollector:
         combined_df = pd.concat(all_data, axis=0, ignore_index=True)
         combined_df = combined_df.sort_values(['symbol_ticker', 'price_date'])
 
+        # Final summary
+        elapsed = time.time() - start_time
         logger.info(f"\n{'='*60}")
-        logger.info(f"Collection Summary:")
-        logger.info(f"  Total tickers: {len(tickers)}")
-        logger.info(f"  Successful: {success_count}")
-        logger.info(f"    - Polygon.io: {polygon_count}")
-        logger.info(f"    - yfinance: {yfinance_count}")
-        logger.info(f"  Failed: {len(failed_tickers)}")
+        logger.info(f"COLLECTION COMPLETE")
+        logger.info(f"{'='*60}")
+        logger.info(f"Total tickers: {len(tickers)}")
+        logger.info(f"Successful: {success_count} ({success_count/len(tickers)*100:.1f}%)")
+        logger.info(f"  - Yahoo Finance: {yfinance_count}")
+        logger.info(f"  - Polygon.io: {polygon_count}")
+        logger.info(f"Failed: {len(failed_tickers)} ({len(failed_tickers)/len(tickers)*100:.1f}%)")
         if failed_tickers:
-            logger.info(f"  Failed tickers: {', '.join(failed_tickers)}")
-        logger.info(f"  Total rows collected: {len(combined_df)}")
+            logger.info(f"Failed tickers: {', '.join(failed_tickers)}")
+        logger.info(f"Total rows collected: {len(combined_df)}")
+        logger.info(f"Time elapsed: {elapsed/60:.1f} minutes")
+        logger.info(f"Average rate: {len(tickers)/elapsed:.1f} tickers/second")
         logger.info(f"{'='*60}\n")
 
         return combined_df
@@ -396,8 +464,8 @@ class PriceDataCollector:
 
 
 if __name__ == "__main__":
-    # Initialize collector
-    collector = PriceDataCollector()
+    # Initialize collector with Yahoo Finance as primary source (faster, better rate limits)
+    collector = PriceDataCollector(use_yfinance_primary=True)
 
     print(f"\n{'='*60}")
     print(f"Price Data Collection Script")
