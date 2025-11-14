@@ -32,7 +32,7 @@ from pathlib import Path
 
 # Add data_collectors to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent / 'data_collectors'))
-from data_infrastructure import DataConfig, get_data_quality_manager
+from data_infrastructure import DataConfig, get_data_quality_manager, get_data_validator
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -42,9 +42,10 @@ class MLFeaturesAggregator:
     """Aggregate all features into unified ML features table"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db"):
-        """Initialize aggregator with data quality manager"""
+        """Initialize aggregator with data quality manager and validator"""
         self.db_path = db_path
         self.data_quality = get_data_quality_manager()
+        self.data_validator = get_data_validator()
         logger.info(f"Initialized MLFeaturesAggregator (ENHANCED)")
         logger.info(f"Database: {db_path}")
 
@@ -384,6 +385,9 @@ class MLFeaturesAggregator:
 
         # Normalize features
         merged_df = self._normalize_features(merged_df)
+
+        # Validate data and cap outliers (prevents garbage data from breaking models)
+        merged_df = self.data_validator.validate_dataframe(merged_df, log_outliers=True)
 
         # Drop rows with NaN in critical features
         merged_df = merged_df.dropna(subset=['return_1d'])
