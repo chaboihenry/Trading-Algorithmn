@@ -59,8 +59,8 @@ daily_schedule:
     time: "09:40:00"
     tier: 3
     dependencies: ["Asset Collection"]
-    max_runtime_seconds: 300
-    critical: true
+    max_runtime_seconds: 900
+    critical: false
 
   - name: "Earnings Data"
     script: "data_collectors/06_collect_earnings.py"
