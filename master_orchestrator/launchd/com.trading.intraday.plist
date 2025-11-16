@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Job Label -->
+    <key>Label</key>
+    <string>com.trading.intraday</string>
+
+    <!-- Program to run (intraday runner in continuous mode) -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/henry/Desktop/Programming &amp; Networking/Personal Projects/Integrated Trading Agent/master_orchestrator/launchd/wait_and_run_intraday.sh</string>
+    </array>
+
+    <!-- Working Directory -->
+    <key>WorkingDirectory</key>
+    <string>/Users/henry/Desktop/Programming &amp; Networking/Personal Projects/Integrated Trading Agent</string>
+
+    <!-- Run every day at 9:30 AM ET -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <!-- Standard Output -->
+    <key>StandardOutPath</key>
+    <string>/tmp/trading_intraday.log</string>
+
+    <!-- Standard Error -->
+    <key>StandardErrorPath</key>
+    <string>/tmp/trading_intraday_error.log</string>
+
+    <!-- Run at load (for testing) -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Environment Variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/henry/miniconda3/envs/trading/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>
