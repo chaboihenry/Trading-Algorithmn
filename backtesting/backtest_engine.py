@@ -81,11 +81,11 @@ class BacktestEngine:
             print(f"{'='*80}")
 
             if quick:
-                result = self.validator.quick_validation(strategy_name)
+                result = self.strategy_validator.quick_validation(strategy_name)
             else:
                 # For walk-forward, we need to implement strategy-specific logic
                 # For now, use quick validation
-                result = self.validator.quick_validation(strategy_name)
+                result = self.strategy_validator.quick_validation(strategy_name)
 
             results[strategy_name] = result
 
