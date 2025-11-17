@@ -9,8 +9,8 @@
     <!-- Program to run (intraday runner in continuous mode) -->
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/henry/Desktop/Programming &amp; Networking/Personal Projects/Integrated Trading Agent/master_orchestrator/launchd/wait_and_run_intraday.sh</string>
+        <string>/Users/henry/miniconda3/envs/trading/bin/python</string>
+        <string>/Users/henry/Desktop/Programming &amp; Networking/Personal Projects/Integrated Trading Agent/master_orchestrator/launchd/wait_and_run_intraday.py</string>
     </array>
 
     <!-- Working Directory -->
