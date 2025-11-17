@@ -96,6 +96,15 @@ daily_schedule:
     max_runtime_seconds: 180
     critical: true
 
+  # Tier 6: Strategy Validation & Daily Report (needs tier 5)
+  - name: "Validate Strategies & Generate Report"
+    script: "backtesting/report_generator.py"
+    time: "10:00:00"
+    tier: 6
+    dependencies: ["Generate Trading Signals"]
+    max_runtime_seconds: 300
+    critical: false
+
 intraday_schedule:
   # Continuous tasks (9:30 AM - 4:00 PM ET)
   - name: "Price Data"
@@ -136,6 +145,16 @@ intraday_schedule:
     critical: true
     market_hours_only: true
     args: ["--incremental"]
+
+  # Signal Quality Monitoring (hourly during market hours)
+  - name: "Signal Quality Monitoring"
+    script: "backtesting/monitor_signal_quality.py"
+    interval_minutes: 60
+    tier: 2
+    dependencies: ["ML Features Update"]
+    max_runtime_seconds: 180
+    critical: false
+    market_hours_only: true
 
 # Market hours configuration (Eastern Time)
 market_hours:

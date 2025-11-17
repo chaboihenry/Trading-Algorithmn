@@ -1,10 +1,12 @@
 """
-Walk-Forward Analysis for Time Series Validation
+Strategy Validator with Walk-Forward Analysis
 
-Implements rolling window validation to prevent lookahead bias:
+Validates individual trading strategies using time series analysis:
 - 1 year training windows
 - 3 month testing windows
 - Tests strategies across different market regimes
+- Quick validation mode for development
+- Statistical significance testing
 """
 
 import numpy as np
@@ -21,8 +23,8 @@ sys.path.append(str(Path(__file__).parent.parent))
 from backtesting.metrics_calculator import MetricsCalculator
 
 
-class WalkForwardValidator:
-    """Walk-forward analysis for time series validation"""
+class StrategyValidator:
+    """Validates individual trading strategies with walk-forward analysis"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
                  train_months: int = 12,

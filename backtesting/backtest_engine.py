@@ -22,12 +22,14 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 from backtesting.metrics_calculator import MetricsCalculator
-from backtesting.walk_forward_validator import WalkForwardValidator
+from backtesting.strategy_validator import StrategyValidator
+from backtesting.ensemble_validator import EnsembleValidator
 from backtesting.trade_ranker import TradeRanker
+from backtesting.report_generator import ReportGenerator
 
 
 class BacktestEngine:
-    """Streamlined backtesting engine"""
+    """Streamlined backtesting engine - main orchestrator"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db"):
         """
@@ -36,8 +38,10 @@ class BacktestEngine:
         """
         self.db_path = db_path
         self.metrics_calc = MetricsCalculator()
-        self.validator = WalkForwardValidator(db_path)
+        self.strategy_validator = StrategyValidator(db_path)
+        self.ensemble_validator = EnsembleValidator(db_path)
         self.ranker = TradeRanker(db_path)
+        self.report_generator = ReportGenerator(db_path)
 
     # ========== Strategy Validation ==========
 
@@ -135,11 +139,11 @@ class BacktestEngine:
             Validation results
         """
         if quick:
-            return self.validator.quick_validation(strategy_name)
+            return self.strategy_validator.quick_validation(strategy_name)
         else:
             # Full walk-forward would require strategy-specific train/predict functions
             # For existing signals, use quick validation
-            return self.validator.quick_validation(strategy_name)
+            return self.strategy_validator.quick_validation(strategy_name)
 
     # ========== Trade Selection ==========
 
@@ -411,11 +415,33 @@ class BacktestEngine:
 
         return results
 
+    # ========== Daily Report Generation ==========
+
+    def generate_daily_report(self, num_trades: int = 5,
+                             total_capital: float = 100_000,
+                             output_dir: str = "backtesting/results") -> Dict[str, any]:
+        """
+        Generate comprehensive daily trading report
+
+        Args:
+            num_trades: Number of top trades to recommend
+            total_capital: Total available capital
+            output_dir: Directory to save reports
+
+        Returns:
+            Report data and file paths
+        """
+        return self.report_generator.generate_daily_report(
+            num_trades=num_trades,
+            total_capital=total_capital,
+            output_dir=output_dir
+        )
+
     # ========== Quick Methods ==========
 
     def quick_validation(self, strategy_name: str):
         """Quick validation of a single strategy"""
-        return self.validator.quick_validation(strategy_name)
+        return self.strategy_validator.quick_validation(strategy_name)
 
     def quick_portfolio_analysis(self):
         """Quick portfolio performance analysis"""
@@ -424,6 +450,10 @@ class BacktestEngine:
     def quick_trade_selection(self, num_trades: int = 5, capital: float = 100_000):
         """Quick trade selection"""
         return self.get_top_trades(num_trades, capital)
+
+    def validate_ensemble(self):
+        """Quick ensemble validation"""
+        return self.ensemble_validator.validate_ensemble(lookback_days=90)
 
 
 if __name__ == "__main__":
