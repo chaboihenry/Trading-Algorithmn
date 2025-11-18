@@ -105,6 +105,15 @@ daily_schedule:
     max_runtime_seconds: 300
     critical: false
 
+  # Tier 7: Email Notification (needs tier 6, runs after all processing complete)
+  - name: "Send Daily Trade Notification"
+    script: "notifications/send_daily_trades.py"
+    time: "10:05:00"
+    tier: 7
+    dependencies: ["Validate Strategies & Generate Report"]
+    max_runtime_seconds: 60
+    critical: false
+
 intraday_schedule:
   # Continuous tasks (9:30 AM - 4:00 PM ET)
   - name: "Price Data"

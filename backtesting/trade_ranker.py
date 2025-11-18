@@ -429,7 +429,8 @@ class TradeRanker:
 
     def get_current_top_trades(self, num_trades: int = 5,
                                total_capital: float = 100_000,
-                               date: Optional[str] = None) -> pd.DataFrame:
+                               date: Optional[str] = None,
+                               strategy_filter: Optional[str] = None) -> pd.DataFrame:
         """
         Get current top trades (convenience method)
 
@@ -437,6 +438,7 @@ class TradeRanker:
             num_trades: Number of trades to select
             total_capital: Total available capital
             date: Date to get signals for (default: latest)
+            strategy_filter: Filter by strategy name (e.g., 'EnsembleStrategy')
 
         Returns:
             Top N trades with full details
@@ -448,10 +450,38 @@ class TradeRanker:
             print("\n❌ No current signals found")
             return pd.DataFrame()
 
+        # Filter by strategy if specified
+        if strategy_filter:
+            signals = signals[signals['strategy_name'] == strategy_filter].copy()
+            if len(signals) == 0:
+                print(f"\n❌ No signals found for strategy: {strategy_filter}")
+                return pd.DataFrame()
+
         # Select top trades
         top_trades = self.select_top_trades(signals, num_trades, total_capital)
 
         return top_trades
+
+    def get_ensemble_top_trades(self, num_trades: int = 5,
+                                total_capital: float = 100_000,
+                                date: Optional[str] = None) -> pd.DataFrame:
+        """
+        Get top trades from EnsembleStrategy only
+
+        Args:
+            num_trades: Number of trades to select
+            total_capital: Total available capital
+            date: Date to get signals for (default: latest)
+
+        Returns:
+            Top N trades from EnsembleStrategy
+        """
+        return self.get_current_top_trades(
+            num_trades=num_trades,
+            total_capital=total_capital,
+            date=date,
+            strategy_filter='EnsembleStrategy'
+        )
 
     def export_trades_to_csv(self, trades: pd.DataFrame, output_path: str):
         """
