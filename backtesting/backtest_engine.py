@@ -192,20 +192,20 @@ class BacktestEngine:
 
         query = """
         SELECT
-            s.date,
-            s.symbol,
+            s.signal_date as date,
+            s.symbol_ticker as symbol,
             s.strategy_name,
-            s.signal,
-            s.signal_strength,
+            s.signal_type as signal,
+            s.strength as signal_strength,
             p1.close as entry_price,
             p2.close as exit_price
         FROM trading_signals s
-        JOIN price_data p1 ON s.symbol = p1.symbol AND s.date = p1.date
-        JOIN price_data p2 ON s.symbol = p2.symbol
-            AND DATE(p2.date) = DATE(s.date, '+1 day')
-        WHERE s.date >= ?
-          AND s.signal != 0
-        ORDER BY s.date
+        JOIN raw_price_data p1 ON s.symbol_ticker = p1.symbol_ticker AND s.signal_date = p1.price_date
+        JOIN raw_price_data p2 ON s.symbol_ticker = p2.symbol_ticker
+            AND DATE(p2.price_date) = DATE(s.signal_date, '+1 day')
+        WHERE s.signal_date >= ?
+          AND s.signal_type != 'HOLD'
+        ORDER BY s.signal_date
         """
 
         df = pd.read_sql_query(query, conn, params=[cutoff_date])
@@ -218,8 +218,9 @@ class BacktestEngine:
         # Calculate returns
         df['return'] = (df['exit_price'] - df['entry_price']) / df['entry_price']
 
-        # Adjust for signal direction
-        df.loc[df['signal'] < 0, 'return'] = -df.loc[df['signal'] < 0, 'return']
+        # Convert BUY/SELL to numeric and adjust for signal direction
+        df['signal_numeric'] = df['signal'].map({'BUY': 1, 'SELL': -1, 'HOLD': 0})
+        df.loc[df['signal_numeric'] < 0, 'return'] = -df.loc[df['signal_numeric'] < 0, 'return']
 
         # Daily portfolio returns (equal weighted for simplicity)
         daily_returns = df.groupby('date')['return'].mean()

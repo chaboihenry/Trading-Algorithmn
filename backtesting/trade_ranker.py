@@ -87,21 +87,25 @@ class TradeRanker:
 
         query = """
         SELECT
-            s.signal,
-            s.signal_strength,
+            s.signal_type as signal,
+            s.strength as signal_strength,
             p1.close as entry_price,
             p2.close as exit_price
         FROM trading_signals s
-        JOIN price_data p1 ON s.symbol = p1.symbol AND s.date = p1.date
-        JOIN price_data p2 ON s.symbol = p2.symbol
-            AND DATE(p2.date) = DATE(s.date, '+1 day')
+        JOIN raw_price_data p1 ON s.symbol_ticker = p1.symbol_ticker AND s.signal_date = p1.price_date
+        JOIN raw_price_data p2 ON s.symbol_ticker = p2.symbol_ticker
+            AND DATE(p2.price_date) = DATE(s.signal_date, '+1 day')
         WHERE s.strategy_name = ?
-          AND s.date >= ?
-          AND s.signal != 0
+          AND s.signal_date >= ?
+          AND s.signal_type != 'HOLD'
         """
 
         df = pd.read_sql_query(query, conn, params=[strategy_name, cutoff_date])
         conn.close()
+
+        # Convert BUY/SELL to numeric
+        if len(df) > 0:
+            df['signal_numeric'] = df['signal'].map({'BUY': 1, 'SELL': -1, 'HOLD': 0})
 
         if len(df) == 0:
             # No historical data - use conservative defaults
@@ -117,7 +121,7 @@ class TradeRanker:
         df['return'] = ((df['exit_price'] - df['entry_price']) / df['entry_price'])
 
         # Adjust for signal direction (short positions)
-        df.loc[df['signal'] < 0, 'return'] = -df.loc[df['signal'] < 0, 'return']
+        df.loc[df['signal_numeric'] < 0, 'return'] = -df.loc[df['signal_numeric'] < 0, 'return']
 
         # Calculate metrics
         returns = df['return'].dropna()
@@ -238,32 +242,42 @@ class TradeRanker:
 
         if date is None:
             # Get latest date
-            date_query = "SELECT MAX(date) FROM trading_signals"
+            date_query = "SELECT MAX(signal_date) FROM trading_signals"
             date = pd.read_sql_query(date_query, conn).iloc[0, 0]
 
         # Get signals with price and volume data
         query = """
         SELECT
-            s.*,
+            s.signal_id,
+            s.strategy_name,
+            s.symbol_ticker as symbol,
+            s.signal_date as date,
+            s.signal_type as signal,
+            s.strength as signal_strength,
+            s.entry_price,
+            s.stop_loss,
+            s.take_profit,
             p.close,
             p.volume,
             p.high,
             p.low,
-            m.volatility_30d,
-            m.avg_volume_30d
+            COALESCE(m.volatility_30d, 0.15) as volatility_30d
         FROM trading_signals s
-        JOIN price_data p ON s.symbol = p.symbol AND s.date = p.date
-        LEFT JOIN ml_features m ON s.symbol = m.symbol AND s.date = m.date
-        WHERE s.date = ?
-          AND s.signal != 0
-          AND ABS(s.signal_strength) >= ?
-        ORDER BY s.symbol
+        JOIN raw_price_data p ON s.symbol_ticker = p.symbol_ticker AND s.signal_date = p.price_date
+        LEFT JOIN ml_features m ON s.symbol_ticker = m.symbol_ticker AND s.signal_date = m.feature_date
+        WHERE s.signal_date = ?
+          AND s.signal_type != 'HOLD'
+          AND ABS(s.strength) >= ?
+        ORDER BY s.symbol_ticker
         """
 
         df = pd.read_sql_query(query, conn, params=[date, min_signal_strength])
         conn.close()
 
         df['date'] = pd.to_datetime(df['date'])
+
+        # Convert signal to numeric for scoring
+        df['signal_numeric'] = df['signal'].map({'BUY': 1, 'SELL': -1, 'HOLD': 0})
 
         return df
 

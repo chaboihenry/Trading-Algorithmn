@@ -1,4 +1,3 @@
-#!/Users/henry/miniconda3/envs/trading/bin/python
 """
 Health Monitor for Trading Data Pipeline
 
@@ -180,46 +179,27 @@ class HealthMonitor:
                     last_failure = now
 
                 # Calculate rolling average runtime
-                avg_runtime = current.get('average_runtime_seconds') or 0
-                if avg_runtime == 0 or avg_runtime is None:
+                avg_runtime = current.get('average_runtime_seconds', 0)
+                if avg_runtime == 0:
                     new_avg_runtime = runtime_seconds
                 else:
                     # Exponential moving average (weight recent runs more)
                     alpha = 0.3
                     new_avg_runtime = alpha * runtime_seconds + (1 - alpha) * avg_runtime
 
-                # Check if task exists
-                if current:
-                    # Update existing record
-                    conn.execute("""
-                        UPDATE data_pipeline_status
-                        SET last_run_end = ?, last_success = ?, last_failure = ?,
-                            consecutive_failures = ?, total_runs = ?, total_successes = ?,
-                            total_failures = ?, last_error_message = ?,
-                            last_records_processed = ?, average_runtime_seconds = ?,
-                            status = ?, updated_at = ?
-                        WHERE task_name = ?
-                    """, (
-                        now, last_success, last_failure,
+                conn.execute("""
+                    INSERT OR REPLACE INTO data_pipeline_status (
+                        task_name, last_run_end, last_success, last_failure,
                         consecutive_failures, total_runs, total_successes, total_failures,
-                        error_message, records_processed, new_avg_runtime,
-                        status, now, task_name
-                    ))
-                else:
-                    # Insert new record
-                    conn.execute("""
-                        INSERT INTO data_pipeline_status (
-                            task_name, last_run_end, last_success, last_failure,
-                            consecutive_failures, total_runs, total_successes, total_failures,
-                            last_error_message, last_records_processed, average_runtime_seconds,
-                            status, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        task_name, now, last_success, last_failure,
-                        consecutive_failures, total_runs, total_successes, total_failures,
-                        error_message, records_processed, new_avg_runtime,
-                        status, now
-                    ))
+                        last_error_message, last_records_processed, average_runtime_seconds,
+                        status, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    task_name, now, last_success, last_failure,
+                    consecutive_failures, total_runs, total_successes, total_failures,
+                    error_message, records_processed, new_avg_runtime,
+                    status, now
+                ))
                 conn.commit()
 
         except Exception as e:
@@ -230,29 +210,11 @@ class HealthMonitor:
         try:
             with sqlite3.connect(self.db_path) as conn:
                 now = datetime.now().isoformat()
-
-                # Check if task exists
-                cursor = conn.execute(
-                    "SELECT task_name FROM data_pipeline_status WHERE task_name = ?",
-                    (task_name,)
-                )
-                exists = cursor.fetchone() is not None
-
-                if exists:
-                    # Update existing record
-                    conn.execute("""
-                        UPDATE data_pipeline_status
-                        SET last_run_start = ?, status = 'RUNNING', updated_at = ?
-                        WHERE task_name = ?
-                    """, (now, now, task_name))
-                else:
-                    # Insert new record
-                    conn.execute("""
-                        INSERT INTO data_pipeline_status (
-                            task_name, last_run_start, status, updated_at
-                        ) VALUES (?, ?, 'RUNNING', ?)
-                    """, (task_name, now, now))
-
+                conn.execute("""
+                    INSERT OR REPLACE INTO data_pipeline_status (
+                        task_name, last_run_start, status, updated_at
+                    ) VALUES (?, ?, 'RUNNING', ?)
+                """, (task_name, now, now))
                 conn.commit()
         except Exception as e:
             print(f"⚠️  Error marking task started for {task_name}: {e}")
