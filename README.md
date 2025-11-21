@@ -1047,5 +1047,3 @@ All components are optimized for Apple Silicon:
 - Email delivery: Daily at 10:05 AM
 
 ---
-
-**🤖 Generated with [Claude Code](https://claude.com/claude-code)**
