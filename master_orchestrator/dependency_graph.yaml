@@ -92,7 +92,7 @@ daily_schedule:
     time: "09:40:00"
     tier: 3
     dependencies: ["Asset Collection"]
-    max_runtime_seconds: 360
+    max_runtime_seconds: 600
     critical: false
 
   # Tier 4: ML Features Aggregator (needs tier 1-3)

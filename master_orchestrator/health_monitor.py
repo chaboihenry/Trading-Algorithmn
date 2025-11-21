@@ -164,28 +164,29 @@ class HealthMonitor:
                 # Get current stats
                 current = self.get_task_status(task_name) or {}
 
-                total_runs = current.get('total_runs', 0) + 1
-                consecutive_failures = 0 if success else current.get('consecutive_failures', 0) + 1
+                # Handle None values from database by using 'or 0' pattern
+                total_runs = (current.get('total_runs') or 0) + 1
+                consecutive_failures = 0 if success else (current.get('consecutive_failures') or 0) + 1
 
                 if success:
-                    total_successes = current.get('total_successes', 0) + 1
-                    total_failures = current.get('total_failures', 0)
+                    total_successes = (current.get('total_successes') or 0) + 1
+                    total_failures = current.get('total_failures') or 0
                     last_success = now
                     last_failure = current.get('last_failure')
                 else:
-                    total_successes = current.get('total_successes', 0)
-                    total_failures = current.get('total_failures', 0) + 1
+                    total_successes = current.get('total_successes') or 0
+                    total_failures = (current.get('total_failures') or 0) + 1
                     last_success = current.get('last_success')
                     last_failure = now
 
                 # Calculate rolling average runtime
-                avg_runtime = current.get('average_runtime_seconds', 0)
-                if avg_runtime == 0:
+                avg_runtime = current.get('average_runtime_seconds') or 0
+                if avg_runtime == 0 or avg_runtime is None:
                     new_avg_runtime = runtime_seconds
                 else:
                     # Exponential moving average (weight recent runs more)
                     alpha = 0.3
-                    new_avg_runtime = alpha * runtime_seconds + (1 - alpha) * avg_runtime
+                    new_avg_runtime = alpha * runtime_seconds + (1 - alpha) * float(avg_runtime)
 
                 conn.execute("""
                     INSERT OR REPLACE INTO data_pipeline_status (
