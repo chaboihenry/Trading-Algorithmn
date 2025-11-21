@@ -26,7 +26,7 @@ from notifications.email_sender import EmailSender
 def send_daily_trade_notification(
     recipient_email: str = "henry.vianna123@gmail.com",
     num_trades: int = 5,
-    total_capital: float = 100_000
+    total_capital: float = 1_000
 ) -> bool:
     """
     Send daily trade notification email
@@ -165,7 +165,7 @@ def main():
     success = send_daily_trade_notification(
         recipient_email="henry.vianna123@gmail.com",
         num_trades=5,
-        total_capital=100_000
+        total_capital=1_000
     )
 
     sys.exit(0 if success else 1)

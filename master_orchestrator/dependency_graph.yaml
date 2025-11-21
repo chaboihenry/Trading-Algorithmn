@@ -11,12 +11,21 @@ daily_schedule:
     max_runtime_seconds: 120
     critical: true
 
+  # Tier 0.5: Price Data (backbone of all analysis)
+  - name: "Price Data Collection"
+    script: "data_collectors/02_collect_price_data.py"
+    time: "09:30:15"
+    tier: 0.5
+    dependencies: ["Asset Collection"]
+    max_runtime_seconds: 180
+    critical: true
+
   # Tier 1: Fundamental Data & Economic Indicators (no dependencies)
   - name: "Fundamental Data"
     script: "data_collectors/03_collect_fundamentals.py"
     time: "09:30:30"
     tier: 1
-    dependencies: ["Asset Collection"]
+    dependencies: ["Asset Collection", "Price Data Collection"]
     max_runtime_seconds: 300
     critical: true
 
@@ -42,6 +51,14 @@ daily_schedule:
     time: "09:35:00"
     tier: 2
     dependencies: ["Asset Collection"]
+    max_runtime_seconds: 180
+    critical: false
+
+  - name: "Relative Valuation"
+    script: "data_collectors/11_collect_relative_valuation.py"
+    time: "09:35:00"
+    tier: 2
+    dependencies: ["Asset Collection", "Price Data Collection", "Fundamental Data"]
     max_runtime_seconds: 180
     critical: false
 
@@ -75,7 +92,7 @@ daily_schedule:
     time: "09:40:00"
     tier: 3
     dependencies: ["Asset Collection"]
-    max_runtime_seconds: 240
+    max_runtime_seconds: 360
     critical: false
 
   # Tier 4: ML Features Aggregator (needs tier 1-3)
@@ -87,12 +104,21 @@ daily_schedule:
     max_runtime_seconds: 300
     critical: true
 
-  # Tier 5: Signal Generation (needs tier 4)
+  # Tier 4.5: Incremental Model Retraining (needs tier 4, before tier 5)
+  - name: "Retrain ML Models"
+    script: "strategies/retrain_all_strategies.py"
+    time: "09:52:00"
+    tier: 4.5
+    dependencies: ["ML Features Aggregation"]
+    max_runtime_seconds: 600
+    critical: true
+
+  # Tier 5: Signal Generation (needs tier 4.5 - retrained models)
   - name: "Generate Trading Signals"
     script: "strategies/run_strategies.py"
     time: "09:55:00"
     tier: 5
-    dependencies: ["ML Features Aggregation"]
+    dependencies: ["Retrain ML Models"]
     max_runtime_seconds: 180
     critical: true
 

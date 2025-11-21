@@ -335,7 +335,7 @@ class ReportGenerator:
         top_trades = report_data.get('top_trades')
         if isinstance(top_trades, pd.DataFrame) and len(top_trades) > 0:
             for i, row in top_trades.iterrows():
-                direction = "LONG" if row['signal'] > 0 else "SHORT"
+                direction = "LONG" if row['signal'] == 'BUY' else "SHORT"
                 md_content += f"### #{i+1} {row['symbol']} ({direction})\n"
                 md_content += f"- **Strategy:** {row['strategy_name']}\n"
                 md_content += f"- **Position Size:** {row['position_size']:.2%} (${row['position_value']:,.0f})\n"

@@ -249,8 +249,21 @@ class EmailSender:
 """
 
             for i, row in trades.iterrows():
-                direction = "LONG" if row['signal'] > 0 else "SHORT"
+                direction = "LONG" if row['signal'] == 'BUY' else "SHORT"
                 badge_class = "" if direction == "LONG" else " short"
+
+                # For LONG (BUY): Show entry (buy price) and exit (sell price = take profit)
+                # For SHORT (SELL): Show entry (sell price) and exit (buy back price = take profit)
+                if direction == "LONG":
+                    action_label = "BUY at"
+                    exit_label = "SELL at"
+                    entry_price = row['close']
+                    exit_price = row['take_profit_price']
+                else:  # SHORT
+                    action_label = "SELL at"
+                    exit_label = "BUY BACK at"
+                    entry_price = row['close']
+                    exit_price = row['take_profit_price']
 
                 html += f"""
         <div class="trade-card{badge_class}">
@@ -258,52 +271,20 @@ class EmailSender:
                 <div class="trade-symbol">#{i+1} {row['symbol']}</div>
                 <div class="trade-badge{badge_class}">{direction}</div>
             </div>
-            <div class="detail-item" style="background: white; margin-bottom: 10px;">
-                <span class="detail-label">Strategy:</span>
-                <span class="detail-value">{row['strategy_name']}</span>
-            </div>
             <div class="trade-details">
                 <div class="detail-item">
-                    <span class="detail-label">Position Size:</span>
-                    <span class="detail-value">{row['position_size']:.2%}</span>
+                    <span class="detail-label">{action_label}:</span>
+                    <span class="detail-value">${entry_price:.2f}</span>
                 </div>
                 <div class="detail-item">
-                    <span class="detail-label">Capital:</span>
-                    <span class="detail-value">${row['position_value']:,.0f}</span>
-                </div>
-                <div class="detail-item">
-                    <span class="detail-label">Shares:</span>
-                    <span class="detail-value">{row['num_shares']:,}</span>
-                </div>
-                <div class="detail-item">
-                    <span class="detail-label">Entry Price:</span>
-                    <span class="detail-value">${row['close']:.2f}</span>
+                    <span class="detail-label">{exit_label}:</span>
+                    <span class="detail-value">${exit_price:.2f}</span>
                 </div>
                 <div class="detail-item">
                     <span class="detail-label">Stop Loss:</span>
                     <span class="detail-value">${row['stop_loss_price']:.2f}</span>
                 </div>
-                <div class="detail-item">
-                    <span class="detail-label">Take Profit:</span>
-                    <span class="detail-value">${row['take_profit_price']:.2f}</span>
-                </div>
-                <div class="detail-item">
-                    <span class="detail-label">Kelly Score:</span>
-                    <span class="detail-value">{row['score']:.4f}</span>
-                </div>
-                <div class="detail-item">
-                    <span class="detail-label">Confidence:</span>
-                    <span class="detail-value">{row['signal_strength']:.2f}</span>
-                </div>
             </div>
-        </div>
-"""
-
-            total_allocation = trades['position_size'].sum()
-            html += f"""
-        <div class="detail-item" style="background: #e7f3ff; padding: 15px; margin-top: 20px; border-radius: 8px;">
-            <span class="detail-label" style="font-size: 16px;">Total Capital Allocated:</span>
-            <span class="detail-value" style="font-size: 18px;">{total_allocation:.2%} (${total_allocation * 100_000:,.0f})</span>
         </div>
 """
         else:

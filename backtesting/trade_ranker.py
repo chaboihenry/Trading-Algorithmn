@@ -246,6 +246,7 @@ class TradeRanker:
             date = pd.read_sql_query(date_query, conn).iloc[0, 0]
 
         # Get signals with price and volume data
+        # Use most recent available price data (in case of stale data)
         query = """
         SELECT
             s.signal_id,
@@ -257,13 +258,17 @@ class TradeRanker:
             s.entry_price,
             s.stop_loss,
             s.take_profit,
-            p.close,
-            p.volume,
-            p.high,
-            p.low,
+            COALESCE(p.close, s.entry_price) as close,
+            COALESCE(p.volume, 1000000) as volume,
+            COALESCE(p.high, s.entry_price * 1.02) as high,
+            COALESCE(p.low, s.entry_price * 0.98) as low,
             COALESCE(m.volatility_30d, 0.15) as volatility_30d
         FROM trading_signals s
-        JOIN raw_price_data p ON s.symbol_ticker = p.symbol_ticker AND s.signal_date = p.price_date
+        LEFT JOIN (
+            SELECT symbol_ticker, close, volume, high, low, price_date,
+                   ROW_NUMBER() OVER (PARTITION BY symbol_ticker ORDER BY price_date DESC) as rn
+            FROM raw_price_data
+        ) p ON s.symbol_ticker = p.symbol_ticker AND p.rn = 1
         LEFT JOIN ml_features m ON s.symbol_ticker = m.symbol_ticker AND s.signal_date = m.feature_date
         WHERE s.signal_date = ?
           AND s.signal_type != 'HOLD'
@@ -317,6 +322,7 @@ class TradeRanker:
                 'symbol': row['symbol'],
                 'strategy_name': row['strategy_name'],
                 'signal': row['signal'],
+                'signal_numeric': row['signal_numeric'],
                 'signal_strength': row['signal_strength'],
                 'score': score,
                 'kelly_fraction': self.calculate_kelly_fraction(
@@ -395,8 +401,8 @@ class TradeRanker:
         top_trades['stop_loss_price'] = top_trades['close'] * (1 + top_trades['stop_loss_pct'])
         top_trades['take_profit_price'] = top_trades['close'] * (1 + top_trades['take_profit_pct'])
 
-        # Adjust for short positions
-        short_mask = top_trades['signal'] < 0
+        # Adjust for short positions (use signal_numeric for comparison)
+        short_mask = top_trades['signal_numeric'] < 0
         top_trades.loc[short_mask, 'stop_loss_price'] = top_trades.loc[short_mask, 'close'] * (1 - top_trades.loc[short_mask, 'stop_loss_pct'])
         top_trades.loc[short_mask, 'take_profit_price'] = top_trades.loc[short_mask, 'close'] * (1 - top_trades.loc[short_mask, 'take_profit_pct'])
 
@@ -406,7 +412,7 @@ class TradeRanker:
         print(f"{'─'*80}")
 
         for i, row in top_trades.iterrows():
-            direction = "LONG" if row['signal'] > 0 else "SHORT"
+            direction = "LONG" if row['signal'] == 'BUY' else "SHORT"
             print(f"\n#{i+1} {row['symbol']} ({direction}) - {row['strategy_name']}")
             print(f"  Score:          {row['score']:.4f}")
             print(f"  Signal Strength: {row['signal_strength']:.2f}")
@@ -504,7 +510,7 @@ class TradeRanker:
         ]].copy()
 
         # Add execution instructions
-        execution_df['action'] = execution_df['signal'].apply(lambda x: 'BUY' if x > 0 else 'SELL')
+        execution_df['action'] = execution_df['signal'].apply(lambda x: 'BUY' if x == 'BUY' else 'SELL')
         execution_df['entry_price'] = execution_df['close']
 
         # Reorder columns
