@@ -24,7 +24,7 @@ Output: ml_features table ready for signal generation
 import sqlite3
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+# datetime, timedelta not used - only pd.to_datetime() is used
 from sklearn.preprocessing import StandardScaler
 import logging
 import sys

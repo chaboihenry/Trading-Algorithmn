@@ -1,7 +1,8 @@
 """
-Sentiment Trading Strategy (M1 Optimized)
-=========================================
-XGBoost ML model with M1-optimized settings and memory-efficient batch processing
+Sentiment Trading Strategy with Incremental Learning
+====================================================
+Automatically loads previous model or trains from scratch
+Uses incremental updates to avoid full retraining
 """
 
 import pandas as pd
@@ -10,9 +11,10 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
+from incremental_trainer import IncrementalTrainer
 import logging
 
-# Suppress FutureWarning for fillna downcasting (we're using recommended infer_objects)
+# Suppress FutureWarning for fillna downcasting
 pd.set_option('future.no_silent_downcasting', True)
 
 # M1-optimized XGBoost
@@ -25,24 +27,19 @@ logger = logging.getLogger(__name__)
 
 
 class SentimentTradingStrategy(BaseStrategy):
-    """Trade on sentiment-price divergence using XGBoost with continuous learning"""
+    """Trade on sentiment-price divergence using XGBoost with incremental learning"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db"):
         super().__init__(db_path)
         self.model = None
         self.scaler = StandardScaler()
         self.name = "SentimentTradingStrategy"
+        self.trainer = IncrementalTrainer(db_path=db_path)
+        self.feature_cols = None
 
-    def _get_all_historical_data(self, batch_size: int = 10000) -> pd.DataFrame:
-        """
-        Memory-efficient data loading with batching for M1 optimization
-        NOW INCLUDES: Fundamentals, Analyst Ratings, Earnings, Insider Trading
-
-        Args:
-            batch_size: Number of rows to load per batch (default 10000)
-        """
-        conn = self._conn()
-        query = """
+    def _get_historical_data_query(self) -> str:
+        """Return the SQL query for loading training data"""
+        return """
             SELECT
                 mf.symbol_ticker,
                 mf.feature_date,
@@ -74,7 +71,7 @@ class SentimentTradingStrategy(BaseStrategy):
                 mf.sentiment_score_norm,
                 -- Price for labeling
                 rpd.close as current_price,
-                -- FUNDAMENTALS (added)
+                -- FUNDAMENTALS
                 fd.pe_ratio,
                 fd.price_to_book,
                 fd.price_to_sales,
@@ -85,35 +82,35 @@ class SentimentTradingStrategy(BaseStrategy):
                 fd.debt_to_equity,
                 fd.current_ratio,
                 fd.beta,
-                -- ANALYST RATINGS (added)
+                -- ANALYST RATINGS
                 ar.rating as analyst_rating,
                 ar.rating_numeric,
                 ar.price_target,
                 ar.upside_to_target,
-                -- EARNINGS (added)
+                -- EARNINGS
                 ed.reported_eps,
                 ed.estimated_eps,
                 ed.eps_surprise,
                 ed.eps_surprise_percent,
                 ed.reported_revenue,
                 ed.estimated_revenue,
-                -- Revenue surprise (derived)
+                -- Revenue surprise
                 CASE
                     WHEN ed.estimated_revenue > 0 THEN
                         ((ed.reported_revenue - ed.estimated_revenue) / ed.estimated_revenue) * 100
                     ELSE NULL
                 END as revenue_surprise_percent,
-                -- INSIDER TRADING (added - aggregated)
+                -- INSIDER TRADING
                 it.insider_buy_count,
                 it.insider_sell_count,
                 it.insider_net_sentiment,
                 it.total_shares_traded,
                 it.insider_ownership_change,
-                -- OPTIONS DATA (added - key volatility signals)
+                -- OPTIONS DATA
                 od.implied_volatility_30d,
                 od.iv_percentile_1y,
                 od.put_call_ratio,
-                -- ECONOMIC INDICATORS (added - macro context)
+                -- ECONOMIC INDICATORS
                 ei.vix as market_vix,
                 ei.treasury_10y,
                 ei.yield_curve_10y_2y
@@ -186,40 +183,36 @@ class SentimentTradingStrategy(BaseStrategy):
             ORDER BY mf.symbol_ticker, mf.feature_date
         """
 
-        # Memory-efficient batch loading
+    def _get_all_historical_data(self, batch_size: int = 10000) -> pd.DataFrame:
+        """Memory-efficient data loading with batching"""
+        conn = self._conn()
+        query = self._get_historical_data_query()
+
         chunks = []
         for chunk in pd.read_sql(query, conn, chunksize=batch_size):
             chunks.append(chunk)
 
         df = pd.concat(chunks, ignore_index=True) if chunks else pd.DataFrame()
         conn.close()
-        logger.info(f"Loaded {len(df)} historical records with fundamentals, analyst, earnings, and insider data")
+        logger.info(f"Loaded {len(df)} historical records")
         return df
 
     def _create_balanced_labels(self, df: pd.DataFrame) -> pd.DataFrame:
         """Create BALANCED labels using quantile-based classification"""
         df = df.sort_values(['symbol_ticker', 'feature_date'])
-
-        # Calculate future returns
         df['future_return_5d'] = df.groupby('symbol_ticker')['current_price'].pct_change(periods=-5)
-
-        # Drop rows without future returns
         df = df.dropna(subset=['future_return_5d'])
 
-        # Create BALANCED multi-class labels using quantiles
-        # This ensures equal distribution across classes
         quantiles = df['future_return_5d'].quantile([0.2, 0.4, 0.6, 0.8])
-
         conditions = [
-            df['future_return_5d'] <= quantiles[0.2],   # Bottom 20% = STRONG SELL (0)
-            df['future_return_5d'] <= quantiles[0.4],   # 20-40% = SELL (1)
-            df['future_return_5d'] <= quantiles[0.6],   # 40-60% = HOLD (2)
-            df['future_return_5d'] <= quantiles[0.8],   # 60-80% = BUY (3)
+            df['future_return_5d'] <= quantiles[0.2],
+            df['future_return_5d'] <= quantiles[0.4],
+            df['future_return_5d'] <= quantiles[0.6],
+            df['future_return_5d'] <= quantiles[0.8],
         ]
         choices = [0, 1, 2, 3]
-        df['label'] = np.select(conditions, choices, default=4)  # Top 20% = STRONG BUY (4)
+        df['label'] = np.select(conditions, choices, default=4)
 
-        # Log distribution
         label_dist = df['label'].value_counts().sort_index()
         logger.info("Label distribution:")
         for label, count in label_dist.items():
@@ -229,8 +222,7 @@ class SentimentTradingStrategy(BaseStrategy):
         return df
 
     def _prepare_features(self, df: pd.DataFrame) -> tuple:
-        """Prepare feature matrix with ALL available data"""
-        # Original features
+        """Prepare comprehensive feature matrix (returns feature_cols for consistency)"""
         feature_cols = [
             'sentiment_score', 'sentiment_ma_7d', 'sentiment_price_divergence',
             'return_1d', 'return_5d', 'return_20d',
@@ -240,12 +232,12 @@ class SentimentTradingStrategy(BaseStrategy):
             'return_1d_norm', 'rsi_14_norm', 'volatility_20d_norm', 'sentiment_score_norm'
         ]
 
-        # Convert volatility_regime to numeric
+        # Volatility regime
         regime_map = {'low': 0, 'normal': 1, 'high': 2}
         df['volatility_regime_num'] = df['volatility_regime'].map(regime_map).fillna(1)
         feature_cols.append('volatility_regime_num')
 
-        # ADD FUNDAMENTAL FEATURES (with forward fill for missing values)
+        # Fundamentals
         fundamental_features = [
             'pe_ratio', 'price_to_book', 'price_to_sales',
             'profit_margin', 'return_on_equity', 'revenue_growth', 'earnings_growth',
@@ -253,93 +245,83 @@ class SentimentTradingStrategy(BaseStrategy):
         ]
         for feat in fundamental_features:
             if feat in df.columns:
-                df[feat] = df.groupby('symbol_ticker')[feat].ffill()  # Forward fill within ticker
+                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD ANALYST RATING FEATURES
+        # Analyst ratings
         analyst_features = ['rating_numeric', 'upside_to_target']
         for feat in analyst_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD EARNINGS SURPRISE FEATURES (revenue + EPS)
+        # Earnings
         earnings_features = ['eps_surprise_percent', 'revenue_surprise_percent']
         for feat in earnings_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD INSIDER TRADING FEATURES (expanded)
+        # Insider trading
         insider_features = [
             'insider_buy_count', 'insider_sell_count', 'insider_net_sentiment',
             'total_shares_traded', 'insider_ownership_change'
         ]
         for feat in insider_features:
             if feat in df.columns:
-                df[feat] = df[feat].fillna(0)  # No insider trading = 0
+                df[feat] = df[feat].fillna(0)
                 feature_cols.append(feat)
 
-        # ADD OPTIONS DATA FEATURES (volatility signals)
+        # Options
         options_features = ['implied_volatility_30d', 'iv_percentile_1y', 'put_call_ratio']
         for feat in options_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
                 feature_cols.append(feat)
 
-        # ADD ECONOMIC INDICATORS (macro context)
+        # Economic
         economic_features = ['market_vix', 'treasury_10y', 'yield_curve_10y_2y']
         for feat in economic_features:
             if feat in df.columns:
-                df[feat] = df[feat].ffill()  # Forward fill macro data
+                df[feat] = df[feat].ffill()
                 feature_cols.append(feat)
 
-        # === ADVANCED DERIVED FEATURES ===
-
-        # 1. Earnings momentum (EPS + Revenue surprise combined)
+        # Advanced derived features
         if 'eps_surprise_percent' in df.columns and 'revenue_surprise_percent' in df.columns:
             eps_filled = df['eps_surprise_percent'].fillna(0).infer_objects(copy=False)
             rev_filled = df['revenue_surprise_percent'].fillna(0).infer_objects(copy=False)
             df['earnings_momentum'] = eps_filled * 0.6 + rev_filled * 0.4
             feature_cols.append('earnings_momentum')
 
-        # 2. Insider conviction (weighted by ownership change)
         if 'insider_net_sentiment' in df.columns and 'total_shares_traded' in df.columns:
             df['insider_conviction'] = (
                 df['insider_net_sentiment'] * np.log1p(df['total_shares_traded'].fillna(0))
             )
             feature_cols.append('insider_conviction')
 
-        # 3. Analyst-fundamental divergence (overvalued/undervalued signal)
         if 'upside_to_target' in df.columns and 'pe_ratio' in df.columns:
-            # High upside with low PE = strong buy signal
             df['value_opportunity'] = df['upside_to_target'].fillna(0) / (df['pe_ratio'].fillna(15) + 1)
             feature_cols.append('value_opportunity')
 
-        # 4. Risk-adjusted sentiment (sentiment normalized by volatility)
         if 'sentiment_score' in df.columns and 'volatility_20d' in df.columns:
             df['risk_adj_sentiment'] = (
                 df['sentiment_score'] / (df['volatility_20d'].fillna(0.2) + 0.01)
             )
             feature_cols.append('risk_adj_sentiment')
 
-        # 5. Options market fear (put/call ratio × IV percentile)
         if 'put_call_ratio' in df.columns and 'iv_percentile_1y' in df.columns:
             df['options_fear_index'] = (
                 df['put_call_ratio'].fillna(1.0) * df['iv_percentile_1y'].fillna(50) / 100
             )
             feature_cols.append('options_fear_index')
 
-        # 6. Macro risk factor (VIX × yield curve inversion)
         if 'market_vix' in df.columns and 'yield_curve_10y_2y' in df.columns:
-            # Negative yield curve + high VIX = recession risk
             df['macro_risk'] = (
                 (df['market_vix'].fillna(20) / 100) *
-                (1 - df['yield_curve_10y_2y'].fillna(0.5))  # Inverted curve = risk
+                (1 - df['yield_curve_10y_2y'].fillna(0.5))
             )
             feature_cols.append('macro_risk')
 
-        # 7. Quality score (profitability + growth + stability)
         if all(feat in df.columns for feat in ['profit_margin', 'revenue_growth', 'debt_to_equity']):
             profit_filled = df['profit_margin'].fillna(0).infer_objects(copy=False)
             growth_filled = df['revenue_growth'].fillna(0).infer_objects(copy=False)
@@ -347,203 +329,283 @@ class SentimentTradingStrategy(BaseStrategy):
             df['quality_score'] = (
                 profit_filled * 0.4 +
                 growth_filled * 0.3 -
-                (debt_filled / 10) * 0.3  # Lower debt = better
+                (debt_filled / 10) * 0.3
             )
             feature_cols.append('quality_score')
 
-        # 8. Momentum × Quality interaction
         if 'return_20d' in df.columns and 'quality_score' in df.columns:
             df['momentum_quality'] = df['return_20d'] * df['quality_score']
             feature_cols.append('momentum_quality')
 
-        # 9. Analyst-Insider agreement
         if 'upside_to_target' in df.columns and 'insider_net_sentiment' in df.columns:
-            # Both positive or both negative = strong signal
             df['analyst_insider_agree'] = (
                 np.sign(df['upside_to_target'].fillna(0)) *
                 np.sign(df['insider_net_sentiment'].fillna(0))
             )
             feature_cols.append('analyst_insider_agree')
 
-        # 10. Relative IV rank (stock IV vs market VIX)
         if 'implied_volatility_30d' in df.columns and 'market_vix' in df.columns:
             df['relative_iv'] = (
                 df['implied_volatility_30d'].fillna(20) / (df['market_vix'].fillna(20) + 1)
             )
             feature_cols.append('relative_iv')
 
-        # Drop rows with missing labels only
+        # Clean
         df_clean = df.dropna(subset=['label'])
 
-        # Fill remaining NaN with median (robust to outliers)
         for col in feature_cols:
             if col in df_clean.columns:
-                # Only calculate median if column has non-NaN values (prevents "mean of empty slice" warning)
                 if df_clean[col].notna().any():
                     median_val = df_clean[col].median()
                     df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
                 else:
-                    # Column is entirely NaN, fill with 0
                     df_clean[col] = 0
 
         X = df_clean[feature_cols].values
         y = df_clean['label'].values
 
-        logger.info(f"Using {len(feature_cols)} features:")
-        logger.info(f"  - Core features: 20")
-        logger.info(f"  - Fundamentals: 10")
-        logger.info(f"  - Analyst ratings: 2")
-        logger.info(f"  - Earnings: 2")
-        logger.info(f"  - Insider trading: 5")
-        logger.info(f"  - Options data: 3")
-        logger.info(f"  - Economic indicators: 3")
-        logger.info(f"  - Advanced derived: 10+")
+        logger.info(f"Using {len(feature_cols)} features")
         return X, y, df_clean, feature_cols
 
-    def _train_optimized_model(self, X: np.ndarray, y: np.ndarray) -> None:
+    def train_model(self, force_full_retrain: bool = False) -> bool:
         """
-        Train XGBoost with M1 optimizations
+        Train model with incremental learning
 
-        M1 Optimizations:
-        - tree_method='hist': Fast histogram-based algorithm (2-3x faster on M1)
-        - device='cpu': Explicitly use CPU (M1's unified memory architecture)
-        - n_jobs=-1: Use all performance cores
-        - enable_categorical=True: Efficient categorical handling
-        - early_stopping_rounds: Prevent overfitting and reduce training time
+        Args:
+            force_full_retrain: Force complete retrain instead of incremental
+
+        Returns:
+            True if training successful
         """
-        if len(X) < 100:
-            logger.warning(f"Not enough samples ({len(X)}) for training")
-            return
+        # Check if full retrain needed
+        if force_full_retrain or self.trainer.should_full_retrain(self.name, days_threshold=90):
+            logger.info("=" * 80)
+            logger.info("FULL RETRAIN: Loading all historical data")
+            logger.info("=" * 80)
 
-        # Calculate class weights to handle imbalance
-        classes = np.unique(y)
-        class_weights = compute_class_weight('balanced', classes=classes, y=y)
-        sample_weights = np.array([class_weights[np.where(classes == label)[0][0]] for label in y])
+            # Full training on all data
+            df = self._get_all_historical_data()
 
-        # Split with stratification
-        X_train, X_test, y_train, y_test, sw_train, sw_test = train_test_split(
-            X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
-        )
+            if df.empty:
+                logger.warning("No data available")
+                return False
 
-        # Scale features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
+            df_labeled = self._create_balanced_labels(df)
+            X, y, df_clean, feature_cols = self._prepare_features(df_labeled)
 
-        # XGBoost with M1 optimization + regularization to prevent overfitting
-        self.model = xgb.XGBClassifier(
-            n_estimators=200,
-            learning_rate=0.05,
-            max_depth=4,                     # REDUCED from 5 to prevent overfitting
-            min_child_weight=5,              # INCREASED from 4 to prevent overfitting
-            subsample=0.8,
-            colsample_bytree=0.8,
-            reg_alpha=0.1,                   # L1 regularization (prevents overfitting)
-            reg_lambda=1.0,                  # L2 regularization (prevents overfitting)
-            # M1 OPTIMIZATIONS
-            tree_method='hist',              # Histogram-based algorithm (2-3x faster on M1)
-            device='cpu',                    # Use M1's unified memory architecture
-            n_jobs=-1,                       # Use all performance cores
-            enable_categorical=False,        # We've already encoded categories
-            early_stopping_rounds=20,        # Stop if no improvement (saves time)
-            eval_metric='mlogloss',          # Multi-class log loss
-            random_state=42,
-            verbosity=0                      # Quiet output
-        )
+            if len(X) == 0:
+                logger.warning("No valid features")
+                return False
 
-        # Train with early stopping
-        self.model.fit(
-            X_train_scaled, y_train,
-            sample_weight=sw_train,
-            eval_set=[(X_test_scaled, y_test)],
-            sample_weight_eval_set=[sw_test],
-            verbose=False
-        )
+            # Store feature columns
+            self.feature_cols = feature_cols
 
-        # Evaluate
-        train_score = self.model.score(X_train_scaled, y_train)
-        test_score = self.model.score(X_test_scaled, y_test)
+            # Train new model from scratch
+            if len(X) < 100:
+                logger.warning(f"Not enough samples ({len(X)}) for training")
+                return False
 
-        logger.info(f"XGBoost trained (M1 optimized): Train={train_score:.3f}, Test={test_score:.3f}")
+            # Calculate class weights
+            classes = np.unique(y)
+            class_weights = compute_class_weight('balanced', classes=classes, y=y)
+            sample_weights = np.array([class_weights[np.where(classes == label)[0][0]] for label in y])
 
-        # Log per-class performance
-        from sklearn.metrics import classification_report
-        y_pred = self.model.predict(X_test_scaled)
-        logger.info("\nPer-class performance:")
-        logger.info(classification_report(
-            y_test, y_pred,
-            target_names=['STRONG SELL', 'SELL', 'HOLD', 'BUY', 'STRONG BUY'],
-            zero_division=0
-        ))
+            # Split
+            X_train, X_test, y_train, y_test, sw_train, sw_test = train_test_split(
+                X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
+            )
 
-    def _get_feature_importance(self, feature_cols: list) -> dict:
-        """Get feature importance"""
-        if self.model is None:
-            return {}
+            # Scale
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
 
-        importance = dict(zip(feature_cols, self.model.feature_importances_))
-        return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+            # Train XGBoost
+            self.model = xgb.XGBClassifier(
+                n_estimators=200,
+                learning_rate=0.05,
+                max_depth=4,
+                min_child_weight=5,
+                subsample=0.8,
+                colsample_bytree=0.8,
+                reg_alpha=0.1,
+                reg_lambda=1.0,
+                tree_method='hist',
+                device='cpu',
+                n_jobs=-1,
+                enable_categorical=False,
+                early_stopping_rounds=20,
+                eval_metric='mlogloss',
+                random_state=42,
+                verbosity=0
+            )
+
+            self.model.fit(
+                X_train_scaled, y_train,
+                sample_weight=sw_train,
+                eval_set=[(X_test_scaled, y_test)],
+                sample_weight_eval_set=[sw_test],
+                verbose=False
+            )
+
+            train_score = self.model.score(X_train_scaled, y_train)
+            test_score = self.model.score(X_test_scaled, y_test)
+
+            logger.info(f"XGBoost trained: Train={train_score:.3f}, Test={test_score:.3f}")
+
+            # Save model
+            training_start = df_clean['feature_date'].min()
+            training_end = df_clean['feature_date'].max()
+
+            self.trainer.save_model(
+                strategy_name=self.name,
+                model=self.model,
+                scaler=self.scaler,
+                training_start_date=str(training_start),
+                training_end_date=str(training_end),
+                num_training_samples=len(X),
+                num_new_samples=len(X),
+                is_full_retrain=True,
+                train_accuracy=train_score,
+                test_accuracy=test_score,
+                feature_names=feature_cols,
+                hyperparameters=self.model.get_params(),
+                notes="Full retrain with all historical data"
+            )
+
+            return True
+
+        else:
+            logger.info("=" * 80)
+            logger.info("INCREMENTAL UPDATE: Loading only new data")
+            logger.info("=" * 80)
+
+            # Try incremental learning
+            old_model, old_scaler, model_info = self.trainer.load_model(self.name)
+
+            if old_model is None:
+                logger.warning("No existing model - performing full retrain")
+                return self.train_model(force_full_retrain=True)
+
+            # Get new data only
+            query = self._get_historical_data_query()
+            new_df, should_retrain = self.trainer.get_new_training_data(
+                strategy_name=self.name,
+                query=query,
+                min_samples=100
+            )
+
+            if not should_retrain:
+                logger.info("Using existing model (insufficient new data)")
+                self.model = old_model
+                self.scaler = old_scaler
+                self.feature_cols = model_info['feature_names']
+                return True
+
+            # Prepare new data
+            df_labeled = self._create_balanced_labels(new_df)
+            X_new, y_new, df_clean, feature_cols = self._prepare_features(df_labeled)
+
+            if len(X_new) == 0:
+                logger.warning("No valid new features - using existing model")
+                self.model = old_model
+                self.scaler = old_scaler
+                self.feature_cols = model_info['feature_names']
+                return True
+
+            # Store feature columns
+            self.feature_cols = feature_cols
+
+            # Scale new data with OLD scaler (important!)
+            X_new_scaled = old_scaler.transform(X_new)
+
+            # Incremental training
+            updated_model = self.trainer.incremental_train_xgboost(
+                old_model=old_model,
+                X_new=X_new_scaled,
+                y_new=y_new,
+                n_estimators_new=50
+            )
+
+            # Evaluate on new data
+            train_score = updated_model.score(X_new_scaled, y_new)
+
+            logger.info(f"Incremental update complete: Accuracy on new data={train_score:.3f}")
+
+            # Save updated model
+            training_start = model_info['training_end_date']  # Continue from last
+            training_end = df_clean['feature_date'].max()
+
+            self.trainer.save_model(
+                strategy_name=self.name,
+                model=updated_model,
+                scaler=old_scaler,  # Keep old scaler
+                training_start_date=str(training_start),
+                training_end_date=str(training_end),
+                num_training_samples=model_info['num_training_samples'] + len(X_new),
+                num_new_samples=len(X_new),
+                is_full_retrain=False,
+                train_accuracy=train_score,
+                test_accuracy=train_score,  # No separate test set for incremental
+                feature_names=feature_cols,
+                hyperparameters=updated_model.get_params(),
+                notes=f"Incremental update with {len(X_new)} new samples"
+            )
+
+            self.model = updated_model
+            self.scaler = old_scaler
+
+            return True
 
     def generate_signals(self) -> pd.DataFrame:
-        """Generate ML-optimized trading signals with ALL available data"""
-        # Get ALL historical data (with fundamentals, analyst, earnings, insider)
-        df = self._get_all_historical_data()
+        """Generate signals using trained/loaded model"""
+        # Try to load existing model first
+        if self.model is None:
+            logger.info("No model loaded - attempting to load from disk")
+            old_model, old_scaler, model_info = self.trainer.load_model(self.name)
 
-        if df.empty:
-            logger.warning("No data available")
-            return pd.DataFrame()
-
-        # Create balanced labels
-        df_labeled = self._create_balanced_labels(df)
-
-        # Prepare features (now returns feature_cols list)
-        X, y, df_clean, feature_cols = self._prepare_features(df_labeled)
-
-        if len(X) == 0:
-            logger.warning("No valid features")
-            return pd.DataFrame()
-
-        # Store feature columns for prediction
-        self.feature_cols = feature_cols
-
-        # Train optimized model
-        self._train_optimized_model(X, y)
+            if old_model is not None:
+                self.model = old_model
+                self.scaler = old_scaler
+                self.feature_cols = model_info['feature_names']
+            else:
+                logger.info("No existing model found - training new model")
+                success = self.train_model(force_full_retrain=True)
+                if not success:
+                    return pd.DataFrame()
 
         if self.model is None:
             logger.warning("Model training failed")
             return pd.DataFrame()
 
-        # Log feature importance
-        importance = self._get_feature_importance(feature_cols)
-        logger.info(f"\nTop 10 features (out of {len(feature_cols)}):")
-        for feat, imp in list(importance.items())[:10]:
-            logger.info(f"  {feat}: {imp:.3f}")
+        # Get latest data
+        df = self._get_all_historical_data()
+        if df.empty:
+            return pd.DataFrame()
 
-        # Get latest data for each ticker
+        df_labeled = self._create_balanced_labels(df)
+        _, _, df_clean, _ = self._prepare_features(df_labeled)
+
+        # Get latest for each ticker
         latest_data = df_clean.groupby('symbol_ticker').tail(1)
 
-        # Use the SAME feature columns from training, fill missing with 0
+        # Use SAME features from training
         X_latest_list = []
         for _, row in latest_data.iterrows():
-            row_features = [row.get(col, 0) for col in feature_cols]
+            row_features = [row.get(col, 0) for col in self.feature_cols]
             X_latest_list.append(row_features)
         X_latest = np.array(X_latest_list)
         X_latest_scaled = self.scaler.transform(X_latest)
 
-        # Predict with probabilities
+        # Predict
         predictions = self.model.predict(X_latest_scaled)
         probabilities = self.model.predict_proba(X_latest_scaled)
-
-        # NumPy-vectorized signal generation (10x faster than iterrows)
-        # Convert to NumPy arrays for vectorized operations
         confidences = np.max(probabilities, axis=1)
 
-        # Filter high-confidence predictions (vectorized)
-        # Labels: 0=STRONG SELL, 1=SELL, 2=HOLD, 3=BUY, 4=STRONG BUY
+        # Generate signals
         high_conf_mask = confidences >= 0.6
-        buy_mask = (predictions >= 3) & high_conf_mask  # BUY (3) or STRONG BUY (4)
-        sell_mask = (predictions <= 1) & high_conf_mask  # SELL (1) or STRONG SELL (0)
+        buy_mask = (predictions >= 3) & high_conf_mask
+        sell_mask = (predictions <= 1) & high_conf_mask
 
-        # Extract NumPy arrays (much faster than row access)
         symbols = latest_data['symbol_ticker'].values
         dates = latest_data['feature_date'].values
         prices = latest_data['current_price'].values
@@ -552,7 +614,7 @@ class SentimentTradingStrategy(BaseStrategy):
 
         signals = []
 
-        # Process BUY signals (vectorized)
+        # BUY signals
         buy_indices = np.where(buy_mask)[0]
         for idx in buy_indices:
             price = prices[idx]
@@ -570,7 +632,7 @@ class SentimentTradingStrategy(BaseStrategy):
                 'metadata': f'{{"prediction": {predictions[idx]}, "confidence": {confidence:.3f}, "sentiment_divergence": {sent_diverg[idx]:.2f}}}'
             })
 
-        # Process SELL signals (vectorized)
+        # SELL signals
         sell_indices = np.where(sell_mask)[0]
         for idx in sell_indices:
             price = prices[idx]
@@ -588,15 +650,17 @@ class SentimentTradingStrategy(BaseStrategy):
                 'metadata': f'{{"prediction": {predictions[idx]}, "confidence": {confidence:.3f}, "sentiment_divergence": {sent_diverg[idx]:.2f}}}'
             })
 
-        logger.info(f"\nGenerated {len(signals)} signals:")
-        if signals:
-            signal_df = pd.DataFrame(signals)
-            logger.info(signal_df['signal_type'].value_counts())
-
+        logger.info(f"Generated {len(signals)} signals")
         return pd.DataFrame(signals)
 
 
 if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
     strategy = SentimentTradingStrategy()
+
+    # Train with incremental learning
+    strategy.train_model(force_full_retrain=False)
+
+    # Generate signals
     signals = strategy.run()
     print(f"\nGenerated {len(signals)} signals")

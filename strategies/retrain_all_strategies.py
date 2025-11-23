@@ -20,7 +20,7 @@ from datetime import datetime
 # Add strategies to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-from sentiment_trading_incremental import SentimentTradingStrategy
+from sentiment_trading import SentimentTradingStrategy
 from incremental_trainer import IncrementalTrainer
 
 # Configure logging
