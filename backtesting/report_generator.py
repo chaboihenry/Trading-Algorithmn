@@ -307,21 +307,38 @@ class ReportGenerator:
 
 """
 
+        # EnsembleStrategy metrics (primary - used for trade recommendations)
+        strategy_validation = report_data.get('strategy_validation', {})
+        ensemble_result = strategy_validation.get('EnsembleStrategy', {})
+
+        if ensemble_result.get('success'):
+            metrics = ensemble_result.get('metrics', {})
+            status = "PASS" if ensemble_result.get('passes_validation') else "FAIL"
+            md_content += f"### EnsembleStrategy (Walk-Forward Validation)\n\n"
+            md_content += f"| Metric | Value |\n"
+            md_content += f"|--------|-------|\n"
+            md_content += f"| Sharpe Ratio | {metrics.get('sharpe_ratio', 0):.2f} |\n"
+            md_content += f"| Win Rate | {metrics.get('win_rate', 0):.1%} |\n"
+            md_content += f"| Total Return | {metrics.get('total_return', 0):.2%} |\n"
+            md_content += f"| Max Drawdown | {metrics.get('max_drawdown', 0):.2%} |\n"
+            md_content += f"| Trades Analyzed | {ensemble_result.get('num_trades', 0)} |\n"
+            md_content += f"| **Validation** | **{status}** |\n\n"
+
         # Risk assessment summary
         risk = report_data.get('risk_assessment', {})
         md_content += f"**Risk Level:** {risk.get('risk_score', 0)}/10  \n"
         md_content += f"**Recommendation:** {risk.get('recommendation', 'Unknown')}  \n\n"
 
-        # Strategy validation summary
-        md_content += "### Strategy Validation\n\n"
-        for strategy, result in report_data.get('strategy_validation', {}).items():
+        # Other strategies (secondary)
+        md_content += "### Other Strategies\n\n"
+        for strategy, result in strategy_validation.items():
+            if strategy == 'EnsembleStrategy':
+                continue  # Already shown above
             if result.get('success'):
                 status = "✅ PASS" if result.get('passes_validation') else "❌ FAIL"
                 metrics = result['metrics']
                 md_content += f"- **{strategy}** {status}\n"
-                md_content += f"  - Sharpe: {metrics.get('sharpe_ratio', 0):.2f}\n"
-                md_content += f"  - Return: {metrics.get('total_return', 0):.2%}\n"
-                md_content += f"  - Trades: {result.get('num_trades', 0)}\n\n"
+                md_content += f"  - Sharpe: {metrics.get('sharpe_ratio', 0):.2f}, Return: {metrics.get('total_return', 0):.2%}, Trades: {result.get('num_trades', 0)}\n\n"
 
         # Trade recommendations
         md_content += "---\n\n## Trade Recommendations\n\n"

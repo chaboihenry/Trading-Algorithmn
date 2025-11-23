@@ -4,7 +4,7 @@ Daily Trade Notification Script
 
 Runs after the complete automation process and sends:
 - Top 5 trades from EnsembleStrategy (best performing strategy)
-- Portfolio performance metrics
+- Portfolio performance metrics (using walk-forward validation)
 - Comprehensive daily report
 
 Sends to: henry.vianna123@gmail.com
@@ -19,7 +19,7 @@ import pandas as pd
 sys.path.append(str(Path(__file__).parent.parent))
 
 from backtesting.trade_ranker import TradeRanker
-from backtesting.backtest_engine import BacktestEngine
+from backtesting.strategy_validator import StrategyValidator
 from notifications.email_sender import EmailSender
 
 
@@ -64,13 +64,32 @@ def send_daily_trade_notification(
             print("\n⚠️  No trades available from EnsembleStrategy")
             print("Sending notification with no trade recommendations...")
 
-        # Step 2: Get portfolio performance metrics
+        # Step 2: Get portfolio performance metrics using walk-forward validation
+        # This ensures consistency with the daily report metrics
         print("\n" + "▶"*40)
-        print("STEP 2: ANALYZING PORTFOLIO PERFORMANCE")
+        print("STEP 2: WALK-FORWARD VALIDATION (EnsembleStrategy)")
         print("▶"*40)
 
-        engine = BacktestEngine()
-        performance = engine.analyze_portfolio_performance(lookback_days=90)
+        validator = StrategyValidator()
+        validation_result = validator.quick_validation('EnsembleStrategy', lookback_days=90)
+
+        # Convert validation result to format expected by email_sender
+        performance = None
+        if validation_result.get('success'):
+            metrics = validation_result.get('metrics', {})
+            performance = {
+                'success': True,
+                'strategy_metrics': {
+                    'EnsembleStrategy': {
+                        'sharpe': metrics.get('sharpe_ratio', 0),
+                        'win_rate': metrics.get('win_rate', 0),
+                        'avg_return': metrics.get('total_return', 0),
+                        'num_trades': validation_result.get('num_trades', 0)
+                    }
+                },
+                'validation_passed': validation_result.get('passes_validation', False),
+                'validation_reason': validation_result.get('validation_reason', '')
+            }
 
         # Step 3: Get latest report path (if exists)
         print("\n" + "▶"*40)

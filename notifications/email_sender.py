@@ -216,45 +216,53 @@ class EmailSender:
         </div>
 """
 
-        # Portfolio metrics section - USE ENSEMBLESTRATEGY METRICS (not overall)
+        # Portfolio metrics section - USE WALK-FORWARD VALIDATION METRICS
+        # These metrics match the daily report for consistency
         if performance_metrics:
-            # Get EnsembleStrategy-specific metrics since trades are from EnsembleStrategy
+            # Get EnsembleStrategy-specific metrics from walk-forward validation
             strategy_metrics = performance_metrics.get('strategy_metrics', {})
             ensemble_metrics = strategy_metrics.get('EnsembleStrategy', {})
 
-            # Use EnsembleStrategy metrics if available, otherwise fall back to overall
             if ensemble_metrics:
                 sharpe = ensemble_metrics.get('sharpe', 0)
                 win_rate = ensemble_metrics.get('win_rate', 0)
-                avg_return = ensemble_metrics.get('avg_return', 0)
+                total_return = ensemble_metrics.get('avg_return', 0)  # This is total_return from validation
+                num_trades = ensemble_metrics.get('num_trades', 0)
             else:
-                overall = performance_metrics.get('overall_metrics', {})
-                sharpe = overall.get('sharpe_ratio', 0)
-                win_rate = overall.get('win_rate', 0)
-                avg_return = overall.get('total_return', 0)
+                sharpe = 0
+                win_rate = 0
+                total_return = 0
+                num_trades = 0
 
-            html += """
+            # Get validation status
+            validation_passed = performance_metrics.get('validation_passed', False)
+            validation_status = "PASS" if validation_passed else "FAIL"
+            validation_color = "#28a745" if validation_passed else "#dc3545"
+
+            html += f"""
+        <p style="text-align: center; margin-bottom: 15px; color: #666; font-size: 14px;">
+            Walk-Forward Validation (90 days) | {num_trades} trades analyzed
+        </p>
         <div class="metrics">
             <div class="metric-card">
                 <div class="metric-label">Sharpe Ratio</div>
-                <div class="metric-value{}">{:.2f}</div>
+                <div class="metric-value{' positive' if sharpe > 0 else ' negative'}">{sharpe:.2f}</div>
             </div>
             <div class="metric-card">
                 <div class="metric-label">Win Rate</div>
-                <div class="metric-value">{:.1%}</div>
+                <div class="metric-value">{win_rate:.1%}</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Avg Return</div>
-                <div class="metric-value{}">{:.2%}</div>
+                <div class="metric-label">Total Return</div>
+                <div class="metric-value{' positive' if total_return > 0 else ' negative'}">{total_return:.2%}</div>
             </div>
         </div>
-""".format(
-                " positive" if sharpe > 0 else " negative",
-                sharpe,
-                win_rate,
-                " positive" if avg_return > 0 else " negative",
-                avg_return
-            )
+        <div style="text-align: center; margin: 15px 0;">
+            <span style="background: {validation_color}; color: white; padding: 8px 20px; border-radius: 20px; font-weight: bold;">
+                Validation: {validation_status}
+            </span>
+        </div>
+"""
 
         # Trades section
         if len(trades) > 0:
