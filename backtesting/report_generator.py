@@ -303,13 +303,6 @@ class ReportGenerator:
 
 ---
 
-## Configuration
-- **Total Capital:** ${report_data['config']['total_capital']:,.0f}
-- **Recommendations:** Top {report_data['config']['num_trades']} trades
-- **Validation Period:** {report_data['config']['lookback_days']} days
-
----
-
 ## Executive Summary
 
 """
@@ -336,19 +329,18 @@ class ReportGenerator:
         if isinstance(top_trades, pd.DataFrame) and len(top_trades) > 0:
             for i, row in top_trades.iterrows():
                 direction = "LONG" if row['signal'] == 'BUY' else "SHORT"
-                md_content += f"### #{i+1} {row['symbol']} ({direction})\n"
-                md_content += f"- **Strategy:** {row['strategy_name']}\n"
-                md_content += f"- **Position Size:** {row['position_size']:.2%} (${row['position_value']:,.0f})\n"
-                md_content += f"- **Shares:** {row['num_shares']:,}\n"
-                md_content += f"- **Entry:** ${row['close']:.2f}\n"
-                md_content += f"- **Stop Loss:** ${row['stop_loss_price']:.2f}\n"
-                md_content += f"- **Take Profit:** ${row['take_profit_price']:.2f}\n"
-                md_content += f"- **Score:** {row['score']:.4f}\n"
-                md_content += f"- **Signal Strength:** {row['signal_strength']:.2f}\n\n"
+                if direction == "LONG":
+                    action = "BUY"
+                    exit_action = "SELL"
+                else:
+                    action = "SELL"
+                    exit_action = "BUY BACK"
 
-            total_allocation = top_trades['position_size'].sum()
-            md_content += f"**Total Allocation:** {total_allocation:.2%} (${total_allocation * report_data['config']['total_capital']:,.0f})  \n"
-            md_content += f"**Cash Remaining:** {1 - total_allocation:.2%} (${(1 - total_allocation) * report_data['config']['total_capital']:,.0f})\n\n"
+                md_content += f"### #{i+1} {row['symbol']} ({direction})\n"
+                md_content += f"- **{action} at:** ${row['close']:.2f}\n"
+                md_content += f"- **{exit_action} at:** ${row['take_profit_price']:.2f}\n"
+                md_content += f"- **Stop Loss:** ${row['stop_loss_price']:.2f}\n"
+                md_content += f"- **Signal Strength:** {row['signal_strength']:.2f}\n\n"
         else:
             md_content += "❌ No trade recommendations generated.\n\n"
 

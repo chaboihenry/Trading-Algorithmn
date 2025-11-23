@@ -216,9 +216,23 @@ class EmailSender:
         </div>
 """
 
-        # Portfolio metrics section
+        # Portfolio metrics section - USE ENSEMBLESTRATEGY METRICS (not overall)
         if performance_metrics:
-            metrics = performance_metrics.get('overall_metrics', {})
+            # Get EnsembleStrategy-specific metrics since trades are from EnsembleStrategy
+            strategy_metrics = performance_metrics.get('strategy_metrics', {})
+            ensemble_metrics = strategy_metrics.get('EnsembleStrategy', {})
+
+            # Use EnsembleStrategy metrics if available, otherwise fall back to overall
+            if ensemble_metrics:
+                sharpe = ensemble_metrics.get('sharpe', 0)
+                win_rate = ensemble_metrics.get('win_rate', 0)
+                avg_return = ensemble_metrics.get('avg_return', 0)
+            else:
+                overall = performance_metrics.get('overall_metrics', {})
+                sharpe = overall.get('sharpe_ratio', 0)
+                win_rate = overall.get('win_rate', 0)
+                avg_return = overall.get('total_return', 0)
+
             html += """
         <div class="metrics">
             <div class="metric-card">
@@ -230,16 +244,16 @@ class EmailSender:
                 <div class="metric-value">{:.1%}</div>
             </div>
             <div class="metric-card">
-                <div class="metric-label">Total Return</div>
+                <div class="metric-label">Avg Return</div>
                 <div class="metric-value{}">{:.2%}</div>
             </div>
         </div>
 """.format(
-                " positive" if metrics.get('sharpe_ratio', 0) > 0 else " negative",
-                metrics.get('sharpe_ratio', 0),
-                metrics.get('win_rate', 0),
-                " positive" if metrics.get('total_return', 0) > 0 else " negative",
-                metrics.get('total_return', 0)
+                " positive" if sharpe > 0 else " negative",
+                sharpe,
+                win_rate,
+                " positive" if avg_return > 0 else " negative",
+                avg_return
             )
 
         # Trades section
