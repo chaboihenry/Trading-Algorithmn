@@ -60,7 +60,6 @@ class ReportGenerator:
         print("DAILY TRADING REPORT GENERATOR")
         print("="*80)
         print(f"\nDate: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print(f"Capital: ${total_capital:,.0f}")
         print(f"Recommendations: Top {num_trades} trades")
         print("="*80)
 
@@ -69,7 +68,6 @@ class ReportGenerator:
             'date': datetime.now().strftime('%Y-%m-%d'),
             'config': {
                 'num_trades': num_trades,
-                'total_capital': total_capital,
                 'lookback_days': lookback_days
             }
         }
@@ -188,8 +186,8 @@ class ReportGenerator:
         return results
 
     def _assess_risks(self, strategy_results: Dict, ensemble_results: Dict,
-                     top_trades: pd.DataFrame, total_capital: float) -> Dict[str, any]:
-        """Assess trading risks"""
+                     top_trades: pd.DataFrame, total_capital: float = None) -> Dict[str, any]:
+        """Assess trading risks based on strategy validation (not position sizing)"""
         risks = {
             'warnings': [],
             'alerts': [],
@@ -214,17 +212,14 @@ class ReportGenerator:
                 risks['warnings'].append("Ensemble not outperforming individual strategies")
                 risks['risk_score'] += 2
 
-        # Check trade concentration
+        # Check signal quality (not position sizing)
         if len(top_trades) > 0:
-            max_position = top_trades['position_size'].max()
-            if max_position > 0.15:  # More than 15%
-                risks['alerts'].append(f"⚠️  High concentration: {max_position:.1%} in single position")
-                risks['risk_score'] += 2
-
-            total_allocation = top_trades['position_size'].sum()
-            if total_allocation > 0.60:  # More than 60% allocated
-                risks['warnings'].append(f"High total allocation: {total_allocation:.1%}")
-                risks['risk_score'] += 1
+            # Check if signals have low strength
+            if 'signal_strength' in top_trades.columns:
+                avg_strength = top_trades['signal_strength'].mean()
+                if avg_strength < 0.5:
+                    risks['warnings'].append(f"Average signal strength is low: {avg_strength:.2f}")
+                    risks['risk_score'] += 1
 
         # Risk recommendation
         if risks['risk_score'] <= 3:
@@ -232,7 +227,7 @@ class ReportGenerator:
         elif risks['risk_score'] <= 6:
             risks['recommendation'] = "⚠️  MEDIUM RISK - Execute with caution, monitor closely"
         else:
-            risks['recommendation'] = "❌ HIGH RISK - Consider reducing position sizes or skipping"
+            risks['recommendation'] = "❌ HIGH RISK - Consider skipping today's trades"
 
         # Print risk assessment
         print(f"\nRisk Score: {risks['risk_score']}/10")
