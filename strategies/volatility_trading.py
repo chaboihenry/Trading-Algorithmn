@@ -1,7 +1,14 @@
 """
-Volatility Regime Trading (M1 Optimized)
-=========================================
+Volatility Regime Trading with Incremental Learning (M1 Optimized)
+===================================================================
 Uses vectorized GARCH models and XGBoost for M1-optimized volatility forecasting
+with incremental training support for daily model updates.
+
+HYBRID FIX APPLIED:
+1. Lower regime thresholds: ±15% -> ±10%
+2. Class weights for imbalanced data
+3. Lower confidence threshold: 0.60 -> 0.50
+4. Extreme percentile signals for stable regime
 """
 
 import pandas as pd
@@ -10,12 +17,15 @@ import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
+from incremental_trainer import IncrementalTrainer
 import logging
+import joblib
 
 # M1-optimized imports
 import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
 
 # Vectorized GARCH
 try:
@@ -29,7 +39,13 @@ logger = logging.getLogger(__name__)
 
 
 class VolatilityTradingStrategy(BaseStrategy):
-    """Trade based on vectorized GARCH forecasts and XGBoost regime prediction (M1 optimized)"""
+    """Trade based on GARCH forecasts and XGBoost regime prediction with incremental learning"""
+
+    # HYBRID FIX: Adjusted thresholds and parameters
+    REGIME_THRESHOLD = 0.10  # Changed from 0.15 to 0.10 (more sensitive)
+    CONFIDENCE_THRESHOLD = 0.50  # Changed from 0.60 to 0.50 (more signals)
+    EXTREME_VOL_PERCENTILE_LOW = 15  # For stable regime signals
+    EXTREME_VOL_PERCENTILE_HIGH = 85  # For stable regime signals
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
                  lookback_days: int = 90,
@@ -40,9 +56,62 @@ class VolatilityTradingStrategy(BaseStrategy):
         self.model = None
         self.scaler = StandardScaler()
         self.name = "VolatilityTradingStrategy"
+        self.trainer = IncrementalTrainer(db_path=db_path)
+        self.feature_cols = None
 
-    def _get_volatility_features(self) -> pd.DataFrame:
+        # Try to load existing model
+        self._load_model()
+
+    def _get_model_path(self) -> Path:
+        """Get path to saved model"""
+        models_dir = Path(__file__).parent / 'models'
+        models_dir.mkdir(exist_ok=True)
+        return models_dir / 'volatility_xgboost.joblib'
+
+    def _get_scaler_path(self) -> Path:
+        """Get path to saved scaler"""
+        models_dir = Path(__file__).parent / 'models'
+        return models_dir / 'volatility_scaler.joblib'
+
+    def _get_features_path(self) -> Path:
+        """Get path to saved feature columns"""
+        models_dir = Path(__file__).parent / 'models'
+        return models_dir / 'volatility_features.joblib'
+
+    def _load_model(self) -> bool:
+        """Load saved model, scaler, and feature columns"""
+        model_path = self._get_model_path()
+        scaler_path = self._get_scaler_path()
+        features_path = self._get_features_path()
+
+        if model_path.exists() and scaler_path.exists() and features_path.exists():
+            try:
+                self.model = joblib.load(model_path)
+                self.scaler = joblib.load(scaler_path)
+                self.feature_cols = joblib.load(features_path)
+                logger.info(f"Loaded existing volatility model from {model_path}")
+                return True
+            except Exception as e:
+                logger.warning(f"Failed to load model: {e}")
+                return False
+        return False
+
+    def _save_model(self) -> None:
+        """Save model, scaler, and feature columns"""
+        if self.model is not None:
+            try:
+                joblib.dump(self.model, self._get_model_path())
+                joblib.dump(self.scaler, self._get_scaler_path())
+                joblib.dump(self.feature_cols, self._get_features_path())
+                logger.info(f"Saved volatility model to {self._get_model_path()}")
+            except Exception as e:
+                logger.error(f"Failed to save model: {e}")
+
+    def _get_volatility_features(self, lookback_days: int = None) -> pd.DataFrame:
         """Get comprehensive volatility features for ML model with OPTIONS and ECONOMIC data"""
+        if lookback_days is None:
+            lookback_days = self.lookback_days
+
         conn = self._conn()
         query = f"""
             SELECT
@@ -86,7 +155,7 @@ class VolatilityTradingStrategy(BaseStrategy):
                 mf.return_5d,
                 mf.return_20d,
                 rpd.close as current_price,
-                -- OPTIONS DATA (added)
+                -- OPTIONS DATA
                 od.implied_volatility_30d,
                 od.implied_volatility_60d,
                 od.implied_volatility_90d,
@@ -100,7 +169,7 @@ class VolatilityTradingStrategy(BaseStrategy):
                 od.total_options_volume,
                 od.atm_iv,
                 od.skew_25delta,
-                -- ECONOMIC INDICATORS (added)
+                -- ECONOMIC INDICATORS
                 ei.vix,
                 ei.treasury_10y,
                 ei.treasury_2y,
@@ -138,7 +207,7 @@ class VolatilityTradingStrategy(BaseStrategy):
                     SELECT MAX(indicator_date) FROM economic_indicators
                 )
             ) ei ON vm.vol_date = ei.indicator_date
-            WHERE vm.vol_date >= date('now', '-{self.lookback_days} days')
+            WHERE vm.vol_date >= date('now', '-{lookback_days} days')
             ORDER BY vm.symbol_ticker, vm.vol_date
         """
         df = pd.read_sql(query, conn)
@@ -147,41 +216,33 @@ class VolatilityTradingStrategy(BaseStrategy):
         return df
 
     def _calculate_garch_features_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Vectorized GARCH calculation for M1 optimization
-
-        Uses arch package for fast, vectorized GARCH(1,1) estimation
-        Falls back to vectorized approximation if arch not available
-        """
+        """Vectorized GARCH calculation for M1 optimization"""
         if ARCH_AVAILABLE:
-            # FAST: Use vectorized arch package (10-100x faster)
             for ticker in df['symbol_ticker'].unique():
                 mask = df['symbol_ticker'] == ticker
                 ticker_data = df[mask].sort_values('vol_date')
 
-                returns = ticker_data['return_1d'].fillna(0).infer_objects(copy=False) * 100  # Scale for numerical stability
+                returns = ticker_data['return_1d'].fillna(0).infer_objects(copy=False) * 100
 
-                if len(returns) < 30:  # Need minimum data for GARCH
+                if len(returns) < 30:
                     continue
 
                 try:
-                    # Fit GARCH(1,1) model (vectorized, very fast)
                     model = arch_model(
                         returns,
                         vol='GARCH',
                         p=1,
                         q=1,
                         rescale=False,
-                        mean='Zero'  # No mean model for speed
+                        mean='Zero'
                     )
                     result = model.fit(
                         disp='off',
-                        options={'maxiter': 100},  # Limit iterations for speed
+                        options={'maxiter': 100},
                         show_warning=False
                     )
 
-                    # Get conditional volatility (already computed, no loops!)
-                    cond_vol = result.conditional_volatility / 100  # Unscale
+                    cond_vol = result.conditional_volatility / 100
 
                     df.loc[mask, 'garch_cond_vol'] = cond_vol.values
                     df.loc[mask, 'garch_forecast'] = df.loc[mask, 'garch_cond_vol'].shift(1)
@@ -191,10 +252,8 @@ class VolatilityTradingStrategy(BaseStrategy):
 
                 except Exception as e:
                     logger.warning(f"GARCH fit failed for {ticker}: {e}")
-                    # Fall back to simple method for this ticker
                     self._calculate_simple_garch(df, mask)
         else:
-            # FALLBACK: Vectorized approximation (still much faster than loops)
             for ticker in df['symbol_ticker'].unique():
                 mask = df['symbol_ticker'] == ticker
                 self._calculate_simple_garch(df, mask)
@@ -206,8 +265,7 @@ class VolatilityTradingStrategy(BaseStrategy):
         ticker_data = df[mask].sort_values('vol_date')
         returns = ticker_data['return_1d'].fillna(0)
 
-        # Vectorized EWMA for variance (no loops!)
-        alpha = 0.06  # RiskMetrics-style
+        alpha = 0.06
         variance = (returns ** 2).ewm(alpha=alpha, adjust=False).mean()
         cond_vol = np.sqrt(variance)
 
@@ -218,21 +276,19 @@ class VolatilityTradingStrategy(BaseStrategy):
         )
 
     def _create_regime_labels(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Create volatility regime labels for classification"""
+        """Create volatility regime labels with ADJUSTED THRESHOLDS"""
         df = df.sort_values(['symbol_ticker', 'vol_date'])
 
-        # Calculate future volatility change (for labeling)
         df['future_vol_change'] = df.groupby('symbol_ticker')['close_to_close_vol_20d'].shift(-5)
         df['vol_change_pct'] = (
             (df['future_vol_change'] - df['close_to_close_vol_20d']) /
             df['close_to_close_vol_20d']
         )
 
-        # Create regime transition labels
-        # 0 = vol decreasing, 1 = vol stable, 2 = vol increasing
+        # HYBRID FIX: Use adjusted threshold (0.10 instead of 0.15)
         conditions = [
-            df['vol_change_pct'] < -0.15,  # Significant decrease
-            df['vol_change_pct'] > 0.15,    # Significant increase
+            df['vol_change_pct'] < -self.REGIME_THRESHOLD,  # Significant decrease
+            df['vol_change_pct'] > self.REGIME_THRESHOLD,    # Significant increase
         ]
         choices = [0, 2]
         df['regime_label'] = np.select(conditions, choices, default=1)
@@ -240,8 +296,7 @@ class VolatilityTradingStrategy(BaseStrategy):
         return df
 
     def _prepare_ml_features(self, df: pd.DataFrame) -> tuple:
-        """Prepare feature matrix with ALL available features (including options and economic)"""
-        # Core volatility features
+        """Prepare feature matrix with ALL available features"""
         feature_cols = [
             'close_to_close_vol_10d', 'close_to_close_vol_20d', 'close_to_close_vol_60d',
             'parkinson_vol_10d', 'parkinson_vol_20d',
@@ -255,18 +310,15 @@ class VolatilityTradingStrategy(BaseStrategy):
             'return_1d', 'return_5d', 'return_20d'
         ]
 
-        # Add GARCH features if available (many stocks may not have these)
         garch_features = ['garch_cond_vol', 'garch_forecast', 'vol_surprise']
         for feat in garch_features:
-            if feat in df.columns and df[feat].notna().sum() > 10:  # At least 10 non-null values
+            if feat in df.columns and df[feat].notna().sum() > 10:
                 feature_cols.append(feat)
 
-        # Convert volatility_trend to numeric
         trend_map = {'decreasing': -1, 'stable': 0, 'increasing': 1}
         df['volatility_trend_num'] = df['volatility_trend'].map(trend_map).fillna(0)
         feature_cols.append('volatility_trend_num')
 
-        # Add OPTIONS features if available (forward fill within ticker)
         options_features = [
             'implied_volatility_30d', 'implied_volatility_60d', 'implied_volatility_90d',
             'iv_percentile_1y', 'put_call_ratio', 'total_options_volume', 'atm_iv'
@@ -274,32 +326,26 @@ class VolatilityTradingStrategy(BaseStrategy):
         for feat in options_features:
             if feat in df.columns:
                 df[feat] = df.groupby('symbol_ticker')[feat].ffill()
-                if df[feat].notna().sum() > 10:  # At least 10 non-null values
-                    feature_cols.append(feat)
-
-        # Add ECONOMIC features if available (same for all tickers on same date)
-        economic_features = ['vix', 'treasury_10y', 'yield_curve_10y_2y']
-        for feat in economic_features:
-            if feat in df.columns:
-                df[feat] = df[feat].ffill()  # Forward fill economic data
                 if df[feat].notna().sum() > 10:
                     feature_cols.append(feat)
 
-        # Clean data - only drop rows where regime_label is missing
+        economic_features = ['vix', 'treasury_10y', 'yield_curve_10y_2y']
+        for feat in economic_features:
+            if feat in df.columns:
+                df[feat] = df[feat].ffill()
+                if df[feat].notna().sum() > 10:
+                    feature_cols.append(feat)
+
         df_clean = df.dropna(subset=['regime_label'])
 
-        # Fill remaining NaN with median (robust to outliers)
         for col in feature_cols:
             if col in df_clean.columns:
-                # Only calculate median if column has non-NaN values (prevents "mean of empty slice" warning)
                 if df_clean[col].notna().any():
                     median_val = df_clean[col].median()
                     df_clean[col] = df_clean[col].fillna(median_val if not pd.isna(median_val) else 0)
                 else:
-                    # Column is entirely NaN, fill with 0
                     df_clean[col] = 0
 
-        # Final check - ensure we have these columns
         available_cols = [col for col in feature_cols if col in df_clean.columns]
 
         if len(available_cols) == 0:
@@ -311,42 +357,45 @@ class VolatilityTradingStrategy(BaseStrategy):
         logger.info(f"Using {len(available_cols)} features for volatility regime prediction")
         return X, y, df_clean, available_cols
 
-    def _train_xgboost(self, X: np.ndarray, y: np.ndarray) -> None:
+    def _train_xgboost(self, X: np.ndarray, y: np.ndarray, incremental: bool = False) -> None:
         """
-        Train XGBoost for regime prediction with M1 optimizations
+        Train XGBoost with CLASS WEIGHTS for imbalanced data
 
-        M1 Optimizations:
-        - tree_method='hist': 2-3x faster on M1
-        - device='cpu': Leverage unified memory
-        - n_jobs=-1: Use all cores
+        HYBRID FIX: Added class weights to handle imbalanced regime distribution
         """
         if len(X) < self.min_samples:
             logger.warning(f"Not enough samples ({len(X)}) to train model")
             return
 
-        # Split data
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+        # HYBRID FIX: Compute class weights for imbalanced data
+        classes = np.unique(y)
+        class_weights = compute_class_weight('balanced', classes=classes, y=y)
+        weight_dict = dict(zip(classes, class_weights))
+        sample_weights = np.array([weight_dict[label] for label in y])
+
+        logger.info(f"Class distribution: {dict(zip(*np.unique(y, return_counts=True)))}")
+        logger.info(f"Class weights: {weight_dict}")
+
+        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
+            X, y, sample_weights, test_size=0.2, random_state=42, stratify=y
         )
 
-        # Scale features
         X_train_scaled = self.scaler.fit_transform(X_train)
         X_test_scaled = self.scaler.transform(X_test)
 
-        # XGBoost with M1 optimization + regularization to prevent overfitting
+        # XGBoost with M1 optimization + class weights
         self.model = xgb.XGBClassifier(
             n_estimators=150,
             learning_rate=0.1,
-            max_depth=5,                     # REDUCED from 6 to prevent overfitting
-            min_child_weight=4,              # INCREASED from 3 to prevent overfitting
+            max_depth=5,
+            min_child_weight=4,
             subsample=0.8,
             colsample_bytree=0.8,
-            reg_alpha=0.1,                   # L1 regularization (prevents overfitting)
-            reg_lambda=1.0,                  # L2 regularization (prevents overfitting)
-            # M1 OPTIMIZATIONS
-            tree_method='hist',              # Histogram algorithm (M1 optimized)
-            device='cpu',                    # M1 unified memory
-            n_jobs=-1,                       # All performance cores
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            tree_method='hist',
+            device='cpu',
+            n_jobs=-1,
             enable_categorical=False,
             early_stopping_rounds=15,
             eval_metric='mlogloss',
@@ -354,44 +403,91 @@ class VolatilityTradingStrategy(BaseStrategy):
             verbosity=0
         )
 
-        # Train with early stopping
+        # Train with sample weights
         self.model.fit(
             X_train_scaled, y_train,
+            sample_weight=w_train,
             eval_set=[(X_test_scaled, y_test)],
             verbose=False
         )
 
-        # Evaluate
         train_score = self.model.score(X_train_scaled, y_train)
         test_score = self.model.score(X_test_scaled, y_test)
 
-        logger.info(f"XGBoost trained (M1 optimized): Train accuracy={train_score:.3f}, Test accuracy={test_score:.3f}")
+        logger.info(f"XGBoost trained (with class weights): Train accuracy={train_score:.3f}, Test accuracy={test_score:.3f}")
+
+        # Save the model
+        self._save_model()
+
+    def incremental_train(self, force_full: bool = False) -> dict:
+        """
+        Incrementally train or update the model with new data
+
+        Args:
+            force_full: If True, retrain from scratch
+
+        Returns:
+            Training results dict
+        """
+        logger.info("="*60)
+        logger.info("VOLATILITY STRATEGY INCREMENTAL TRAINING")
+        logger.info("="*60)
+
+        # Check if we need full retrain
+        needs_full_retrain = force_full or self.model is None
+
+        if needs_full_retrain:
+            logger.info("Performing FULL model training...")
+            lookback = 365  # Use 1 year of data for full training
+        else:
+            logger.info("Performing INCREMENTAL model update...")
+            lookback = 30  # Just recent data for incremental
+
+        # Get data
+        df = self._get_volatility_features(lookback_days=lookback)
+
+        if df.empty:
+            return {'success': False, 'error': 'No volatility data available'}
+
+        # Calculate features
+        df = self._calculate_garch_features_vectorized(df)
+        df = self._create_regime_labels(df)
+        X, y, df_clean, feature_cols = self._prepare_ml_features(df)
+
+        if len(X) == 0:
+            return {'success': False, 'error': 'No valid features after cleaning'}
+
+        self.feature_cols = feature_cols
+
+        # Train model
+        self._train_xgboost(X, y, incremental=not needs_full_retrain)
+
+        if self.model is None:
+            return {'success': False, 'error': 'Model training failed'}
+
+        # Get class distribution after training
+        unique, counts = np.unique(y, return_counts=True)
+        class_dist = dict(zip(unique.astype(int), counts.astype(int)))
+
+        return {
+            'success': True,
+            'training_type': 'full' if needs_full_retrain else 'incremental',
+            'samples_used': len(X),
+            'features_used': len(feature_cols),
+            'class_distribution': class_dist,
+            'model_saved': True
+        }
 
     def _get_feature_importance(self) -> dict:
-        """Get feature importance from Random Forest"""
-        if self.model is None:
+        """Get feature importance from XGBoost"""
+        if self.model is None or self.feature_cols is None:
             return {}
 
-        feature_names = [
-            'close_to_close_vol_10d', 'close_to_close_vol_20d', 'close_to_close_vol_60d',
-            'parkinson_vol_10d', 'parkinson_vol_20d',
-            'garman_klass_vol_10d', 'garman_klass_vol_20d',
-            'yang_zhang_vol_10d', 'yang_zhang_vol_20d',
-            'realized_vol_percentile_1y', 'realized_vol_percentile_3y',
-            'volatility_of_volatility_20d', 'vol_clustering_index',
-            'volatility_acceleration', 'volume_weighted_volatility',
-            'abnormal_volume_count_20d', 'gap_frequency_60d',
-            'rsi_14', 'atr_14', 'bb_width', 'adx_14',
-            'return_1d', 'return_5d', 'return_20d',
-            'garch_cond_vol', 'garch_forecast', 'vol_surprise',
-            'volatility_trend_num'
-        ]
-
-        importance = dict(zip(feature_names, self.model.feature_importances_))
+        importance = dict(zip(self.feature_cols, self.model.feature_importances_))
         return dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
 
     def generate_signals(self) -> pd.DataFrame:
-        """Generate M1-optimized volatility trading signals"""
+        """Generate volatility trading signals with HYBRID FIX applied"""
         # Get volatility features
         df = self._get_volatility_features()
 
@@ -399,28 +495,31 @@ class VolatilityTradingStrategy(BaseStrategy):
             logger.warning("No volatility data available")
             return pd.DataFrame()
 
-        # Calculate GARCH features (vectorized - 10-100x faster)
+        # Calculate GARCH features
         df = self._calculate_garch_features_vectorized(df)
 
         # Create regime labels
         df = self._create_regime_labels(df)
 
-        # Prepare ML features (now returns feature_cols list)
+        # Prepare ML features
         X, y, df_clean, feature_cols = self._prepare_ml_features(df)
 
         if len(X) == 0:
             logger.warning("No valid features after cleaning")
             return pd.DataFrame()
 
-        # Store feature columns for prediction
-        self.feature_cols = feature_cols
-
-        # Train XGBoost (2-3x faster than RandomForest on M1)
-        self._train_xgboost(X, y)
-
+        # Train if no model exists
         if self.model is None:
-            logger.warning("Model training failed")
-            return pd.DataFrame()
+            self.feature_cols = feature_cols
+            self._train_xgboost(X, y)
+
+            if self.model is None:
+                logger.warning("Model training failed")
+                return pd.DataFrame()
+        else:
+            # Use saved feature columns
+            if self.feature_cols is None:
+                self.feature_cols = feature_cols
 
         # Log feature importance
         importance = self._get_feature_importance()
@@ -429,12 +528,12 @@ class VolatilityTradingStrategy(BaseStrategy):
             logger.info(f"  {feat}: {imp:.3f}")
 
         # Get latest data for prediction
-        latest_data = df_clean.groupby('symbol_ticker').tail(1)
+        latest_data = df_clean.groupby('symbol_ticker').tail(1).copy()
 
-        # Use the SAME feature columns from training, fill missing with 0
+        # Use saved feature columns, fill missing with 0
         X_latest_list = []
         for _, row in latest_data.iterrows():
-            row_features = [row.get(col, 0) for col in feature_cols]
+            row_features = [row.get(col, 0) for col in self.feature_cols]
             X_latest_list.append(row_features)
         X_latest = np.array(X_latest_list)
         X_latest_scaled = self.scaler.transform(X_latest)
@@ -443,68 +542,97 @@ class VolatilityTradingStrategy(BaseStrategy):
         regime_pred = self.model.predict(X_latest_scaled)
         regime_proba = self.model.predict_proba(X_latest_scaled)
 
-        # NumPy-vectorized signal generation (10x faster than iterrows)
-        # Calculate confidences vectorized
         confidences = np.max(regime_proba, axis=1)
 
-        # Vectorized filtering
-        high_conf_mask = confidences >= 0.6
+        # HYBRID FIX: Lower confidence threshold (0.50 instead of 0.60)
+        high_conf_mask = confidences >= self.CONFIDENCE_THRESHOLD
         buy_mask = (regime_pred == 2) & high_conf_mask  # Vol increasing
         sell_mask = (regime_pred == 0) & high_conf_mask  # Vol decreasing
 
-        # Extract NumPy arrays (avoid pandas row access)
+        # HYBRID FIX: Add signals for stable regime at extreme percentiles
+        stable_mask = regime_pred == 1
+        vol_percentiles = latest_data['realized_vol_percentile_1y'].values
+
+        # Stable + extreme low vol -> expect vol increase -> BUY volatility
+        extreme_low_vol_mask = stable_mask & (vol_percentiles < self.EXTREME_VOL_PERCENTILE_LOW) & high_conf_mask
+        # Stable + extreme high vol -> expect vol decrease -> SELL volatility
+        extreme_high_vol_mask = stable_mask & (vol_percentiles > self.EXTREME_VOL_PERCENTILE_HIGH) & high_conf_mask
+
+        # Combine masks
+        buy_mask = buy_mask | extreme_low_vol_mask
+        sell_mask = sell_mask | extreme_high_vol_mask
+
+        # Extract arrays
         symbols = latest_data['symbol_ticker'].values
         dates = latest_data['vol_date'].values
         prices = latest_data['current_price'].values
         atrs = latest_data['atr_14'].values
-        garch_forecasts = latest_data['garch_forecast'].values
+        garch_forecasts = latest_data['garch_forecast'].values if 'garch_forecast' in latest_data.columns else np.zeros(len(latest_data))
 
         signals = []
 
-        # Process BUY signals (vectorized)
+        # Process BUY signals
         buy_indices = np.where(buy_mask)[0]
         if len(buy_indices) > 0:
             buy_prices = prices[buy_indices]
             buy_atrs = atrs[buy_indices]
+            # Handle NaN ATRs
+            buy_atrs = np.where(np.isnan(buy_atrs), buy_prices * 0.02, buy_atrs)
             buy_stops = buy_prices * (1 - 2*buy_atrs/buy_prices)
             buy_targets = buy_prices * (1 + 3*buy_atrs/buy_prices)
 
             for i, idx in enumerate(buy_indices):
+                signal_source = "extreme_low_vol" if extreme_low_vol_mask[idx] else "regime_2"
                 signals.append({
                     'symbol_ticker': symbols[idx],
                     'signal_date': dates[idx],
                     'signal_type': 'BUY',
-                    'strength': confidences[idx],
-                    'entry_price': buy_prices[i],
-                    'stop_loss': buy_stops[i],
-                    'take_profit': buy_targets[i],
-                    'metadata': f'{{"predicted_regime": 2, "confidence": {confidences[idx]:.3f}, "garch_forecast": {garch_forecasts[idx]:.4f}, "model": "XGBoost_M1"}}'
+                    'strength': float(confidences[idx]),
+                    'entry_price': float(buy_prices[i]),
+                    'stop_loss': float(buy_stops[i]),
+                    'take_profit': float(buy_targets[i]),
+                    'metadata': f'{{"predicted_regime": {int(regime_pred[idx])}, "confidence": {confidences[idx]:.3f}, "signal_source": "{signal_source}", "model": "XGBoost_Incremental"}}'
                 })
 
-        # Process SELL signals (vectorized)
+        # Process SELL signals
         sell_indices = np.where(sell_mask)[0]
         if len(sell_indices) > 0:
             sell_prices = prices[sell_indices]
             sell_atrs = atrs[sell_indices]
+            # Handle NaN ATRs
+            sell_atrs = np.where(np.isnan(sell_atrs), sell_prices * 0.02, sell_atrs)
             sell_stops = sell_prices * (1 + 2*sell_atrs/sell_prices)
             sell_targets = sell_prices * (1 - 3*sell_atrs/sell_prices)
 
             for i, idx in enumerate(sell_indices):
+                signal_source = "extreme_high_vol" if extreme_high_vol_mask[idx] else "regime_0"
                 signals.append({
                     'symbol_ticker': symbols[idx],
                     'signal_date': dates[idx],
                     'signal_type': 'SELL',
-                    'strength': confidences[idx],
-                    'entry_price': sell_prices[i],
-                    'stop_loss': sell_stops[i],
-                    'take_profit': sell_targets[i],
-                    'metadata': f'{{"predicted_regime": 0, "confidence": {confidences[idx]:.3f}, "garch_forecast": {garch_forecasts[idx]:.4f}, "model": "XGBoost_M1"}}'
+                    'strength': float(confidences[idx]),
+                    'entry_price': float(sell_prices[i]),
+                    'stop_loss': float(sell_stops[i]),
+                    'take_profit': float(sell_targets[i]),
+                    'metadata': f'{{"predicted_regime": {int(regime_pred[idx])}, "confidence": {confidences[idx]:.3f}, "signal_source": "{signal_source}", "model": "XGBoost_Incremental"}}'
                 })
 
+        logger.info(f"Generated {len(signals)} volatility signals (threshold={self.CONFIDENCE_THRESHOLD}, regime_threshold={self.REGIME_THRESHOLD})")
         return pd.DataFrame(signals)
 
 
 if __name__ == "__main__":
+    import sys
+
     strategy = VolatilityTradingStrategy()
-    signals = strategy.run()
-    print(f"Generated {len(signals)} signals")
+
+    # Check for --retrain flag
+    if len(sys.argv) > 1 and sys.argv[1] == '--retrain':
+        force_full = '--full' in sys.argv
+        result = strategy.incremental_train(force_full=force_full)
+        print(f"\nTraining result: {result}")
+    else:
+        signals = strategy.run()
+        print(f"\nGenerated {len(signals)} signals")
+        if len(signals) > 0:
+            print(signals[['symbol_ticker', 'signal_type', 'strength']].head(10))
