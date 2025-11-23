@@ -36,14 +36,18 @@ class IncrementalTrainer:
 
     def __init__(self,
                  db_path: str = "/Volumes/Vault/85_assets_prediction.db",
-                 model_dir: str = "strategies/models"):
+                 model_dir: str = None):
         """
         Args:
             db_path: Path to database
-            model_dir: Directory to store model files
+            model_dir: Directory to store model files (default: strategies/models)
         """
         self.db_path = db_path
-        self.model_dir = Path(model_dir)
+        # Use absolute path relative to this file to avoid nested directories
+        if model_dir is None:
+            self.model_dir = Path(__file__).parent / 'models'
+        else:
+            self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # Ensure model metadata table exists
