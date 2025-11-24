@@ -95,12 +95,45 @@ daily_schedule:
     max_runtime_seconds: 600
     critical: false
 
-  # Tier 4: ML Features Aggregator (needs tier 1-3)
+  # Tier 3.5: Data Preprocessing (needs price data)
+  - name: "Calculate Technical Indicators"
+    script: "data_preprocessing/02_calculate_technical_indicators.py"
+    time: "09:45:00"
+    tier: 3.5
+    dependencies: ["Price Data Collection"]
+    max_runtime_seconds: 300
+    critical: true
+
+  - name: "Calculate Volatility Metrics"
+    script: "data_preprocessing/03_calculate_volatility.py"
+    time: "09:45:00"
+    tier: 3.5
+    dependencies: ["Price Data Collection", "Options Data"]
+    max_runtime_seconds: 300
+    critical: true
+
+  - name: "Calculate Correlations"
+    script: "data_preprocessing/01_calculate_correlations.py"
+    time: "09:45:00"
+    tier: 3.5
+    dependencies: ["Price Data Collection"]
+    max_runtime_seconds: 180
+    critical: false
+
+  - name: "Analyze Pairs"
+    script: "data_preprocessing/04_analyze_pairs.py"
+    time: "09:47:00"
+    tier: 3.7
+    dependencies: ["Price Data Collection", "Calculate Correlations"]
+    max_runtime_seconds: 300
+    critical: false
+
+  # Tier 4: ML Features Aggregator (needs tier 1-3.5)
   - name: "ML Features Aggregation"
     script: "data_preprocessing/05_ml_features_aggregator.py"
     time: "09:50:00"
     tier: 4
-    dependencies: ["Fundamental Data", "Economic Indicators", "News Events", "Sentiment Analysis"]
+    dependencies: ["Fundamental Data", "Economic Indicators", "News Events", "Sentiment Analysis", "Calculate Technical Indicators", "Calculate Volatility Metrics"]
     max_runtime_seconds: 300
     critical: true
 
