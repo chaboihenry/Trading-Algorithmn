@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from sentiment_trading import SentimentTradingStrategy
 from volatility_trading import VolatilityTradingStrategy
+from stacked_ensemble import StackedEnsemble
 from incremental_trainer import IncrementalTrainer
 
 # Configure logging
@@ -127,6 +128,49 @@ def main():
     except Exception as e:
         logger.error(f"❌ Volatility Strategy: Exception - {e}", exc_info=True)
         results['VolatilityTradingStrategy'] = f'ERROR: {e}'
+
+    # 4. Ensemble Strategy (stacked meta-learning)
+    logger.info("\n" + "=" * 80)
+    logger.info("RETRAINING: Ensemble Strategy (Stacked Meta-Learning)")
+    logger.info("=" * 80)
+
+    try:
+        ensemble = StackedEnsemble()
+
+        # Train meta-model (weekly retrain recommended)
+        if ensemble.meta_model is None or args.force_full_retrain:
+            logger.info("Training meta-model from scratch...")
+            metrics = ensemble.train_meta_model(lookback_days=90, use_cv=True)
+
+            if metrics.get('success'):
+                logger.info("✅ Ensemble Meta-Model: Training successful")
+                results['EnsembleStrategy'] = 'SUCCESS'
+                logger.info(f"   Train accuracy: {metrics['train_accuracy']:.2%}")
+                logger.info(f"   Test accuracy: {metrics['test_accuracy']:.2%}")
+                logger.info(f"   Test precision: {metrics['test_precision']:.2%}")
+                logger.info(f"   Samples: {metrics['n_samples']}")
+            else:
+                logger.error("❌ Ensemble Meta-Model: Training failed")
+                results['EnsembleStrategy'] = 'FAILED'
+        else:
+            logger.info("✅ Ensemble Meta-Model: Already trained (skipping)")
+            logger.info("   Run with --force-full-retrain to retrain meta-model")
+            results['EnsembleStrategy'] = 'SKIPPED (already trained)'
+
+        # Generate signals to verify
+        signals = ensemble.generate_signals()
+        logger.info(f"   Generated {len(signals)} ensemble signals")
+
+        if len(signals) > 0:
+            logger.info(f"   Signal breakdown:")
+            for signal_type in signals['signal_type'].unique():
+                count = len(signals[signals['signal_type'] == signal_type])
+                avg_conf = signals[signals['signal_type'] == signal_type]['strength'].mean()
+                logger.info(f"     {signal_type}: {count} (avg confidence: {avg_conf:.2%})")
+
+    except Exception as e:
+        logger.error(f"❌ Ensemble Strategy: Exception - {e}", exc_info=True)
+        results['EnsembleStrategy'] = f'ERROR: {e}'
 
     # Summary
     logger.info("\n" + "=" * 80)
