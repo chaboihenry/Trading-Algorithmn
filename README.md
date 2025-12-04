@@ -1,4 +1,4 @@
-# Integrated Trading Agent
+# Automated Trading System
 
 This is a live trading bot that uses a stacked ensemble of strategies to trade on the Alpaca paper trading platform.
 
@@ -10,7 +10,7 @@ The bot uses the following strategies:
 *   **Pairs Trading:** A statistical arbitrage strategy that finds cointegrated pairs.
 *   **Volatility Trading:** A strategy that trades based on volatility regime predictions.
 
-## Architecture
+## System Architecture
 
 The bot is designed with a clean and simple architecture:
 
