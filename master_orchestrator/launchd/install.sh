@@ -3,7 +3,7 @@
 # Install LaunchAgents for Automated Trading System
 #
 # This script installs macOS LaunchAgents that will automatically
-# run the trading system Monday-Friday at 9:30 AM ET.
+# run the trading system daily at 5:00 PM ET (after market close).
 #
 
 set -e
@@ -48,7 +48,8 @@ echo "Installation Complete!"
 echo "================================================================================"
 echo ""
 echo "The trading system will now run automatically:"
-echo "  • Every day at 9:30 AM ET (7 days/week for 24/7 crypto data)"
+echo "  • Daily pipeline: 5:00 PM ET (after market close for complete OHLCV data)"
+echo "  • Intraday monitoring: 9:30 AM - 4:00 PM ET (continuous during market hours)"
 echo "  • Waits up to 2 hours for external drive to be connected"
 echo ""
 echo "Logs:"

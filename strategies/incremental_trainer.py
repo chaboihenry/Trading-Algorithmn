@@ -1,4 +1,3 @@
-#!/Users/henry/miniconda3/envs/trading/bin/python
 """
 Incremental ML Model Training System
 
@@ -36,18 +35,14 @@ class IncrementalTrainer:
 
     def __init__(self,
                  db_path: str = "/Volumes/Vault/85_assets_prediction.db",
-                 model_dir: str = None):
+                 model_dir: str = "strategies/models"):
         """
         Args:
             db_path: Path to database
-            model_dir: Directory to store model files (default: strategies/models)
+            model_dir: Directory to store model files
         """
         self.db_path = db_path
-        # Use absolute path relative to this file to avoid nested directories
-        if model_dir is None:
-            self.model_dir = Path(__file__).parent / 'models'
-        else:
-            self.model_dir = Path(model_dir)
+        self.model_dir = Path(model_dir)
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
         # Ensure model metadata table exists
@@ -251,6 +246,39 @@ class IncrementalTrainer:
 
         return next_version
 
+    def get_last_training_date(self, strategy_name: str) -> Optional[str]:
+        """
+        Get the last training end date for a strategy
+
+        Args:
+            strategy_name: Name of strategy
+
+        Returns:
+            Last training end date (YYYY-MM-DD) or None if no training history
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+
+            cursor.execute("""
+                SELECT training_end_date
+                FROM model_metadata
+                WHERE strategy_name = ?
+                ORDER BY trained_date DESC
+                LIMIT 1
+            """, (strategy_name,))
+
+            result = cursor.fetchone()
+            conn.close()
+
+            if result:
+                return result[0]
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting last training date: {e}")
+            return None
+
     def get_new_training_data(self,
                               strategy_name: str,
                               query: str,
@@ -346,33 +374,69 @@ class IncrementalTrainer:
                                   old_model: xgb.XGBClassifier,
                                   X_new: np.ndarray,
                                   y_new: np.ndarray,
-                                  n_estimators_new: int = 50) -> xgb.XGBClassifier:
+                                  n_estimators_new: int = 50,
+                                  max_estimators: int = 200) -> xgb.XGBClassifier:
         """
-        Incrementally train XGBoost by adding more trees
+        Incrementally train XGBoost by adding more trees (WITH CAP to prevent bloat)
 
         Args:
             old_model: Previously trained XGBoost model
             X_new: New training features
             y_new: New training labels
-            n_estimators_new: Number of new trees to add
+            n_estimators_new: Number of new trees to add (default 50)
+            max_estimators: Maximum total trees allowed (default 200)
 
         Returns:
             Updated XGBoost model
+
+        IMPORTANT FIX: Models were growing from 657KB -> 29MB because trees kept accumulating.
+        Now we cap at max_estimators and reset to base model when limit is reached.
         """
         # Get old model parameters
         old_params = old_model.get_params()
         old_n_estimators = old_params['n_estimators']
 
-        # Create new model with additional trees
-        new_n_estimators = old_n_estimators + n_estimators_new
+        # FIX: Check if model has grown too large - reset to base instead of continuing to bloat
+        if old_n_estimators >= max_estimators:
+            logger.warning(f"⚠️  Model has {old_n_estimators} trees (max: {max_estimators})")
+            logger.warning(f"   Resetting to base model with {max_estimators} trees to prevent bloat")
+            logger.warning(f"   Previous models grew from 657KB -> 29MB due to uncapped growth!")
+
+            # Train fresh model with capped size
+            old_params['n_estimators'] = max_estimators
+            old_params.pop('early_stopping_rounds', None)
+            old_params.pop('eval_metric', None)
+
+            new_model = xgb.XGBClassifier(**old_params)
+            new_model.fit(X_new, y_new)
+
+            logger.info(f"✅ Reset to base model with {max_estimators} trees")
+            return new_model
+
+        # Calculate new total (capped at max)
+        new_n_estimators = min(old_n_estimators + n_estimators_new, max_estimators)
+        actual_trees_added = new_n_estimators - old_n_estimators
+
         old_params['n_estimators'] = new_n_estimators
 
-        # Remove early_stopping_rounds for incremental training (no validation set)
-        if 'early_stopping_rounds' in old_params:
-            old_params.pop('early_stopping_rounds')
+        # Remove early_stopping_rounds for incremental training (we don't have validation set)
+        old_params.pop('early_stopping_rounds', None)
+        old_params.pop('eval_metric', None)
 
         # Initialize new model with old parameters
         new_model = xgb.XGBClassifier(**old_params)
+
+        # FIX: Check if the new data contains all the classes the old model was trained on.
+        # XGBoost incremental training requires all classes to be present.
+        old_classes = set(old_model.classes_)
+        new_classes = set(np.unique(y_new))
+
+        if not old_classes.issubset(new_classes):
+            logger.warning(f"⚠️  New data is missing classes required by the old model. Cannot perform incremental training.")
+            logger.warning(f"   Old model classes: {sorted(list(old_classes))}")
+            logger.warning(f"   New data classes:  {sorted(list(new_classes))}")
+            logger.warning(f"   Skipping update and returning original model.")
+            return old_model
 
         # Set xgb_model parameter to continue training from old model
         new_model.fit(
@@ -380,7 +444,11 @@ class IncrementalTrainer:
             xgb_model=old_model.get_booster()
         )
 
-        logger.info(f"Added {n_estimators_new} new trees (total: {new_n_estimators})")
+        logger.info(f"Added {actual_trees_added} new trees (total: {new_n_estimators}/{max_estimators})")
+
+        if new_n_estimators >= max_estimators:
+            logger.warning(f"⚠️  Model at maximum capacity ({max_estimators} trees)")
+            logger.warning(f"   Next incremental update will reset to base model")
 
         return new_model
 

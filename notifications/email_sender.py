@@ -52,14 +52,15 @@ class EmailSender:
 
     def create_trade_email_html(self,
                                 trades: pd.DataFrame,
-                                performance_metrics: Dict[str, any],
-                                report_date: str) -> str:
+                                ensemble_test_accuracy: float,
+                                report_date: str,
+                                performance_30d: Optional[Dict] = None) -> str:
         """
         Create HTML email content for top trades
 
         Args:
             trades: DataFrame with top trades
-            performance_metrics: Portfolio performance metrics
+            ensemble_test_accuracy: Stacked ensemble meta-learner test accuracy
             report_date: Report generation date
 
         Returns:
@@ -216,76 +217,63 @@ class EmailSender:
         </div>
 """
 
-        # Portfolio metrics section - USE WALK-FORWARD VALIDATION METRICS
-        # These metrics match the daily report for consistency
-        if performance_metrics:
-            # Get EnsembleStrategy-specific metrics from walk-forward validation
-            strategy_metrics = performance_metrics.get('strategy_metrics', {})
-            ensemble_metrics = strategy_metrics.get('EnsembleStrategy', {})
+        # 30-day performance summary (if available)
+        if performance_30d and performance_30d.get('num_trades', 0) > 0:
+            num_trades_30d = performance_30d['num_trades']
+            num_wins_30d = performance_30d['num_wins']
+            win_rate_30d = performance_30d['win_rate']
+            total_return_30d = performance_30d['total_return']
 
-            if ensemble_metrics:
-                sharpe = ensemble_metrics.get('sharpe', 0)
-                win_rate = ensemble_metrics.get('win_rate', 0)
-                total_return = ensemble_metrics.get('avg_return', 0)  # This is total_return from validation
-                num_trades = ensemble_metrics.get('num_trades', 0)
-            else:
-                sharpe = 0
-                win_rate = 0
-                total_return = 0
-                num_trades = 0
-
-            # Get validation status
-            validation_passed = performance_metrics.get('validation_passed', False)
-            validation_status = "PASS" if validation_passed else "FAIL"
-            validation_color = "#28a745" if validation_passed else "#dc3545"
+            win_rate_color = '#28a745' if win_rate_30d >= 0.60 else '#ffc107' if win_rate_30d >= 0.50 else '#dc3545'
+            return_color = '#28a745' if total_return_30d > 0 else '#dc3545'
 
             html += f"""
-        <p style="text-align: center; margin-bottom: 15px; color: #666; font-size: 14px;">
-            Walk-Forward Validation (90 days) | {num_trades} trades analyzed
-        </p>
-        <div class="metrics">
-            <div class="metric-card">
-                <div class="metric-label">Sharpe Ratio</div>
-                <div class="metric-value{' positive' if sharpe > 0 else ' negative'}">{sharpe:.2f}</div>
+    <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 20px; border-radius: 8px; margin: 20px 0;">
+        <div style="text-align: center; font-size: 14px; opacity: 0.9; margin-bottom: 10px;">
+            Last 30 Days Performance
+        </div>
+        <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; text-align: center;">
+            <div>
+                <div style="font-size: 24px; font-weight: bold;">{num_trades_30d}</div>
+                <div style="font-size: 12px; opacity: 0.8;">trades, {num_wins_30d} wins</div>
             </div>
-            <div class="metric-card">
-                <div class="metric-label">Win Rate</div>
-                <div class="metric-value">{win_rate:.1%}</div>
+            <div>
+                <div style="font-size: 24px; font-weight: bold; color: {win_rate_color};">{win_rate_30d:.1%}</div>
+                <div style="font-size: 12px; opacity: 0.8;">win rate</div>
             </div>
-            <div class="metric-card">
-                <div class="metric-label">Total Return</div>
-                <div class="metric-value{' positive' if total_return > 0 else ' negative'}">{total_return:.2%}</div>
+            <div>
+                <div style="font-size: 24px; font-weight: bold; color: {return_color};">{total_return_30d:+.2%}</div>
+                <div style="font-size: 12px; opacity: 0.8;">total return</div>
             </div>
         </div>
-        <div style="text-align: center; margin: 15px 0;">
-            <span style="background: {validation_color}; color: white; padding: 8px 20px; border-radius: 20px; font-weight: bold;">
-                Validation: {validation_status}
-            </span>
+    </div>
+"""
+
+        # Single line showing ensemble test accuracy
+        html += f"""
+    <div style="text-align: center; margin: 30px 0; padding: 20px; background: #f8f9fa; border-radius: 8px;">
+        <div style="font-size: 14px; color: #666; text-transform: uppercase; letter-spacing: 1px; margin-bottom: 10px;">
+            Stacked Ensemble Performance
         </div>
+        <div style="font-size: 32px; font-weight: bold; color: {'#28a745' if ensemble_test_accuracy > 0.65 else '#dc3545'};">
+            {ensemble_test_accuracy:.1%}
+        </div>
+        <div style="font-size: 12px; color: #999; margin-top: 5px;">
+            Test Accuracy (Meta-Learner)
+        </div>
+    </div>
 """
 
         # Trades section
         if len(trades) > 0:
-            html += """
-        <h2 style="color: #333; margin-top: 30px;">Top 5 Recommended Trades (EnsembleStrategy)</h2>
+            html += f"""
+        <h2 style="color: #333; margin-top: 30px;">TOP {len(trades)} SIGNALS FOR {report_date.upper()}</h2>
 """
 
             for i, row in trades.iterrows():
                 direction = "LONG" if row['signal'] == 'BUY' else "SHORT"
                 badge_class = "" if direction == "LONG" else " short"
-
-                # For LONG (BUY): Show entry (buy price) and exit (sell price = take profit)
-                # For SHORT (SELL): Show entry (sell price) and exit (buy back price = take profit)
-                if direction == "LONG":
-                    action_label = "BUY at"
-                    exit_label = "SELL at"
-                    entry_price = row['close']
-                    exit_price = row['take_profit_price']
-                else:  # SHORT
-                    action_label = "SELL at"
-                    exit_label = "BUY BACK at"
-                    entry_price = row['close']
-                    exit_price = row['take_profit_price']
+                meta_conf = row.get('meta_confidence', 0.0)
 
                 html += f"""
         <div class="trade-card{badge_class}">
@@ -293,18 +281,29 @@ class EmailSender:
                 <div class="trade-symbol">#{i+1} {row['symbol']}</div>
                 <div class="trade-badge{badge_class}">{direction}</div>
             </div>
+
+            <!-- Meta-Confidence Display -->
+            <div style="text-align: center; margin: 10px 0; padding: 10px; background: white; border-radius: 5px;">
+                <span style="font-size: 11px; color: #666; text-transform: uppercase; letter-spacing: 1px;">
+                    Meta-Confidence
+                </span>
+                <span style="font-size: 18px; font-weight: bold; color: #667eea; margin-left: 10px;">
+                    {meta_conf:.1%}
+                </span>
+            </div>
+
             <div class="trade-details">
                 <div class="detail-item">
-                    <span class="detail-label">{action_label}:</span>
-                    <span class="detail-value">${entry_price:.2f}</span>
-                </div>
-                <div class="detail-item">
-                    <span class="detail-label">{exit_label}:</span>
-                    <span class="detail-value">${exit_price:.2f}</span>
+                    <span class="detail-label">Entry:</span>
+                    <span class="detail-value">${row['close']:.2f}</span>
                 </div>
                 <div class="detail-item">
                     <span class="detail-label">Stop Loss:</span>
                     <span class="detail-value">${row['stop_loss_price']:.2f}</span>
+                </div>
+                <div class="detail-item">
+                    <span class="detail-label">Take Profit:</span>
+                    <span class="detail-value">${row['take_profit_price']:.2f}</span>
                 </div>
             </div>
         </div>
@@ -335,6 +334,9 @@ class EmailSender:
     def send_trade_notification(self,
                                recipient_email: str,
                                trades: pd.DataFrame,
+                               ensemble_test_accuracy: float = 0.0,
+                               ensemble_version: int = 0,
+                               performance_30d: Optional[Dict] = None,
                                performance_metrics: Optional[Dict] = None,
                                report_path: Optional[str] = None,
                                subject: Optional[str] = None) -> bool:
@@ -344,7 +346,8 @@ class EmailSender:
         Args:
             recipient_email: Email address to send to
             trades: DataFrame with top trades
-            performance_metrics: Portfolio performance metrics
+            ensemble_test_accuracy: Stacked ensemble test accuracy
+            performance_metrics: Portfolio performance metrics (deprecated, kept for compatibility)
             report_path: Path to detailed report file (optional attachment)
             subject: Email subject line (auto-generated if None)
 
@@ -359,7 +362,14 @@ class EmailSender:
             if subject is None:
                 num_trades = len(trades)
                 date_str = datetime.now().strftime('%Y-%m-%d')
-                subject = f"📊 Daily Trading Signals: {num_trades} Recommendations ({date_str})"
+                version_str = f"v{ensemble_version}" if ensemble_version > 0 else ""
+
+                # Add 30-day performance to subject if available
+                if performance_30d and performance_30d.get('num_trades', 0) > 0:
+                    perf_str = f"30d: {performance_30d['num_trades']}T, {performance_30d['win_rate']:.0%}WR, {performance_30d['total_return']:+.1%}"
+                    subject = f"📊 {num_trades} Signals | {perf_str} | {version_str} ({date_str})"
+                else:
+                    subject = f"📊 Daily Signals: {num_trades} Trades | Ensemble {version_str} ({date_str})"
 
             message["Subject"] = subject
             message["From"] = self.sender_email
@@ -369,8 +379,9 @@ class EmailSender:
             report_date = datetime.now().strftime('%A, %B %d, %Y')
             html_content = self.create_trade_email_html(
                 trades=trades,
-                performance_metrics=performance_metrics,
-                report_date=report_date
+                ensemble_test_accuracy=ensemble_test_accuracy,
+                report_date=report_date,
+                performance_30d=performance_30d
             )
 
             # Attach HTML
@@ -419,11 +430,21 @@ class EmailSender:
         Returns:
             True if sent successfully
         """
+        # Import here to avoid circular dependency
+        import sys
+        from pathlib import Path
+        sys.path.append(str(Path(__file__).parent.parent))
+        from notifications.send_daily_trades import (
+            get_stacked_ensemble_test_accuracy,
+            get_stacked_ensemble_model_version,
+            get_30day_performance_summary
+        )
+
         # Create dummy trade data
         test_trades = pd.DataFrame([{
             'symbol': 'TEST',
-            'strategy_name': 'EnsembleStrategy',
-            'signal': 1,
+            'strategy_name': 'StackedEnsembleStrategy',
+            'signal': 'BUY',
             'position_size': 0.10,
             'position_value': 10000,
             'num_shares': 100,
@@ -431,21 +452,21 @@ class EmailSender:
             'stop_loss_price': 95.00,
             'take_profit_price': 110.00,
             'score': 0.5678,
-            'signal_strength': 0.85
+            'signal_strength': 0.85,
+            'meta_confidence': 0.72
         }])
 
-        test_metrics = {
-            'overall_metrics': {
-                'sharpe_ratio': 1.45,
-                'win_rate': 0.58,
-                'total_return': 0.12
-            }
-        }
+        # Get real test accuracy, version, and 30-day performance from database
+        test_accuracy = get_stacked_ensemble_test_accuracy()
+        model_version = get_stacked_ensemble_model_version()
+        perf_30d = get_30day_performance_summary()
 
         return self.send_trade_notification(
             recipient_email=recipient_email,
             trades=test_trades,
-            performance_metrics=test_metrics,
+            ensemble_test_accuracy=test_accuracy,
+            ensemble_version=model_version,
+            performance_30d=perf_30d,
             subject="🧪 Test Email - Trading System"
         )
 

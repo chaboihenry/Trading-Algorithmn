@@ -234,6 +234,32 @@ class MetricsCalculator:
         pf = gross_profit / gross_loss
         return pf
 
+    def mar_ratio(self, returns: np.ndarray, periods_per_year: int = 252) -> float:
+        """
+        MAR Ratio = Annualized Return / Absolute Max Drawdown
+
+        Similar to Calmar but uses absolute values.
+        Industry standard: > 1.0 is good
+
+        Args:
+            returns: Array of returns
+            periods_per_year: 252 for daily, 52 for weekly
+
+        Returns:
+            MAR ratio
+        """
+        if len(returns) == 0:
+            return 0.0
+
+        annual_return = np.mean(returns) * periods_per_year
+        max_dd = abs(self.max_drawdown(returns))
+
+        if max_dd == 0:
+            return 0.0
+
+        mar = annual_return / max_dd
+        return mar
+
     def trading_metrics(self, returns: np.ndarray,
                        benchmark_returns: Optional[np.ndarray] = None,
                        periods_per_year: int = 252) -> Dict[str, float]:
@@ -268,7 +294,139 @@ class MetricsCalculator:
 
         return metrics
 
+    # ========== Tail Risk Metrics ==========
+
+    def value_at_risk(self, returns: np.ndarray, confidence: float = 0.95) -> float:
+        """
+        Value at Risk (VaR) - Maximum expected loss at confidence level
+
+        Args:
+            returns: Array of returns
+            confidence: 0.95 (95%) or 0.99 (99%) typical
+
+        Returns:
+            VaR as decimal (e.g., -0.05 = 5% maximum loss expected)
+        """
+        if len(returns) == 0:
+            return 0.0
+
+        var = np.percentile(returns, (1 - confidence) * 100)
+        return var
+
+    def conditional_value_at_risk(self, returns: np.ndarray, confidence: float = 0.95) -> float:
+        """
+        Conditional VaR (CVaR) / Expected Shortfall
+
+        Average loss when losses exceed VaR threshold.
+        More informative than VaR for tail risk.
+
+        Args:
+            returns: Array of returns
+            confidence: 0.95 (95%) or 0.99 (99%) typical
+
+        Returns:
+            CVaR as decimal
+        """
+        if len(returns) == 0:
+            return 0.0
+
+        var = self.value_at_risk(returns, confidence)
+        cvar = returns[returns <= var].mean()
+        return cvar if not np.isnan(cvar) else 0.0
+
     # ========== Statistical Significance ==========
+
+    def bootstrap_confidence_interval(self, returns: np.ndarray,
+                                      metric_func,
+                                      n_bootstrap: int = 1000,
+                                      confidence: float = 0.95) -> Tuple[float, float, float]:
+        """
+        Bootstrap confidence intervals for any metric
+
+        Args:
+            returns: Array of returns
+            metric_func: Function that takes returns and returns a metric value
+            n_bootstrap: Number of bootstrap samples (default 1000)
+            confidence: Confidence level (default 0.95)
+
+        Returns:
+            Tuple of (lower_bound, point_estimate, upper_bound)
+
+        Example:
+            lower, mean, upper = bootstrap_confidence_interval(
+                returns,
+                lambda x: x.mean() * 252  # Annualized return
+            )
+        """
+        if len(returns) == 0:
+            return 0.0, 0.0, 0.0
+
+        np.random.seed(42)
+        n = len(returns)
+
+        bootstrap_metrics = []
+        for _ in range(n_bootstrap):
+            sample = np.random.choice(returns, size=n, replace=True)
+            bootstrap_metrics.append(metric_func(sample))
+
+        bootstrap_metrics = np.array(bootstrap_metrics)
+        alpha = (1 - confidence) / 2
+
+        lower = np.percentile(bootstrap_metrics, alpha * 100)
+        upper = np.percentile(bootstrap_metrics, (1 - alpha) * 100)
+        point = metric_func(returns)
+
+        return lower, point, upper
+
+    def monte_carlo_drawdown_distribution(self, returns: np.ndarray,
+                                          n_simulations: int = 1000,
+                                          n_periods: int = 252) -> Dict[str, float]:
+        """
+        Monte Carlo simulation of maximum drawdown distribution
+
+        Helps assess if observed max drawdown is within expected range.
+
+        Args:
+            returns: Array of returns
+            n_simulations: Number of Monte Carlo simulations (default 1000)
+            n_periods: Number of periods to simulate (default 252)
+
+        Returns:
+            Dictionary with observed_max_dd, simulated percentiles, and p_value
+        """
+        if len(returns) == 0:
+            return {
+                'observed_max_dd': 0.0,
+                'simulated_5th_percentile': 0.0,
+                'simulated_50th_percentile': 0.0,
+                'simulated_95th_percentile': 0.0,
+                'p_value': 1.0
+            }
+
+        np.random.seed(42)
+
+        # Observed max drawdown
+        observed_max_dd = self.max_drawdown(returns)
+
+        # Simulate
+        simulated_max_dds = []
+        for _ in range(n_simulations):
+            sim_returns = np.random.choice(returns, size=n_periods, replace=True)
+            sim_max_dd = self.max_drawdown(sim_returns)
+            simulated_max_dds.append(sim_max_dd)
+
+        simulated_max_dds = np.array(simulated_max_dds)
+
+        # Calculate p-value (how likely is observed DD?)
+        p_value = (simulated_max_dds <= observed_max_dd).sum() / n_simulations
+
+        return {
+            'observed_max_dd': observed_max_dd,
+            'simulated_5th_percentile': np.percentile(simulated_max_dds, 5),
+            'simulated_50th_percentile': np.percentile(simulated_max_dds, 50),
+            'simulated_95th_percentile': np.percentile(simulated_max_dds, 95),
+            'p_value': p_value
+        }
 
     def statistical_significance(self, returns: np.ndarray) -> Tuple[float, float]:
         """

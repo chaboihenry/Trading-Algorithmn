@@ -3,7 +3,7 @@
 Daily Runner for Trading Data Pipeline
 
 Executes daily scheduled tasks with dependency management.
-Runs at 9:30 AM for slow-changing data (fundamentals, sentiment, etc.)
+Runs at 5:00 PM EST (after market close) for complete OHLCV data and full pipeline execution.
 """
 
 import subprocess
@@ -109,23 +109,32 @@ class DailyRunner:
             try:
                 start_time = time.time()
 
-                # Execute script with timeout
-                # Don't capture output - let it stream to console for visibility
+                # Execute script with timeout and capture output
                 result = subprocess.run(
                     [PYTHON_BIN, str(script_path)],
                     timeout=max_runtime,
-                    cwd=str(self.project_root)
+                    cwd=str(self.project_root),
+                    capture_output=True,
+                    text=True
                 )
 
                 runtime_seconds = time.time() - start_time
+                records_processed = self._extract_records_processed(result.stdout)
 
                 if result.returncode == 0:
                     # Success
-                    logger.info(f"   ✅ {task_name} completed in {runtime_seconds:.1f}s")
-                    return True, "", 0, runtime_seconds
+                    logger.info(f"   ✅ {task_name} completed in {runtime_seconds:.1f}s ({records_processed} records)")
+                    if result.stdout:
+                        logger.debug(f"   Output:\n{result.stdout.strip()}")
+                    return True, "", records_processed, runtime_seconds
                 else:
                     # Script failed
-                    logger.warning(f"   ❌ {task_name} failed with exit code {result.returncode} (attempt {attempt}/{max_attempts})")
+                    error_message = f"Exit code {result.returncode}"
+                    logger.warning(f"   ❌ {task_name} failed with {error_message} (attempt {attempt}/{max_attempts})")
+                    if result.stderr:
+                        logger.error(f"   Stderr:\n{result.stderr.strip()}")
+                    if result.stdout:
+                        logger.warning(f"   Stdout:\n{result.stdout.strip()}")
 
                     # Retry if not last attempt
                     if attempt < max_attempts:
@@ -134,12 +143,17 @@ class DailyRunner:
                         time.sleep(wait_time)
                         continue
                     else:
-                        return False, f"Exit code {result.returncode}", 0, runtime_seconds
+                        return False, error_message, records_processed, runtime_seconds
 
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 runtime_seconds = time.time() - start_time
                 error_msg = f"Script timed out after {max_runtime}s"
                 logger.error(f"   ⏱️  {task_name} timed out after {max_runtime}s")
+                # Log any output captured before the timeout
+                if e.stdout:
+                    logger.warning(f"   Stdout (partial):\n{e.stdout.strip()}")
+                if e.stderr:
+                    logger.error(f"   Stderr (partial):\n{e.stderr.strip()}")
 
                 if attempt < max_attempts:
                     wait_time = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]

@@ -1,11 +1,12 @@
 # Dependency Graph for Trading Data Pipeline
 # Defines execution order and timing for all data collection tasks
+# SCHEDULE: Daily at 5:00 PM EST (after market close at 4:00 PM)
 
 daily_schedule:
   # Tier 0: Asset Universe (must run first)
   - name: "Asset Collection"
     script: "data_collectors/01_collect_assets.py"
-    time: "09:30:00"
+    time: "17:00:00"
     tier: 0
     dependencies: []
     max_runtime_seconds: 120
@@ -14,16 +15,16 @@ daily_schedule:
   # Tier 0.5: Price Data (backbone of all analysis)
   - name: "Price Data Collection"
     script: "data_collectors/02_collect_price_data.py"
-    time: "09:30:15"
+    time: "17:00:15"
     tier: 0.5
     dependencies: ["Asset Collection"]
-    max_runtime_seconds: 180
+    max_runtime_seconds: 600  # Increased to 10min to handle network delays and rate limits
     critical: true
 
   # Tier 1: Fundamental Data & Economic Indicators (no dependencies)
   - name: "Fundamental Data"
     script: "data_collectors/03_collect_fundamentals.py"
-    time: "09:30:30"
+    time: "17:03:00"
     tier: 1
     dependencies: ["Asset Collection", "Price Data Collection"]
     max_runtime_seconds: 300
@@ -31,7 +32,7 @@ daily_schedule:
 
   - name: "Economic Indicators"
     script: "data_collectors/04_collect_economic_indicators.py"
-    time: "09:30:30"
+    time: "17:03:00"
     tier: 1
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 120
@@ -40,7 +41,7 @@ daily_schedule:
   # Tier 2: Insider Trading & Analyst Ratings (no dependencies)
   - name: "Insider Trading"
     script: "data_collectors/07_collect_insider_trades.py"
-    time: "09:35:00"
+    time: "17:08:00"
     tier: 2
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 180
@@ -48,7 +49,7 @@ daily_schedule:
 
   - name: "Analyst Ratings"
     script: "data_collectors/08_collect_analyst_ratings.py"
-    time: "09:35:00"
+    time: "17:08:00"
     tier: 2
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 180
@@ -56,7 +57,7 @@ daily_schedule:
 
   - name: "Relative Valuation"
     script: "data_collectors/11_collect_relative_valuation.py"
-    time: "09:35:00"
+    time: "17:08:00"
     tier: 2
     dependencies: ["Asset Collection", "Price Data Collection", "Fundamental Data"]
     max_runtime_seconds: 180
@@ -65,7 +66,7 @@ daily_schedule:
   # Tier 3: News & Sentiment (no dependencies on each other)
   - name: "News Events"
     script: "data_collectors/10_collect_news_events.py"
-    time: "09:40:00"
+    time: "17:13:00"
     tier: 3
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 240
@@ -73,7 +74,7 @@ daily_schedule:
 
   - name: "Sentiment Analysis"
     script: "data_collectors/05_collect_sentiment.py"
-    time: "09:40:00"
+    time: "17:13:00"
     tier: 3
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 900
@@ -81,7 +82,7 @@ daily_schedule:
 
   - name: "Earnings Data"
     script: "data_collectors/06_collect_earnings.py"
-    time: "09:40:00"
+    time: "17:13:00"
     tier: 3
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 180
@@ -89,7 +90,7 @@ daily_schedule:
 
   - name: "Options Data"
     script: "data_collectors/09_collect_options_data.py"
-    time: "09:40:00"
+    time: "17:13:00"
     tier: 3
     dependencies: ["Asset Collection"]
     max_runtime_seconds: 600
@@ -98,7 +99,7 @@ daily_schedule:
   # Tier 3.5: Data Preprocessing (needs price data)
   - name: "Calculate Technical Indicators"
     script: "data_preprocessing/02_calculate_technical_indicators.py"
-    time: "09:45:00"
+    time: "17:28:00"
     tier: 3.5
     dependencies: ["Price Data Collection"]
     max_runtime_seconds: 300
@@ -106,7 +107,7 @@ daily_schedule:
 
   - name: "Calculate Volatility Metrics"
     script: "data_preprocessing/03_calculate_volatility.py"
-    time: "09:45:00"
+    time: "17:28:00"
     tier: 3.5
     dependencies: ["Price Data Collection", "Options Data"]
     max_runtime_seconds: 300
@@ -114,7 +115,7 @@ daily_schedule:
 
   - name: "Calculate Correlations"
     script: "data_preprocessing/01_calculate_correlations.py"
-    time: "09:45:00"
+    time: "17:28:00"
     tier: 3.5
     dependencies: ["Price Data Collection"]
     max_runtime_seconds: 180
@@ -122,7 +123,7 @@ daily_schedule:
 
   - name: "Analyze Pairs"
     script: "data_preprocessing/04_analyze_pairs.py"
-    time: "09:47:00"
+    time: "17:33:00"
     tier: 3.7
     dependencies: ["Price Data Collection", "Calculate Correlations"]
     max_runtime_seconds: 300
@@ -131,7 +132,7 @@ daily_schedule:
   # Tier 4: ML Features Aggregator (needs tier 1-3.5)
   - name: "ML Features Aggregation"
     script: "data_preprocessing/05_ml_features_aggregator.py"
-    time: "09:50:00"
+    time: "17:38:00"
     tier: 4
     dependencies: ["Fundamental Data", "Economic Indicators", "News Events", "Sentiment Analysis", "Calculate Technical Indicators", "Calculate Volatility Metrics"]
     max_runtime_seconds: 300
@@ -140,7 +141,7 @@ daily_schedule:
   # Tier 4.5: Incremental Model Retraining (needs tier 4, before tier 5)
   - name: "Retrain ML Models"
     script: "strategies/retrain_all_strategies.py"
-    time: "09:52:00"
+    time: "17:43:00"
     tier: 4.5
     dependencies: ["ML Features Aggregation"]
     max_runtime_seconds: 600
@@ -149,7 +150,7 @@ daily_schedule:
   # Tier 5: Signal Generation (needs tier 4.5 - retrained models)
   - name: "Generate Trading Signals"
     script: "strategies/run_strategies.py"
-    time: "09:55:00"
+    time: "17:53:00"
     tier: 5
     dependencies: ["Retrain ML Models"]
     max_runtime_seconds: 180
@@ -158,7 +159,7 @@ daily_schedule:
   # Tier 6: Strategy Validation & Daily Report (needs tier 5)
   - name: "Validate Strategies & Generate Report"
     script: "backtesting/report_generator.py"
-    time: "10:00:00"
+    time: "17:56:00"
     tier: 6
     dependencies: ["Generate Trading Signals"]
     max_runtime_seconds: 300
@@ -167,7 +168,7 @@ daily_schedule:
   # Tier 7: Email Notification (needs tier 6, runs after all processing complete)
   - name: "Send Daily Trade Notification"
     script: "notifications/send_daily_trades.py"
-    time: "10:05:00"
+    time: "18:01:00"
     tier: 7
     dependencies: ["Validate Strategies & Generate Report"]
     max_runtime_seconds: 60
@@ -271,9 +272,12 @@ freshness_thresholds:
 
 # Retry configuration
 retry_policy:
-  max_attempts: 3
-  backoff_seconds: [10, 30, 60]  # Exponential backoff
+  max_attempts: 5  # Increased from 3 to handle intermittent network issues
+  backoff_seconds: [15, 45, 90, 180, 300]  # More aggressive backoff for network recovery
   retry_on_failure: true
+  # Network-specific settings
+  network_timeout_seconds: 30  # Per-request timeout
+  connection_retry_delay: 5  # Wait between connection attempts
 
 # Notification configuration
 notifications:

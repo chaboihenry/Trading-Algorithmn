@@ -41,7 +41,7 @@ class ReportGenerator:
         self.metrics_calc = MetricsCalculator()
 
     def generate_daily_report(self, num_trades: int = 5,
-                             total_capital: float = 100_000,
+                             total_capital: float = 1_000,
                              output_dir: str = "backtesting/results",
                              lookback_days: int = 90) -> Dict[str, any]:
         """
@@ -168,7 +168,7 @@ class ReportGenerator:
 
     def _validate_all_strategies(self, lookback_days: int) -> Dict[str, any]:
         """Validate all strategies"""
-        strategies = ['PairsTradingStrategy', 'SentimentTradingStrategy', 'EnsembleStrategy']
+        strategies = ['PairsTradingStrategy', 'SentimentTradingStrategy', 'VolatilityTradingStrategy', 'EnsembleStrategy']
         results = {}
 
         for strategy in strategies:
@@ -319,6 +319,24 @@ class ReportGenerator:
             md_content += f"| Trades Analyzed | {ensemble_result.get('num_trades', 0)} |\n"
             md_content += f"| **Validation** | **{status}** |\n\n"
 
+            # NEW: Advanced Risk Metrics Section
+            md_content += f"### Advanced Risk Metrics\n\n"
+            md_content += f"**Risk-Adjusted Performance:**\n"
+            md_content += f"- Calmar Ratio: {metrics.get('calmar_ratio', 0):.2f} (Target: > 1.0)\n"
+            md_content += f"- Sortino Ratio: {metrics.get('sortino_ratio', 0):.2f} (Target: > 1.0)\n"
+            md_content += f"- MAR Ratio: {metrics.get('mar_ratio', 0):.2f} (Target: > 1.0)\n\n"
+
+            md_content += f"**Tail Risk Analysis:**\n"
+            md_content += f"- Value at Risk (95%): {metrics.get('var_95', 0):.2%}\n"
+            md_content += f"- Conditional VaR (95%): {metrics.get('cvar_95', 0):.2%}\n\n"
+
+            md_content += f"**Statistical Significance:**\n"
+            md_content += f"- Sharpe Ratio 95% CI: [{metrics.get('sharpe_95_ci_lower', 0):.2f}, {metrics.get('sharpe_95_ci_upper', 0):.2f}]\n"
+            md_content += f"- Max Drawdown p-value: {metrics.get('max_dd_p_value', 1):.3f}\n"
+            md_content += f"- Significance: {metrics.get('statistical_significance', 'UNKNOWN')}\n\n"
+
+            md_content += f"**Risk Classification:** {metrics.get('risk_level', 'UNKNOWN')}\n\n"
+
         # Risk assessment summary
         risk = report_data.get('risk_assessment', {})
         md_content += f"**Risk Level:** {risk.get('risk_score', 0)}/10  \n"
@@ -397,6 +415,6 @@ if __name__ == "__main__":
     generator = ReportGenerator()
     generator.generate_daily_report(
         num_trades=5,
-        total_capital=100_000,
+        total_capital=1_000,
         output_dir="backtesting/results"
     )

@@ -4,7 +4,7 @@ Wait for External Drive Wrapper
 
 Waits up to 2 hours for the external drive (/Volumes/Vault) to be mounted
 before running the trading system. This handles scenarios where the Mac
-starts at 9:30 AM but the drive isn't connected yet.
+starts the scheduled pipeline but the drive isn't connected yet.
 
 Usage:
     wait_for_drive.py --daily
@@ -134,6 +134,18 @@ def run_orchestrator(mode: str) -> int:
         return 1
 
 
+def rotate_logs():
+    """Rotate logs if they're too large (>10MB)"""
+    script_dir = Path(__file__).parent
+    log_rotation_script = script_dir / "log_rotation.sh"
+
+    if log_rotation_script.exists():
+        try:
+            subprocess.run([str(log_rotation_script)], check=False)
+        except Exception as e:
+            print(f"⚠️  Log rotation failed (non-critical): {e}")
+
+
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
@@ -154,6 +166,9 @@ def main():
                        help='Skip waiting for drive (fail immediately if not mounted)')
 
     args = parser.parse_args()
+
+    # Rotate logs before starting (prevents log files from growing too large)
+    rotate_logs()
 
     # Determine mode
     if args.daily:

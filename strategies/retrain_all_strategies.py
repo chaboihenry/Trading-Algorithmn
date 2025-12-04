@@ -1,4 +1,3 @@
-#!/Users/henry/miniconda3/envs/trading/bin/python
 """
 Automated Strategy Retraining Script
 ====================================
@@ -22,15 +21,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from sentiment_trading import SentimentTradingStrategy
 from volatility_trading import VolatilityTradingStrategy
+from pairs_trading import PairsTradingStrategy
 from stacked_ensemble import StackedEnsemble
 from incremental_trainer import IncrementalTrainer
 
 # Configure logging
+log_dir = Path(__file__).parent / 'logs'
+log_dir.mkdir(exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('strategies/logs/retraining.log'),
+        logging.FileHandler(log_dir / 'retraining.log'),
         logging.StreamHandler()
     ]
 )
@@ -93,24 +96,18 @@ def main():
     logger.info("   Using existing implementation (no ML model)")
     results['PairsTradingStrategy'] = 'SKIPPED (no ML model)'
 
-    # 3. Volatility Strategy (incremental learning enabled)
+    # 3. Volatility Strategy
     logger.info("\n" + "=" * 80)
     logger.info("RETRAINING: Volatility Trading Strategy")
     logger.info("=" * 80)
 
     try:
         volatility_strategy = VolatilityTradingStrategy()
-        result = volatility_strategy.incremental_train(force_full=args.force_full_retrain)
+        success = volatility_strategy.train_model(force_full_retrain=args.force_full_retrain)
 
-        if result.get('success'):
+        if success:
             logger.info("✅ Volatility Strategy: Training successful")
             results['VolatilityTradingStrategy'] = 'SUCCESS'
-
-            # Log training details
-            logger.info(f"   Training type: {'FULL' if result.get('full_retrain') else 'INCREMENTAL'}")
-            logger.info(f"   Train accuracy: {result.get('train_accuracy', 0):.2%}")
-            logger.info(f"   Test accuracy: {result.get('test_accuracy', 0):.2%}")
-            logger.info(f"   Samples trained: {result.get('samples_trained', 0)}")
 
             # Generate signals to verify
             signals = volatility_strategy.generate_signals()
@@ -122,55 +119,42 @@ def main():
                     count = len(signals[signals['signal_type'] == signal_type])
                     logger.info(f"     {signal_type}: {count}")
         else:
-            logger.error(f"❌ Volatility Strategy: Training failed - {result.get('error', 'Unknown')}")
+            logger.error("❌ Volatility Strategy: Training failed")
             results['VolatilityTradingStrategy'] = 'FAILED'
 
     except Exception as e:
         logger.error(f"❌ Volatility Strategy: Exception - {e}", exc_info=True)
         results['VolatilityTradingStrategy'] = f'ERROR: {e}'
 
-    # 4. Ensemble Strategy (stacked meta-learning)
+    # 4. Stacked Ensemble Strategy (Meta-Learner)
     logger.info("\n" + "=" * 80)
-    logger.info("RETRAINING: Ensemble Strategy (Stacked Meta-Learning)")
+    logger.info("RETRAINING: Stacked Ensemble Strategy (Meta-Learner)")
     logger.info("=" * 80)
 
     try:
-        ensemble = StackedEnsemble()
+        ensemble_strategy = StackedEnsemble()
+        success = ensemble_strategy.train_model(force_full_retrain=args.force_full_retrain)
 
-        # Train meta-model (weekly retrain recommended)
-        if ensemble.meta_model is None or args.force_full_retrain:
-            logger.info("Training meta-model from scratch...")
-            metrics = ensemble.train_meta_model(lookback_days=90, use_cv=True)
+        if success:
+            logger.info("✅ Stacked Ensemble: Training successful")
+            results['StackedEnsembleStrategy'] = 'SUCCESS'
 
-            if metrics.get('success'):
-                logger.info("✅ Ensemble Meta-Model: Training successful")
-                results['EnsembleStrategy'] = 'SUCCESS'
-                logger.info(f"   Train accuracy: {metrics['train_accuracy']:.2%}")
-                logger.info(f"   Test accuracy: {metrics['test_accuracy']:.2%}")
-                logger.info(f"   Test precision: {metrics['test_precision']:.2%}")
-                logger.info(f"   Samples: {metrics['n_samples']}")
-            else:
-                logger.error("❌ Ensemble Meta-Model: Training failed")
-                results['EnsembleStrategy'] = 'FAILED'
+            # Generate signals to verify
+            signals = ensemble_strategy.generate_signals()
+            logger.info(f"   Generated {len(signals)} signals")
+
+            if len(signals) > 0:
+                logger.info(f"   Signal breakdown:")
+                for signal_type in signals['signal_type'].unique():
+                    count = len(signals[signals['signal_type'] == signal_type])
+                    logger.info(f"     {signal_type}: {count}")
         else:
-            logger.info("✅ Ensemble Meta-Model: Already trained (skipping)")
-            logger.info("   Run with --force-full-retrain to retrain meta-model")
-            results['EnsembleStrategy'] = 'SKIPPED (already trained)'
-
-        # Generate signals to verify
-        signals = ensemble.generate_signals()
-        logger.info(f"   Generated {len(signals)} ensemble signals")
-
-        if len(signals) > 0:
-            logger.info(f"   Signal breakdown:")
-            for signal_type in signals['signal_type'].unique():
-                count = len(signals[signals['signal_type'] == signal_type])
-                avg_conf = signals[signals['signal_type'] == signal_type]['strength'].mean()
-                logger.info(f"     {signal_type}: {count} (avg confidence: {avg_conf:.2%})")
+            logger.error("❌ Stacked Ensemble: Training failed")
+            results['StackedEnsembleStrategy'] = 'FAILED'
 
     except Exception as e:
-        logger.error(f"❌ Ensemble Strategy: Exception - {e}", exc_info=True)
-        results['EnsembleStrategy'] = f'ERROR: {e}'
+        logger.error(f"❌ Stacked Ensemble: Exception - {e}", exc_info=True)
+        results['StackedEnsembleStrategy'] = f'ERROR: {e}'
 
     # Summary
     logger.info("\n" + "=" * 80)
@@ -192,7 +176,7 @@ def main():
 
     trainer = IncrementalTrainer()
 
-    for strategy_name in ['SentimentTradingStrategy', 'VolatilityTradingStrategy']:
+    for strategy_name in ['SentimentTradingStrategy', 'VolatilityTradingStrategy', 'StackedEnsembleStrategy']:
         logger.info(f"\n{strategy_name}:")
         logger.info("-" * 80)
 

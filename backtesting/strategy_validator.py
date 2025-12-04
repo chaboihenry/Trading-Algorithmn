@@ -473,19 +473,48 @@ class StrategyValidator:
         metrics['t_statistic'] = t_stat
         metrics['p_value'] = p_value
 
+        # NEW: Advanced risk metrics
+        metrics['mar_ratio'] = self.metrics_calc.mar_ratio(returns)
+        metrics['var_95'] = self.metrics_calc.value_at_risk(returns, confidence=0.95)
+        metrics['cvar_95'] = self.metrics_calc.conditional_value_at_risk(returns, confidence=0.95)
+
+        # NEW: Bootstrap confidence interval for Sharpe ratio
+        sharpe_ci = self.metrics_calc.bootstrap_confidence_interval(
+            returns,
+            lambda x: (x.mean() * np.sqrt(252)) / (x.std() * np.sqrt(252)) if x.std() > 0 else 0,
+            n_bootstrap=1000
+        )
+        metrics['sharpe_95_ci_lower'] = sharpe_ci[0]
+        metrics['sharpe_95_ci_upper'] = sharpe_ci[2]
+
+        # NEW: Monte Carlo drawdown analysis
+        dd_analysis = self.metrics_calc.monte_carlo_drawdown_distribution(returns)
+        metrics['max_dd_p_value'] = dd_analysis['p_value']
+        metrics['max_dd_is_significant'] = dd_analysis['p_value'] < 0.05
+
+        # Interpretation
+        metrics['risk_level'] = 'LOW' if abs(metrics.get('max_drawdown', 0)) < 0.10 else 'MEDIUM' if abs(metrics.get('max_drawdown', 0)) < 0.20 else 'HIGH'
+        metrics['statistical_significance'] = 'SIGNIFICANT' if sharpe_ci[0] > 0 else 'NOT SIGNIFICANT'
+
         # Print results
         print(f"\n{'─'*80}")
         print("RESULTS")
         print(f"{'─'*80}")
         print(f"Trades:            {len(returns):>8}")
-        print(f"Sharpe Ratio:      {metrics.get('sharpe_ratio', 0):>8.2f}")
+        print(f"Sharpe Ratio:      {metrics.get('sharpe_ratio', 0):>8.2f} (CI: [{metrics.get('sharpe_95_ci_lower', 0):.2f}, {metrics.get('sharpe_95_ci_upper', 0):.2f}])")
         print(f"Sortino Ratio:     {metrics.get('sortino_ratio', 0):>8.2f}")
+        print(f"Calmar Ratio:      {metrics.get('calmar_ratio', 0):>8.2f}")
+        print(f"MAR Ratio:         {metrics.get('mar_ratio', 0):>8.2f}")
         print(f"Total Return:      {metrics.get('total_return', 0):>8.2%}")
-        print(f"Max Drawdown:      {metrics.get('max_drawdown', 0):>8.2%}")
+        print(f"Max Drawdown:      {metrics.get('max_drawdown', 0):>8.2%} (p-value: {metrics.get('max_dd_p_value', 1):.3f})")
         print(f"Win Rate:          {metrics.get('win_rate', 0):>8.2%}")
         print(f"Profit Factor:     {metrics.get('profit_factor', 0):>8.2f}")
+        print(f"VaR (95%):         {metrics.get('var_95', 0):>8.2%}")
+        print(f"CVaR (95%):        {metrics.get('cvar_95', 0):>8.2%}")
         print(f"T-Statistic:       {metrics.get('t_statistic', 0):>8.2f}")
         print(f"P-Value:           {metrics.get('p_value', 1):>8.4f}")
+        print(f"Risk Level:        {metrics.get('risk_level', 'UNKNOWN'):>8}")
+        print(f"Significance:      {metrics.get('statistical_significance', 'UNKNOWN')}")
 
         # Check thresholds
         passes, reason = self.metrics_calc.passes_thresholds(metrics)

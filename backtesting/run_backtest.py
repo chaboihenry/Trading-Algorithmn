@@ -35,8 +35,8 @@ Examples:
   # Analyze portfolio performance
   python run_backtest.py --performance
 
-  # Select top 5 trades with $100k capital
-  python run_backtest.py --trades --num-trades 5 --capital 100000
+  # Select top 5 trades with $1k capital
+  python run_backtest.py --trades --num-trades 5 --capital 1000
 
   # Quick validation of single strategy
   python run_backtest.py --quick pairs_trading
@@ -59,8 +59,8 @@ Examples:
     # Parameters
     parser.add_argument('--num-trades', type=int, default=5,
                        help='Number of top trades to select (default: 5)')
-    parser.add_argument('--capital', type=float, default=100000,
-                       help='Total available capital (default: 100000)')
+    parser.add_argument('--capital', type=float, default=1000,
+                       help='Total available capital (default: 1000)')
     parser.add_argument('--db', type=str,
                        default='/Volumes/Vault/85_assets_prediction.db',
                        help='Path to database')

@@ -148,7 +148,7 @@ class BacktestEngine:
     # ========== Trade Selection ==========
 
     def get_top_trades(self, num_trades: int = 5,
-                      total_capital: float = 100_000,
+                      total_capital: float = 1_000,
                       date: Optional[str] = None,
                       min_signal_strength: float = 0.3) -> pd.DataFrame:
         """
@@ -301,7 +301,7 @@ class BacktestEngine:
                              select_trades: bool = True,
                              analyze_performance: bool = True,
                              num_trades: int = 5,
-                             total_capital: float = 100_000,
+                             total_capital: float = 1_000,
                              export_csv: bool = True,
                              output_dir: str = "backtesting/results") -> Dict[str, any]:
         """
@@ -419,7 +419,7 @@ class BacktestEngine:
     # ========== Daily Report Generation ==========
 
     def generate_daily_report(self, num_trades: int = 5,
-                             total_capital: float = 100_000,
+                             total_capital: float = 1_000,
                              output_dir: str = "backtesting/results") -> Dict[str, any]:
         """
         Generate comprehensive daily trading report
@@ -448,7 +448,7 @@ class BacktestEngine:
         """Quick portfolio performance analysis"""
         return self.analyze_portfolio_performance(lookback_days=90)
 
-    def quick_trade_selection(self, num_trades: int = 5, capital: float = 100_000):
+    def quick_trade_selection(self, num_trades: int = 5, capital: float = 1_000):
         """Quick trade selection"""
         return self.get_top_trades(num_trades, capital)
 

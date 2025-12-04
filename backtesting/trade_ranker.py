@@ -13,8 +13,18 @@ Selects top 5 trades with optimal position sizing.
 import numpy as np
 import pandas as pd
 import sqlite3
+import json
 from typing import Dict, List, Tuple, Optional
 from datetime import datetime, timedelta
+
+
+def _extract_meta_confidence(metadata_json: str) -> float:
+    """Extract meta_confidence from metadata JSON"""
+    try:
+        metadata = json.loads(metadata_json)
+        return metadata.get('meta_confidence', 0.0)
+    except:
+        return 0.0
 
 
 class TradeRanker:
@@ -258,6 +268,7 @@ class TradeRanker:
             s.entry_price,
             s.stop_loss,
             s.take_profit,
+            s.metadata,
             COALESCE(p.close, s.entry_price) as close,
             COALESCE(p.volume, 1000000) as volume,
             COALESCE(p.high, s.entry_price * 1.02) as high,
@@ -283,6 +294,12 @@ class TradeRanker:
 
         # Convert signal to numeric for scoring
         df['signal_numeric'] = df['signal'].map({'BUY': 1, 'SELL': -1, 'HOLD': 0})
+
+        # Extract meta-confidence from metadata column
+        if 'metadata' in df.columns:
+            df['meta_confidence'] = df['metadata'].apply(_extract_meta_confidence)
+        else:
+            df['meta_confidence'] = 0.0
 
         return df
 
@@ -333,7 +350,8 @@ class TradeRanker:
                 'strategy_win_rate': strategy_perf['win_rate'],
                 'strategy_sharpe': strategy_perf['sharpe_ratio'],
                 'close': row['close'],
-                'volume': row['volume']
+                'volume': row['volume'],
+                'meta_confidence': row.get('meta_confidence', 0.0)
             })
 
         # Create ranked DataFrame
@@ -346,7 +364,7 @@ class TradeRanker:
 
     def select_top_trades(self, signals: pd.DataFrame,
                          num_trades: int = 5,
-                         total_capital: float = 100_000,
+                         total_capital: float = 1_000,
                          current_vix: Optional[float] = None) -> pd.DataFrame:
         """
         Select top N trades with position sizing
@@ -434,7 +452,7 @@ class TradeRanker:
         return top_trades
 
     def get_current_top_trades(self, num_trades: int = 5,
-                               total_capital: float = 100_000,
+                               total_capital: float = 1_000,
                                date: Optional[str] = None,
                                strategy_filter: Optional[str] = None) -> pd.DataFrame:
         """
@@ -469,10 +487,10 @@ class TradeRanker:
         return top_trades
 
     def get_ensemble_top_trades(self, num_trades: int = 5,
-                                total_capital: float = 100_000,
+                                total_capital: float = 1_000,
                                 date: Optional[str] = None) -> pd.DataFrame:
         """
-        Get top trades from EnsembleStrategy only
+        Get top trades from StackedEnsembleStrategy (meta-learner combining all 3 base strategies)
 
         Args:
             num_trades: Number of trades to select
@@ -480,14 +498,17 @@ class TradeRanker:
             date: Date to get signals for (default: latest)
 
         Returns:
-            Top N trades from EnsembleStrategy
+            Top N trades from StackedEnsembleStrategy
         """
-        return self.get_current_top_trades(
+        # Get trades from StackedEnsembleStrategy (combines Pairs, Sentiment, Volatility)
+        trades = self.get_current_top_trades(
             num_trades=num_trades,
             total_capital=total_capital,
             date=date,
-            strategy_filter='EnsembleStrategy'
+            strategy_filter='StackedEnsembleStrategy'
         )
+
+        return trades
 
     def export_trades_to_csv(self, trades: pd.DataFrame, output_path: str):
         """
