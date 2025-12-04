@@ -2,14 +2,12 @@
 Enhanced Strategy 1: Statistical Arbitrage with Robust Statistical Tests
 =========================================================================
 Uses proper cointegration tests with M1-optimized NumPy vectorization
+import sqlite3
 """
 
 import pandas as pd
 import numpy as np
 from typing import List, Tuple
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
 import logging
 from scipy import stats
@@ -17,7 +15,7 @@ from scipy import stats
 logger = logging.getLogger(__name__)
 
 
-class PairsTradingStrategy(BaseStrategy):
+class PairsTradingStrategy:
     """Statistical arbitrage with rigorous cointegration testing"""
 
     def __init__(self, db_path: str = "/Volumes/Vault/85_assets_prediction.db",
@@ -25,18 +23,57 @@ class PairsTradingStrategy(BaseStrategy):
                  zscore_entry: float = 1.5,       # KEPT at 1.5 (was 2.0 before)
                  zscore_exit: float = 0.5,        # NEW: Tighter exit for more signals
                  min_correlation: float = 0.7,
-                 use_relative_valuation: bool = True):
-        super().__init__(db_path)
+                 use_relative_valuation: bool = True,
+                 api=None):
+        self.db_path = db_path
         self.lookback_days = lookback_days
         self.zscore_entry = zscore_entry
         self.zscore_exit = zscore_exit
         self.min_correlation = min_correlation
         self.use_relative_valuation = use_relative_valuation
         self.name = "PairsTradingStrategy"
+        self.api = api
 
     def _get_price_data(self) -> pd.DataFrame:
-        """Get recent price data"""
-        conn = self._conn()
+        """Get recent price data from Alpaca API if available, otherwise from DB."""
+        if self.api:
+            logger.info("Fetching live price data from Alpaca...")
+            # Get tradable US equities
+            assets = self.api.list_assets(status='active', tradable=True)
+            us_equities = [a.symbol for a in assets if a.exchange in ['NASDAQ', 'NYSE']]
+            
+            # Fetch price data for the last lookback_days
+            end_dt = pd.Timestamp.now(tz='America/New_York')
+            start_dt = end_dt - pd.Timedelta(days=self.lookback_days + 20)
+            
+            try:
+                # Use Alpaca's get_bars method
+                price_data = self.api.get_bars(
+                    us_equities,
+                    "1D",
+                    start=start_dt.isoformat(),
+                    end=end_dt.isoformat()
+                ).df
+                
+                # Format the DataFrame to match the DB schema
+                price_data = price_data.reset_index()
+                price_data = price_data[['symbol', 'timestamp', 'close']]
+                price_data.columns = ['symbol_ticker', 'price_date', 'close']
+                price_data['price_date'] = price_data['price_date'].dt.date
+                
+                logger.info(f"Fetched {len(price_data)} price bars from Alpaca.")
+                return price_data
+            except Exception as e:
+                logger.error(f"Failed to fetch price data from Alpaca: {e}")
+                # Fallback to DB if API fails
+                return self._get_price_data_from_db()
+        else:
+            return self._get_price_data_from_db()
+
+    def _get_price_data_from_db(self) -> pd.DataFrame:
+        """Get recent price data from the database."""
+        logger.info("Fetching price data from database...")
+        conn = sqlite3.connect(self.db_path)
         query = f"""
             SELECT symbol_ticker, price_date, close
             FROM raw_price_data
@@ -52,7 +89,7 @@ class PairsTradingStrategy(BaseStrategy):
         Get latest relative valuation metrics for stock pairs
         This provides fundamental-based pair selection and signal enhancement
         """
-        conn = self._conn()
+        conn = sqlite3.connect(self.db_path)
         query = """
             SELECT
                 rv.symbol_ticker_1,
@@ -358,9 +395,9 @@ class PairsTradingStrategy(BaseStrategy):
         """Generate enhanced pairs trading signals with relative valuation overlay"""
         prices = self._get_price_data()
 
-        # Load relative valuation data if enabled
+        # Load relative valuation data if enabled and not in live mode
         rel_val_data = None
-        if self.use_relative_valuation:
+        if self.use_relative_valuation and self.api is None:
             try:
                 rel_val_data = self._get_relative_valuation_data()
                 logger.info(f"Using relative valuation data for {len(rel_val_data)} pairs")
@@ -449,7 +486,3 @@ class PairsTradingStrategy(BaseStrategy):
         return pd.DataFrame(signals)
 
 
-if __name__ == "__main__":
-    strategy = PairsTradingStrategy()
-    signals = strategy.run()
-    print(f"Generated {len(signals)} signals")

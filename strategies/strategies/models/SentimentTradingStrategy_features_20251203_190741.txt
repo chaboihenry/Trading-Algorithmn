@@ -1,0 +1,31 @@
+Feature Selection for SentimentTradingStrategy
+Generated: 20251203_190741
+================================================================================
+
+Selected 25 features:
+
+volatility_20d                           0.049795
+upside_to_target                         0.043737
+implied_volatility_30d                   0.037609
+value_opportunity                        0.036380
+volatility_10d                           0.034941
+earnings_momentum                        0.034185
+quality_score                            0.032852
+debt_to_equity                           0.031920
+revenue_growth                           0.030625
+macd_histogram                           0.030480
+beta                                     0.030148
+rsi_14_norm                              0.029599
+return_on_equity                         0.028700
+earnings_growth                          0.028535
+total_shares_traded                      0.028455
+current_ratio                            0.027894
+return_20d                               0.027852
+eps_surprise_percent                     0.027451
+volatility_20d_norm                      0.027413
+pe_ratio                                 0.027078
+profit_margin                            0.026914
+options_fear_index                       0.026898
+price_to_book                            0.026742
+macd                                     0.025529
+put_call_ratio                           0.025335

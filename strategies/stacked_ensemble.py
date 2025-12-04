@@ -66,7 +66,8 @@ class StackedEnsemble(BaseStrategy):
                  db_path: str = "/Volumes/Vault/85_assets_prediction.db",
                  meta_model_path: Optional[str] = None,
                  use_incremental_learning: bool = True,
-                 retrain_frequency_days: int = 7):
+                 retrain_frequency_days: int = 7,
+                 api=None):
         """
         Initialize stacked ensemble with meta-learner
 
@@ -75,16 +76,18 @@ class StackedEnsemble(BaseStrategy):
             meta_model_path: Path to saved meta-model (None = auto-generate)
             use_incremental_learning: Enable daily incremental updates (default True)
             retrain_frequency_days: Full retrain every N days (default 7)
+            api: Alpaca API object
         """
         super().__init__(db_path)
         self.name = "StackedEnsembleStrategy"
         self.use_incremental_learning = use_incremental_learning
         self.retrain_frequency_days = retrain_frequency_days
+        self.api = api
 
         # Initialize base strategies
-        self.sentiment_strategy = SentimentTradingStrategy(db_path)
-        self.pairs_strategy = PairsTradingStrategy(db_path)
-        self.volatility_strategy = VolatilityTradingStrategy(db_path)
+        self.enhanced_sentiment_trader = EnhancedSentimentTrader()
+        self.pairs_strategy = PairsTradingStrategy(db_path, api=self.api)
+        self.volatility_strategy = VolatilityTradingStrategy(db_path, api=self.api)
 
         # Meta-learner (small model to prevent overfitting)
         self.meta_model = None
@@ -189,7 +192,7 @@ class StackedEnsemble(BaseStrategy):
                 ts.symbol_ticker = rpd_future.symbol_ticker AND
                 rpd_future.price_date = date(ts.signal_date, '+5 days')
             WHERE ts.signal_date >= date('now', '-{lookback_days} days')
-                AND ts.strategy_name IN ('SentimentTradingStrategy', 'PairsTradingStrategy', 'VolatilityTradingStrategy')
+                AND ts.strategy_name IN ('PairsTradingStrategy', 'VolatilityTradingStrategy')
                 AND rpd_future.close IS NOT NULL
             ORDER BY ts.signal_date, ts.symbol_ticker
         """
@@ -214,8 +217,6 @@ class StackedEnsemble(BaseStrategy):
             row_data = {
                 'date': date,
                 'ticker': ticker,
-                'sentiment_pred': 0,
-                'sentiment_strength': 0,
                 'pairs_pred': 0,
                 'pairs_strength': 0,
                 'volatility_pred': 0,
@@ -229,10 +230,7 @@ class StackedEnsemble(BaseStrategy):
                 strength = signal['strength']
                 actual_return = signal['actual_return']
 
-                if 'Sentiment' in strategy:
-                    row_data['sentiment_pred'] = pred
-                    row_data['sentiment_strength'] = strength
-                elif 'Pairs' in strategy:
+                if 'Pairs' in strategy:
                     row_data['pairs_pred'] = pred
                     row_data['pairs_strength'] = strength
                 elif 'Volatility' in strategy:
@@ -275,13 +273,11 @@ class StackedEnsemble(BaseStrategy):
 
         # Agreement features
         features['total_buy_signals'] = (
-            (features['sentiment_pred'] == 1).astype(int) +
             (features['pairs_pred'] == 1).astype(int) +
             (features['volatility_pred'] == 1).astype(int)
         )
 
         features['total_sell_signals'] = (
-            (features['sentiment_pred'] == -1).astype(int) +
             (features['pairs_pred'] == -1).astype(int) +
             (features['volatility_pred'] == -1).astype(int)
         )
@@ -293,27 +289,17 @@ class StackedEnsemble(BaseStrategy):
 
         # Average confidence
         features['avg_confidence'] = (
-            features['sentiment_strength'] +
             features['pairs_strength'] +
             features['volatility_strength']
-        ) / 3
+        ) / 2
 
         # Interaction features (strategy pairs)
-        features['sentiment_pairs_agree'] = (
-            features['sentiment_pred'] * features['pairs_pred']
-        ).astype(float)
-
-        features['sentiment_volatility_agree'] = (
-            features['sentiment_pred'] * features['volatility_pred']
-        ).astype(float)
-
         features['pairs_volatility_agree'] = (
             features['pairs_pred'] * features['volatility_pred']
         ).astype(float)
 
         # Weighted predictions
         features['weighted_pred'] = (
-            features['sentiment_pred'] * features['sentiment_strength'] +
             features['pairs_pred'] * features['pairs_strength'] +
             features['volatility_pred'] * features['volatility_strength']
         )
@@ -335,12 +321,11 @@ class StackedEnsemble(BaseStrategy):
 
         # Feature columns for meta-learner
         feature_cols = [
-            'sentiment_pred', 'sentiment_strength',
             'pairs_pred', 'pairs_strength',
             'volatility_pred', 'volatility_strength',
             'total_buy_signals', 'total_sell_signals', 'total_agreement',
             'avg_confidence',
-            'sentiment_pairs_agree', 'sentiment_volatility_agree', 'pairs_volatility_agree',
+            'pairs_volatility_agree',
             'weighted_pred'
         ]
 
@@ -444,12 +429,11 @@ class StackedEnsemble(BaseStrategy):
 
         # Feature importance
         feature_names = [
-            'sentiment_pred', 'sentiment_strength',
             'pairs_pred', 'pairs_strength',
             'volatility_pred', 'volatility_strength',
             'total_buy_signals', 'total_sell_signals', 'total_agreement',
             'avg_confidence',
-            'sentiment_pairs_agree', 'sentiment_volatility_agree', 'pairs_volatility_agree',
+            'pairs_volatility_agree',
             'weighted_pred'
         ]
 
@@ -472,12 +456,11 @@ class StackedEnsemble(BaseStrategy):
         training_end = base_predictions['date'].max() if 'date' in base_predictions.columns else 'Unknown'
 
         feature_names = [
-            'sentiment_pred', 'sentiment_strength',
             'pairs_pred', 'pairs_strength',
             'volatility_pred', 'volatility_strength',
             'total_buy_signals', 'total_sell_signals', 'total_agreement',
             'avg_confidence',
-            'sentiment_pairs_agree', 'sentiment_volatility_agree', 'pairs_volatility_agree',
+            'pairs_volatility_agree',
             'weighted_pred'
         ]
 
@@ -541,14 +524,6 @@ class StackedEnsemble(BaseStrategy):
         logger.info("\n=== Running Base Strategies ===")
 
         try:
-            logger.info("▶ Sentiment Strategy")
-            sentiment_signals = self.sentiment_strategy.generate_signals()
-            logger.info(f"  Generated {len(sentiment_signals)} signals")
-        except Exception as e:
-            logger.error(f"❌ Sentiment strategy failed: {e}")
-            sentiment_signals = pd.DataFrame()
-
-        try:
             logger.info("▶ Pairs Strategy")
             pairs_signals = self.pairs_strategy.generate_signals()
             logger.info(f"  Generated {len(pairs_signals)} signals")
@@ -566,8 +541,6 @@ class StackedEnsemble(BaseStrategy):
 
         # Combine signals
         all_tickers = set()
-        if not sentiment_signals.empty:
-            all_tickers.update(sentiment_signals['symbol_ticker'].unique())
         if not pairs_signals.empty:
             all_tickers.update(pairs_signals['symbol_ticker'].unique())
         if not volatility_signals.empty:
@@ -585,10 +558,6 @@ class StackedEnsemble(BaseStrategy):
 
         for ticker in all_tickers:
             # Get base strategy predictions for this ticker
-            sentiment_pred = 0
-            sentiment_strength = 0
-            sentiment_price = 0
-
             pairs_pred = 0
             pairs_strength = 0
             pairs_price = 0
@@ -596,14 +565,6 @@ class StackedEnsemble(BaseStrategy):
             volatility_pred = 0
             volatility_strength = 0
             volatility_price = 0
-
-            if not sentiment_signals.empty:
-                sentiment_ticker = sentiment_signals[sentiment_signals['symbol_ticker'] == ticker]
-                if not sentiment_ticker.empty:
-                    signal = sentiment_ticker.iloc[0]
-                    sentiment_pred = 1 if signal['signal_type'] == 'BUY' else -1
-                    sentiment_strength = signal['strength']
-                    sentiment_price = signal.get('entry_price', 0)
 
             if not pairs_signals.empty:
                 pairs_ticker = pairs_signals[pairs_signals['symbol_ticker'] == ticker]
@@ -622,13 +583,11 @@ class StackedEnsemble(BaseStrategy):
                     volatility_price = signal.get('entry_price', 0)
 
             # Skip if no strategies have signals for this ticker
-            if sentiment_pred == 0 and pairs_pred == 0 and volatility_pred == 0:
+            if pairs_pred == 0 and volatility_pred == 0:
                 continue
 
             # Create meta-features
             base_pred_df = pd.DataFrame([{
-                'sentiment_pred': sentiment_pred,
-                'sentiment_strength': sentiment_strength,
                 'pairs_pred': pairs_pred,
                 'pairs_strength': pairs_strength,
                 'volatility_pred': volatility_pred,
@@ -638,12 +597,11 @@ class StackedEnsemble(BaseStrategy):
             meta_features = self._create_meta_features(base_pred_df)
 
             feature_cols = [
-                'sentiment_pred', 'sentiment_strength',
                 'pairs_pred', 'pairs_strength',
                 'volatility_pred', 'volatility_strength',
                 'total_buy_signals', 'total_sell_signals', 'total_agreement',
                 'avg_confidence',
-                'sentiment_pairs_agree', 'sentiment_volatility_agree', 'pairs_volatility_agree',
+                'pairs_volatility_agree',
                 'weighted_pred'
             ]
 
@@ -654,11 +612,17 @@ class StackedEnsemble(BaseStrategy):
             meta_pred = self.meta_model.predict(X_scaled)[0]
             meta_confidence = self.meta_model.predict_proba(X_scaled)[0][meta_pred]
 
+            # Get live sentiment score
+            sentiment_features = self.enhanced_sentiment_trader.get_ensemble_features(ticker)
+            sentiment_score = sentiment_features.get('finbert_sentiment_score', 0.0)
+
+            # Combine meta-confidence with sentiment score (e.g., weighted average)
+            adjusted_confidence = (0.7 * meta_confidence) + (0.3 * abs(sentiment_score))
+
             # Only use signals where meta-model is confident
-            if meta_pred == 1 and meta_confidence >= 0.6:  # 60% confidence threshold
+            if meta_pred == 1 and adjusted_confidence >= 0.6:  # 60% confidence threshold
                 # Determine signal direction (use weighted vote)
                 weighted_vote = (
-                    sentiment_pred * sentiment_strength +
                     pairs_pred * pairs_strength +
                     volatility_pred * volatility_strength
                 )
@@ -668,9 +632,6 @@ class StackedEnsemble(BaseStrategy):
                 # Use average price (weighted by strength)
                 prices = []
                 strengths = []
-                if sentiment_pred != 0:
-                    prices.append(sentiment_price)
-                    strengths.append(sentiment_strength)
                 if pairs_pred != 0:
                     prices.append(pairs_price)
                     strengths.append(pairs_strength)
@@ -691,18 +652,17 @@ class StackedEnsemble(BaseStrategy):
                     'symbol_ticker': ticker,
                     'signal_date': datetime.now().strftime('%Y-%m-%d'),
                     'signal_type': signal_type,
-                    'strength': meta_confidence,  # Use meta-model confidence
+                    'strength': adjusted_confidence,  # Use adjusted confidence
                     'entry_price': avg_price,
                     'stop_loss': avg_price * (1 + stop_loss_pct),
                     'take_profit': avg_price * (1 + take_profit_pct),
-                    'metadata': f'{{"meta_confidence": {meta_confidence:.3f}, "weighted_vote": {weighted_vote:.3f}, '
-                               f'"sentiment": [{sentiment_pred}, {sentiment_strength:.2f}], '
+                    'metadata': f'{{"meta_confidence": {meta_confidence:.3f}, "sentiment_score": {sentiment_score:.3f}, "adjusted_confidence": {adjusted_confidence:.3f}, "weighted_vote": {weighted_vote:.3f}, '
                                f'"pairs": [{pairs_pred}, {pairs_strength:.2f}], '
                                f'"volatility": [{volatility_pred}, {volatility_strength:.2f}], '
                                f'"model_version": "{model_version}"}}'
                 })
 
-                logger.info(f"✅ {ticker}: {signal_type} (meta-confidence: {meta_confidence:.1%})")
+                logger.info(f"✅ {ticker}: {signal_type} (adjusted confidence: {adjusted_confidence:.1%})")
 
         result_df = pd.DataFrame(meta_predictions)
 
@@ -713,7 +673,7 @@ class StackedEnsemble(BaseStrategy):
             logger.info(f"\n=== Stacked Ensemble Results ===")
             logger.info(f"Total signals: {len(result_df)}")
             logger.info(f"Signal distribution: {result_df['signal_type'].value_counts().to_dict()}")
-            logger.info(f"Average meta-confidence: {result_df['strength'].mean():.1%}")
+            logger.info(f"Average adjusted confidence: {result_df['strength'].mean():.1%}")
         else:
             logger.info("\n=== No high-confidence signals generated ===")
 

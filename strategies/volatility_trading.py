@@ -2,6 +2,7 @@
 Volatility Regime Trading with Incremental Learning (M1 Optimized)
 ===================================================================
 Uses vectorized GARCH models and XGBoost for M1-optimized volatility forecasting
+import sqlite3
 with incremental training support for daily model updates.
 
 HYBRID FIX APPLIED:
@@ -15,9 +16,6 @@ ENHANCEMENT: Smart Feature Selection (further optimization)
 
 import pandas as pd
 import numpy as np
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent))
 from base_strategy import BaseStrategy
 from incremental_trainer import IncrementalTrainer
 from feature_selector import SmartFeatureSelector
@@ -41,7 +39,7 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
-class VolatilityTradingStrategy(BaseStrategy):
+class VolatilityTradingStrategy:
     """Trade based on GARCH forecasts and XGBoost regime prediction with incremental learning"""
 
     # HYBRID FIX: Adjusted thresholds and parameters
@@ -54,7 +52,8 @@ class VolatilityTradingStrategy(BaseStrategy):
                  lookback_days: int = 90,
                  min_samples: int = 30,
                  use_feature_selection: bool = True,
-                 n_features: int = 20):
+                 n_features: int = 20,
+                 api=None):
         """
         Initialize volatility strategy with optional feature selection
 
@@ -64,8 +63,9 @@ class VolatilityTradingStrategy(BaseStrategy):
             min_samples: Minimum samples required for training
             use_feature_selection: Enable smart feature selection (default True)
             n_features: Number of top features to keep (default 20, as we already have fewer features)
+            api: Alpaca API object
         """
-        super().__init__(db_path)
+        self.db_path = db_path
         self.lookback_days = lookback_days
         self.min_samples = min_samples
         self.model = None
@@ -73,6 +73,7 @@ class VolatilityTradingStrategy(BaseStrategy):
         self.name = "VolatilityTradingStrategy"
         self.trainer = IncrementalTrainer(db_path=db_path)
         self.feature_cols = None
+        self.api = api
 
         # Feature selection configuration
         self.use_feature_selection = use_feature_selection
@@ -360,10 +361,13 @@ class VolatilityTradingStrategy(BaseStrategy):
 
     def _get_volatility_features(self, lookback_days: int = None) -> pd.DataFrame:
         """Get comprehensive volatility features for ML model with OPTIONS and ECONOMIC data"""
+        if self.api:
+            return self._get_live_volatility_features(lookback_days)
+        
         if lookback_days is None:
             lookback_days = self.lookback_days
 
-        conn = self._conn()
+        conn = sqlite3.connect(self.db_path)
         query = f"""
             SELECT
                 vm.symbol_ticker,
@@ -466,6 +470,69 @@ class VolatilityTradingStrategy(BaseStrategy):
         logger.info(f"Loaded {len(df)} volatility records with options and economic data")
         return df
 
+    def _get_live_volatility_features(self, lookback_days: int = None) -> pd.DataFrame:
+        """Get simplified volatility features from live Alpaca data."""
+        if lookback_days is None:
+            lookback_days = self.lookback_days
+
+        logger.info("Fetching live price data from Alpaca for volatility features...")
+        assets = self.api.list_assets(status='active', tradable=True)
+        us_equities = [a.symbol for a in assets if a.exchange in ['NASDAQ', 'NYSE']]
+        
+        end_dt = pd.Timestamp.now(tz='America/New_York')
+        start_dt = end_dt - pd.Timedelta(days=lookback_days + 100) # Fetch more data for calculations
+
+        try:
+            price_data = self.api.get_bars(
+                us_equities,
+                "1D",
+                start=start_dt.isoformat(),
+                end=end_dt.isoformat()
+            ).df
+
+            if price_data.empty:
+                logger.warning("No price data fetched from Alpaca.")
+                return pd.DataFrame()
+
+            df = price_data.reset_index()
+            df = df[['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']]
+            df.columns = ['symbol_ticker', 'vol_date', 'open', 'high', 'low', 'close', 'volume']
+            df['vol_date'] = df['vol_date'].dt.date
+
+            # Calculate simplified features
+            df['return_1d'] = df.groupby('symbol_ticker')['close'].pct_change(1)
+            df['return_5d'] = df.groupby('symbol_ticker')['close'].pct_change(5)
+            df['return_20d'] = df.groupby('symbol_ticker')['close'].pct_change(20)
+
+            # Close-to-close volatility
+            df['close_to_close_vol_10d'] = df.groupby('symbol_ticker')['return_1d'].rolling(10).std().reset_index(0, drop=True)
+            df['close_to_close_vol_20d'] = df.groupby('symbol_ticker')['return_1d'].rolling(20).std().reset_index(0, drop=True)
+            df['close_to_close_vol_60d'] = df.groupby('symbol_ticker')['return_1d'].rolling(60).std().reset_index(0, drop=True)
+
+            # RSI
+            delta = df.groupby('symbol_ticker')['close'].diff()
+            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+            rs = gain / loss
+            df['rsi_14'] = 100 - (100 / (1 + rs))
+
+            # ATR
+            high_low = df['high'] - df['low']
+            high_close = np.abs(df['high'] - df.groupby('symbol_ticker')['close'].shift())
+            low_close = np.abs(df['low'] - df.groupby('symbol_ticker')['close'].shift())
+            ranges = pd.concat([high_low, high_close, low_close], axis=1)
+            true_range = np.max(ranges, axis=1)
+            df['atr_14'] = true_range.rolling(14).mean()
+            
+            df['current_price'] = df['close']
+
+            return df
+
+        except Exception as e:
+            logger.error(f"Failed to fetch or process live volatility features: {e}")
+            return pd.DataFrame()
+
+
     def _calculate_garch_features_vectorized(self, df: pd.DataFrame) -> pd.DataFrame:
         """Vectorized GARCH calculation for M1 optimization"""
         if ARCH_AVAILABLE:
@@ -547,51 +614,12 @@ class VolatilityTradingStrategy(BaseStrategy):
         return df
 
     def _prepare_ml_features(self, df: pd.DataFrame) -> tuple:
-        """Prepare feature matrix with ALL available features"""
+        """Prepare feature matrix with a simplified feature set for live trading."""
         feature_cols = [
             'close_to_close_vol_10d', 'close_to_close_vol_20d', 'close_to_close_vol_60d',
-            'parkinson_vol_10d', 'parkinson_vol_20d',
-            'garman_klass_vol_10d', 'garman_klass_vol_20d',
-            'yang_zhang_vol_10d', 'yang_zhang_vol_20d',
-            'realized_vol_percentile_1y', 'realized_vol_percentile_3y',
-            'volatility_of_volatility_20d', 'vol_clustering_index',
-            'volatility_acceleration', 'volume_weighted_volatility',
-            'abnormal_volume_count_20d', 'gap_frequency_60d',
-            'rsi_14', 'atr_14', 'bb_width', 'adx_14',
             'return_1d', 'return_5d', 'return_20d',
-            # MULTI-TIMEFRAME FEATURES (2-3% win rate boost)
-            'momentum_5d', 'momentum_10d', 'momentum_20d', 'momentum_50d', 'momentum_100d',
-            'volatility_5d', 'volatility_50d', 'volatility_100d',
-            'volume_surge_5d', 'volume_surge_10d', 'volume_surge_20d', 'volume_surge_50d', 'volume_surge_100d',
-            # MARKET REGIME DETECTION (2-3% win rate boost)
-            'is_bullish', 'is_bearish', 'is_sideways'
+            'rsi_14', 'atr_14'
         ]
-
-        garch_features = ['garch_cond_vol', 'garch_forecast', 'vol_surprise']
-        for feat in garch_features:
-            if feat in df.columns and df[feat].notna().sum() > 10:
-                feature_cols.append(feat)
-
-        trend_map = {'decreasing': -1, 'stable': 0, 'increasing': 1}
-        df['volatility_trend_num'] = df['volatility_trend'].map(trend_map).fillna(0)
-        feature_cols.append('volatility_trend_num')
-
-        options_features = [
-            'implied_volatility_30d', 'implied_volatility_60d', 'implied_volatility_90d',
-            'iv_percentile_1y', 'put_call_ratio', 'total_options_volume', 'atm_iv'
-        ]
-        for feat in options_features:
-            if feat in df.columns:
-                df[feat] = df.groupby('symbol_ticker')[feat].ffill()
-                if df[feat].notna().sum() > 10:
-                    feature_cols.append(feat)
-
-        economic_features = ['vix', 'treasury_10y', 'yield_curve_10y_2y']
-        for feat in economic_features:
-            if feat in df.columns:
-                df[feat] = df[feat].ffill()
-                if df[feat].notna().sum() > 10:
-                    feature_cols.append(feat)
 
         df_clean = df.dropna(subset=['regime_label'])
 
@@ -922,18 +950,3 @@ class VolatilityTradingStrategy(BaseStrategy):
         return pd.DataFrame(signals)
 
 
-if __name__ == "__main__":
-    import sys
-
-    strategy = VolatilityTradingStrategy()
-
-    # Check for --retrain flag
-    if len(sys.argv) > 1 and sys.argv[1] == '--retrain':
-        force_full = '--full' in sys.argv
-        result = strategy.incremental_train(force_full=force_full)
-        print(f"\nTraining result: {result}")
-    else:
-        signals = strategy.run()
-        print(f"\nGenerated {len(signals)} signals")
-        if len(signals) > 0:
-            print(signals[['symbol_ticker', 'signal_type', 'strength']].head(10))
