@@ -1,4 +1,4 @@
-# Lumibot Trading Bot
+# Live Trading Agent
 
 A production-ready trading bot that combines sentiment analysis and pairs trading using a machine learning meta-learner. Runs on Alpaca paper trading platform with daily execution.
 
@@ -28,14 +28,12 @@ This populates your database with historical price data, technical indicators, a
 ### 4. Run Backtests (Optional but Recommended)
 
 ```bash
-cd lumibot_strategies
 python run_backtest.py
 ```
 
 ### 5. Start Live Paper Trading
 
 ```bash
-cd lumibot_strategies
 python live_trader.py --strategy combined
 ```
 
@@ -45,16 +43,12 @@ python live_trader.py --strategy combined
 Integrated Trading Agent/
 ├── requirements.txt                 # All dependencies
 ├── backfill_historical_data.py     # Data backfill utility
-├── README.md                        # This file
-│
-└── lumibot_strategies/              # Main trading system
-    ├── sentiment_strategy.py        # FinBERT news sentiment
-    ├── pairs_strategy.py            # Statistical arbitrage
-    ├── combined_strategy.py         # Meta-learner ensemble ⭐
-    ├── run_backtest.py              # Backtesting suite
-    ├── live_trader.py               # Live trading script
-    ├── README.md                    # Detailed documentation
-    └── models/                      # Saved meta-models
+├── sentiment_strategy.py            # FinBERT news sentiment
+├── pairs_strategy.py                # Statistical arbitrage
+├── combined_strategy.py             # Meta-learner ensemble ⭐
+├── run_backtest.py                  # Backtesting suite
+├── live_trader.py                   # Live trading script
+└── models/                          # Saved meta-models
 ```
 
 ## 🎯 Features
@@ -168,7 +162,7 @@ tail -f live_trading_$(date +%Y%m%d).log
 
 **"No module named 'lumibot'"**
 ```bash
-pip install lumibot==2.9.13
+pip install -r requirements.txt
 ```
 
 **"Alpaca credentials not found"**
@@ -181,37 +175,17 @@ export ALPACA_API_SECRET="your_secret"
 ```bash
 # Verify path
 ls /Volumes/Vault/85_assets_prediction.db
-
-# If missing, check backfill_historical_data.py DB_PATH variable
 ```
 
 **"Insufficient training data"**
 - Run backtests first to generate signal history
 - Meta-learner needs 100+ signals to train effectively
 
-## 📚 Documentation
-
-See [lumibot_strategies/README.md](lumibot_strategies/README.md) for detailed documentation including:
-- Complete API reference
-- Advanced configuration
-- Production deployment
-- Monitoring and alerts
-
 ## ⚖️ License & Disclaimer
 
 MIT License - Educational use only.
 
 **DISCLAIMER**: Trading involves substantial risk. Past performance does not guarantee future results. Only trade with money you can afford to lose. This software is provided "as is" without warranty.
-
-## 🤝 Support
-
-For detailed documentation, see the [Lumibot Strategies README](lumibot_strategies/README.md).
-
-For issues:
-1. Check logs in `live_trading_YYYYMMDD.log`
-2. Verify Alpaca account status
-3. Ensure database has sufficient data
-4. Review backtest results
 
 ---
 
