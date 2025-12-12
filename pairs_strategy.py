@@ -91,20 +91,20 @@ class PairsStrategy(Strategy):
             # Fetch specific symbols
             placeholders = ','.join(['?' for _ in self.symbols])
             query = f"""
-                SELECT symbol_ticker, date as price_date, close
+                SELECT symbol_ticker, price_date, close
                 FROM raw_price_data
                 WHERE symbol_ticker IN ({placeholders})
-                  AND date >= date('now', '-{days + 20} days')
-                ORDER BY symbol_ticker, date
+                  AND price_date >= date('now', '-{days + 20} days')
+                ORDER BY symbol_ticker, price_date
             """
             df = pd.read_sql(query, conn, params=self.symbols)
         else:
             # Fetch all symbols
             query = f"""
-                SELECT symbol_ticker, date as price_date, close
+                SELECT symbol_ticker, price_date, close
                 FROM raw_price_data
-                WHERE date >= date('now', '-{days + 20} days')
-                ORDER BY symbol_ticker, date
+                WHERE price_date >= date('now', '-{days + 20} days')
+                ORDER BY symbol_ticker, price_date
             """
             df = pd.read_sql(query, conn)
 
@@ -236,8 +236,8 @@ class PairsStrategy(Strategy):
             logger.warning("No price data available")
             return
 
-        # Pivot to price matrix
-        price_matrix = prices.pivot(index='price_date', columns='symbol_ticker', values='close')
+        # Pivot to price matrix (handle duplicates by taking the mean)
+        price_matrix = prices.groupby(['price_date', 'symbol_ticker'])['close'].mean().unstack()
         price_matrix = price_matrix.ffill().dropna(axis=1)
 
         if len(price_matrix.columns) < 2:
@@ -298,7 +298,7 @@ class PairsStrategy(Strategy):
 
         # Filter to our pair
         pair_prices = prices[prices['symbol_ticker'].isin([s1, s2])]
-        price_matrix = pair_prices.pivot(index='price_date', columns='symbol_ticker', values='close')
+        price_matrix = pair_prices.groupby(['price_date', 'symbol_ticker'])['close'].mean().unstack()
 
         if s1 not in price_matrix.columns or s2 not in price_matrix.columns:
             return 0.0, 0.0

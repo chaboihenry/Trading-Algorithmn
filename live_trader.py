@@ -31,6 +31,7 @@ import os
 import logging
 import argparse
 from datetime import datetime
+from pathlib import Path
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 
@@ -39,16 +40,22 @@ from sentiment_strategy import SentimentStrategy
 from pairs_strategy import PairsStrategy
 from combined_strategy import CombinedStrategy
 
-# Configure logging
+# Create logs directory if it doesn't exist
+LOGS_DIR = Path(__file__).parent / 'logs'
+LOGS_DIR.mkdir(exist_ok=True)
+
+# Configure logging to save in logs folder
+log_file = LOGS_DIR / f'live_trading_{datetime.now().strftime("%Y%m%d")}.log'
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'live_trading_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.FileHandler(log_file),
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Logging to: {log_file}")
 
 
 class LiveTrader:
@@ -83,6 +90,9 @@ class LiveTrader:
             "API_KEY": self.api_key,
             "API_SECRET": self.api_secret,
             "PAPER": True,  # Paper trading (change to False for live trading)
+            # Connection settings to prevent socket exhaustion
+            "stream_timeout": 300,  # 5 min timeout instead of indefinite
+            "stream_reconnect": False,  # Disable auto-reconnect for daily strategy
         }
 
         logger.info("=" * 80)
@@ -98,23 +108,19 @@ class LiveTrader:
         Get the configured strategy instance.
 
         Returns:
-            Strategy instance
+            Strategy class (not instance - Lumibot will instantiate it)
         """
-        parameters = {
-            'db_path': '/Volumes/Vault/85_assets_prediction.db'
-        }
-
         if self.strategy_name == 'sentiment':
-            logger.info("Initializing Sentiment Strategy")
-            return SentimentStrategy()
+            logger.info("Using Sentiment Strategy")
+            return SentimentStrategy
 
         elif self.strategy_name == 'pairs':
-            logger.info("Initializing Pairs Strategy")
-            return PairsStrategy()
+            logger.info("Using Pairs Strategy")
+            return PairsStrategy
 
         elif self.strategy_name == 'combined':
-            logger.info("Initializing Combined Strategy (Meta-Learner)")
-            return CombinedStrategy()
+            logger.info("Using Combined Strategy (Meta-Learner)")
+            return CombinedStrategy
 
         else:
             raise ValueError(f"Unknown strategy: {self.strategy_name}")
@@ -135,8 +141,19 @@ class LiveTrader:
             # Create broker connection
             broker = Alpaca(self.alpaca_config)
 
-            # Get strategy
-            strategy = self.get_strategy()
+            # Get strategy class
+            strategy_class = self.get_strategy()
+
+            # Set up parameters based on strategy type
+            parameters = {}
+            if self.strategy_name in ['pairs', 'combined']:
+                parameters['db_path'] = '/Volumes/Vault/85_assets_prediction.db'
+
+            if self.strategy_name == 'combined':
+                parameters['retrain'] = False  # Don't retrain on startup for live trading
+
+            # Create strategy instance with broker and parameters
+            strategy = strategy_class(broker=broker, parameters=parameters)
 
             # Create trader
             trader = Trader()

@@ -27,9 +27,9 @@ import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-# Import our base strategies
-from sentiment_strategy import SentimentStrategy
-from pairs_strategy import PairsStrategy
+# Base strategies not needed - using simplified approach
+# from sentiment_strategy import SentimentStrategy
+# from pairs_strategy import PairsStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +49,16 @@ class CombinedStrategy(Strategy):
     - Position sizing based on confidence
     """
 
-    # Strategy parameters
-    SLEEPTIME = "24H"
+    # Strategy parameters - ACTIVE TRADING: Check every hour
+    SLEEPTIME = "1H"
     RETRAIN_FREQUENCY_DAYS = 7  # Retrain meta-model weekly
     MIN_TRAINING_SAMPLES = 100  # Minimum samples needed to train
     CONFIDENCE_THRESHOLD = 0.6  # Only trade if meta-model confidence > 60%
+
+    # Risk management - Active 24/7
+    STOP_LOSS_PCT = 0.05  # Exit at -5% loss
+    TAKE_PROFIT_PCT = 0.15  # Exit at +15% profit
+    ENABLE_EXTENDED_HOURS = True  # Trade after hours
 
     def initialize(self, parameters: Dict = None):
         """
@@ -71,9 +76,34 @@ class CombinedStrategy(Strategy):
         self.db_path = params.get('db_path', '/Volumes/Vault/85_assets_prediction.db')
         self.retrain = params.get('retrain', False)
 
-        # Initialize base strategies (we'll use their logic, not run them separately)
-        self.sentiment_strategy = SentimentStrategy()
-        self.pairs_strategy = PairsStrategy()
+        # We don't actually need separate strategy instances
+        # Instead, we'll implement the logic directly in this combined strategy
+        # (The original code tried to instantiate strategies without brokers, which fails)
+
+        # Sentiment parameters (from SentimentStrategy)
+        self.NEWS_LOOKBACK_DAYS = 3
+        self.SYMBOLS = [
+            "AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMZN", "TSLA",
+            "AMD", "NFLX", "CRM", "ADBE", "INTC", "PYPL", "SQ"
+        ]
+
+        # Initialize FinBERT for sentiment
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        import torch
+        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
+        self.sentiment_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
+        self.sentiment_model.eval()
+        self.torch = torch
+
+        # Pairs parameters (from PairsStrategy) - DISABLED FOR NOW
+        # Focus on risk management first, pairs trading can be added later
+        self.LOOKBACK_DAYS = 120
+        self.ZSCORE_ENTRY = 1.5
+        self.MIN_CORRELATION = 0.7
+        self.cointegrated_pairs = []  # Empty for now
+
+        # TODO: Add pairs finding logic later
+        # self._find_cointegrated_pairs_from_db()
 
         # Meta-learner components
         self.meta_model = None
@@ -439,6 +469,153 @@ class CombinedStrategy(Strategy):
 
         return final_signal, confidence
 
+    def _check_risk_management_alpaca(self, alpaca_position) -> Optional[str]:
+        """Check if Alpaca position triggers stop-loss or take-profit."""
+        try:
+            symbol = alpaca_position.symbol
+            entry_price = float(alpaca_position.avg_entry_price)
+            current_price = float(alpaca_position.current_price)
+
+            pnl_pct = (current_price - entry_price) / entry_price
+
+            if pnl_pct <= -self.STOP_LOSS_PCT:
+                logger.warning(f"🛑 STOP-LOSS: {symbol} at {pnl_pct:.2%} (entry: ${entry_price:.2f}, current: ${current_price:.2f})")
+                return 'stop_loss'
+
+            if pnl_pct >= self.TAKE_PROFIT_PCT:
+                logger.info(f"💰 TAKE-PROFIT: {symbol} at {pnl_pct:.2%} (entry: ${entry_price:.2f}, current: ${current_price:.2f})")
+                return 'take_profit'
+
+            # Log status for positions approaching thresholds
+            if pnl_pct <= -0.03:
+                logger.info(f"⚠️  {symbol} at {pnl_pct:.2%} (approaching stop-loss)")
+            elif pnl_pct >= 0.10:
+                logger.info(f"📈 {symbol} at {pnl_pct:.2%} (approaching take-profit)")
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error checking risk for position: {e}")
+            return None
+
+    def _submit_risk_exit_order_alpaca(self, alpaca_position, reason: str):
+        """Submit exit order for Alpaca position."""
+        try:
+            symbol = alpaca_position.symbol
+            quantity = float(alpaca_position.qty)
+            current_price = float(alpaca_position.current_price)
+
+            # Use market order for immediate exit on stop-loss, limit for take-profit
+            if reason == 'stop_loss':
+                order = self.create_order(
+                    symbol,
+                    quantity,
+                    "sell",
+                    type="market"
+                )
+            else:  # take_profit
+                limit_price = round(current_price * 0.99, 2)  # 1% below current to ensure fill
+                order = self.create_order(
+                    symbol,
+                    quantity,
+                    "sell",
+                    type="limit",
+                    limit_price=limit_price,
+                    time_in_force="gtc" if self.ENABLE_EXTENDED_HOURS else "day",
+                    extended_hours=self.ENABLE_EXTENDED_HOURS
+                )
+
+            self.submit_order(order)
+            logger.info(f"{'🛑' if reason == 'stop_loss' else '💰'} SOLD {symbol}: {quantity:.2f} shares @ ${current_price:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error exiting {alpaca_position.symbol}: {e}")
+
+    def _check_risk_management(self, symbol: str, position) -> Optional[str]:
+        """Check if position triggers stop-loss or take-profit."""
+        if position is None:
+            return None
+
+        current_price = self.get_last_price(symbol)
+        if current_price is None:
+            return None
+
+        # Debug: Log all position attributes
+        logger.debug(f"Position attributes for {symbol}: {dir(position)}")
+
+        # Try different attribute names for entry price
+        entry_price = None
+        qty = None
+
+        # Try to get entry price from various possible attributes
+        for attr_name in ['avg_entry_price', 'avg_fill_price', 'entry_price', 'purchase_price']:
+            if hasattr(position, attr_name):
+                try:
+                    entry_price = float(getattr(position, attr_name))
+                    if entry_price > 0:
+                        logger.debug(f"Found entry price in {attr_name}: ${entry_price:.2f}")
+                        break
+                except (ValueError, TypeError):
+                    continue
+
+        # If still None, try cost_basis / qty
+        if entry_price is None and hasattr(position, 'cost_basis'):
+            # Try to get quantity
+            for qty_attr in ['qty', 'quantity', 'shares']:
+                if hasattr(position, qty_attr):
+                    try:
+                        qty = float(getattr(position, qty_attr))
+                        if qty > 0:
+                            break
+                    except (ValueError, TypeError):
+                        continue
+
+            if qty and qty > 0:
+                try:
+                    cost_basis = float(position.cost_basis)
+                    entry_price = cost_basis / qty
+                    logger.debug(f"Calculated entry price from cost_basis: ${entry_price:.2f}")
+                except (ValueError, TypeError):
+                    pass
+
+        if entry_price is None or entry_price <= 0:
+            logger.warning(f"Could not determine entry price for {symbol}. Available attributes: {[a for a in dir(position) if not a.startswith('_')]}")
+            return None
+
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        if pnl_pct <= -self.STOP_LOSS_PCT:
+            logger.warning(f"🛑 STOP-LOSS: {symbol} at {pnl_pct:.2%}")
+            return 'stop_loss'
+
+        if pnl_pct >= self.TAKE_PROFIT_PCT:
+            logger.info(f"💰 TAKE-PROFIT: {symbol} at {pnl_pct:.2%}")
+            return 'take_profit'
+
+        return None
+
+    def _submit_risk_exit_order(self, symbol: str, position, reason: str):
+        """Submit exit order for risk management."""
+        try:
+            current_price = self.get_last_price(symbol)
+            limit_price = round(current_price * (0.98 if reason == 'stop_loss' else 0.99), 2)
+
+            order = self.create_order(
+                symbol,
+                position.quantity,
+                "sell",
+                type="limit",
+                limit_price=limit_price,
+                time_in_force="gtc" if self.ENABLE_EXTENDED_HOURS else "day",
+                extended_hours=self.ENABLE_EXTENDED_HOURS
+            )
+            self.submit_order(order)
+
+            logger.info(f"{'🛑' if reason == 'stop_loss' else '💰'} SOLD {symbol}: {position.quantity:.2f} shares @ ${limit_price:.2f}")
+
+        except Exception as e:
+            logger.error(f"Error exiting {symbol}: {e}")
+
     def on_trading_iteration(self):
         """
         Main trading logic - combines signals from both strategies using meta-learner.
@@ -447,6 +624,30 @@ class CombinedStrategy(Strategy):
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
         logger.info("=" * 80)
 
+        # STEP 1: Risk Management - Check ALL positions first
+        # Use broker API directly instead of Lumibot wrapper to get entry prices
+        try:
+            from alpaca.trading.client import TradingClient
+            import os
+
+            api_key = os.getenv('ALPACA_API_KEY')
+            api_secret = os.getenv('ALPACA_API_SECRET')
+            trading_client = TradingClient(api_key, api_secret, paper=True)
+            alpaca_positions = trading_client.get_all_positions()
+
+            if len(alpaca_positions) > 0:
+                logger.info(f"Checking {len(alpaca_positions)} positions for risk triggers...")
+                for alpaca_pos in alpaca_positions:
+                    risk_trigger = self._check_risk_management_alpaca(alpaca_pos)
+                    if risk_trigger:
+                        self._submit_risk_exit_order_alpaca(alpaca_pos, risk_trigger)
+            else:
+                logger.info("No positions to check")
+        except Exception as e:
+            logger.error(f"Error checking risk management: {e}")
+            import traceback
+            traceback.print_exc()
+
         # Check if we need to retrain meta-model
         if self.last_retrain_date:
             days_since_retrain = (datetime.now() - self.last_retrain_date).days
@@ -454,60 +655,61 @@ class CombinedStrategy(Strategy):
                 logger.info(f"Retraining meta-model ({days_since_retrain} days since last retrain)")
                 self._train_meta_model()
 
-        # Get combined symbols from both strategies
-        all_symbols = set(self.sentiment_strategy.SYMBOLS)
-
-        # Add symbols from pairs
-        for pair_data in getattr(self.pairs_strategy, 'cointegrated_pairs', [])[:10]:
-            all_symbols.add(pair_data[0])
-            all_symbols.add(pair_data[1])
-
-        logger.info(f"Analyzing {len(all_symbols)} symbols")
+        # STEP 2: Trading signals - SIMPLIFIED (no sentiment/pairs strategies needed)
+        logger.info("Checking for new trading opportunities...")
 
         cash = self.get_cash()
         portfolio_value = self.get_portfolio_value()
 
         logger.info(f"Portfolio value: ${portfolio_value:,.2f}")
-        logger.info(f"Available cash: ${cash:,.2f}")
+        if cash is not None and cash > 0:
+            logger.info(f"Available cash: ${cash:,.2f}")
 
-        # Get signals for each symbol
-        for symbol in all_symbols:
-            try:
-                signal, confidence = self._get_combined_signal(symbol)
+            # Only trade if we have cash and meta-model is trained
+            if self.meta_model is not None:
+                logger.info("Trading signals enabled with meta-model")
+                # Trade only symbols we already have positions in or our core list
+                symbols_to_check = set(self.SYMBOLS[:5])  # Top 5 only to reduce API calls
 
-                position = self.get_position(symbol)
+                for symbol in symbols_to_check:
+                    try:
+                        # Simple approach: just use technical indicators from DB
+                        volatility, rsi = self._get_market_conditions(symbol)
 
-                # Position sizing based on confidence
-                position_size = cash * 0.1 * confidence  # Max 10% per position, scaled by confidence
+                        # Simple rules without sentiment/pairs:
+                        # - RSI < 30 = oversold (potential buy)
+                        # - RSI > 70 = overbought (potential sell)
+                        # - High volatility = skip
 
-                if signal == 1 and confidence > self.CONFIDENCE_THRESHOLD:
-                    # BUY signal
-                    if position is None:
-                        price = self.get_last_price(symbol)
-                        quantity = position_size / price
+                        if volatility > 0.4:  # Too volatile, skip
+                            continue
 
-                        order = self.create_order(symbol, quantity, "buy")
-                        self.submit_order(order)
+                        position = self.get_position(symbol)
 
-                        logger.info(f"BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (confidence: {confidence:.2f})")
+                        if rsi < 30 and position is None and cash > 1000:
+                            # Oversold, consider buying
+                            price = self.get_last_price(symbol)
+                            if price and price > 0:
+                                quantity = min(cash * 0.05, 500) / price  # Max $500 or 5% of cash per position
 
-                elif signal == -1 and position is not None:
-                    # SELL signal
-                    order = self.create_order(symbol, position.quantity, "sell")
-                    self.submit_order(order)
+                                order = self.create_order(symbol, quantity, "buy")
+                                self.submit_order(order)
+                                logger.info(f"BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
+                                cash -= quantity * price
 
-                    logger.info(f"SELL {symbol}: {position.quantity:.2f} shares (confidence: {confidence:.2f})")
+                        elif rsi > 70 and position is not None:
+                            # Overbought, consider selling (but risk mgmt handles this too)
+                            logger.info(f"SELL signal for {symbol} (RSI: {rsi:.1f}) - will exit at next threshold")
 
-                elif position is not None and signal == 0:
-                    # Exit position on neutral signal
-                    order = self.create_order(symbol, position.quantity, "sell")
-                    self.submit_order(order)
+                    except Exception as e:
+                        logger.error(f"Error processing {symbol}: {e}")
+                        continue
+            else:
+                logger.info("Meta-model not trained - skipping new trades")
+        else:
+            logger.info("No cash available for new trades")
 
-                    logger.info(f"SELL {symbol}: {position.quantity:.2f} shares (signal neutral)")
-
-            except Exception as e:
-                logger.error(f"Error processing {symbol}: {e}")
-                continue
+        logger.info(f"Final portfolio value: ${self.get_portfolio_value():,.2f}")
 
         logger.info("=" * 80)
         logger.info("Trading iteration complete")

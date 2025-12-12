@@ -104,7 +104,7 @@ class HistoricalDataBackfiller:
             Tuple of (earliest_date, latest_date) or (None, None) if no data
         """
         query = """
-        SELECT MIN(date) as min_date, MAX(date) as max_date
+        SELECT MIN(price_date) as min_date, MAX(price_date) as max_date
         FROM raw_price_data
         WHERE symbol_ticker = ?
         """
@@ -145,7 +145,7 @@ class HistoricalDataBackfiller:
             # Prepare data for insertion
             df = df.reset_index()
             df['symbol_ticker'] = symbol
-            df['date'] = df['Date'].dt.strftime('%Y-%m-%d')
+            df['price_date'] = df['Date'].dt.strftime('%Y-%m-%d')
 
             # Rename columns to match database schema
             df = df.rename(columns={
@@ -157,7 +157,7 @@ class HistoricalDataBackfiller:
             })
 
             # Select only needed columns
-            df = df[['symbol_ticker', 'date', 'open', 'high', 'low', 'close', 'volume']]
+            df = df[['symbol_ticker', 'price_date', 'open', 'high', 'low', 'close', 'volume']]
 
             logger.info(f"Fetched {len(df)} days of data for {symbol}")
             return df
@@ -200,11 +200,11 @@ class HistoricalDataBackfiller:
             try:
                 self.conn.execute("""
                     INSERT OR IGNORE INTO raw_price_data
-                    (symbol_ticker, date, open, high, low, close, volume)
+                    (symbol_ticker, price_date, open, high, low, close, volume)
                     VALUES (?, ?, ?, ?, ?, ?, ?)
                 """, (
                     row['symbol_ticker'],
-                    row['date'],
+                    row['price_date'],
                     row['open'],
                     row['high'],
                     row['low'],
@@ -243,10 +243,10 @@ class HistoricalDataBackfiller:
         buffer_start = (pd.to_datetime(start_date) - timedelta(days=100)).strftime('%Y-%m-%d')
 
         query = """
-        SELECT date, close, high, low, volume
+        SELECT price_date as date, close, high, low, volume
         FROM raw_price_data
-        WHERE symbol_ticker = ? AND date >= ? AND date <= ?
-        ORDER BY date
+        WHERE symbol_ticker = ? AND price_date >= ? AND price_date <= ?
+        ORDER BY price_date
         """
         df = pd.read_sql_query(query, self.conn, params=(symbol, buffer_start, end_date))
 
@@ -292,34 +292,14 @@ class HistoricalDataBackfiller:
         df = df.reset_index()
         df['symbol_ticker'] = symbol
 
-        # Create table if not exists
-        create_table_sql = """
-        CREATE TABLE IF NOT EXISTS technical_indicators (
-            symbol_ticker TEXT,
-            date TEXT,
-            rsi_14 REAL,
-            macd REAL,
-            macd_signal REAL,
-            macd_histogram REAL,
-            bb_upper REAL,
-            bb_middle REAL,
-            bb_lower REAL,
-            bb_width REAL,
-            bb_position REAL,
-            atr_14 REAL,
-            PRIMARY KEY (symbol_ticker, date)
-        )
-        """
-        self.conn.execute(create_table_sql)
-
-        # Insert indicators
+        # Insert indicators into existing schema (don't recreate table)
         for _, row in df.iterrows():
             try:
                 self.conn.execute("""
                     INSERT OR REPLACE INTO technical_indicators
-                    (symbol_ticker, date, rsi_14, macd, macd_signal, macd_histogram,
-                     bb_upper, bb_middle, bb_lower, bb_width, bb_position, atr_14)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol_ticker, indicator_date, rsi_14, macd, macd_signal, macd_histogram,
+                     bb_upper, bb_middle, bb_lower, atr_14)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, (
                     symbol,
                     row['date'].strftime('%Y-%m-%d'),
@@ -330,8 +310,6 @@ class HistoricalDataBackfiller:
                     row['bb_upper'],
                     row['bb_middle'],
                     row['bb_lower'],
-                    row['bb_width'],
-                    row['bb_position'],
                     row['atr_14']
                 ))
             except Exception as e:
@@ -363,10 +341,10 @@ class HistoricalDataBackfiller:
         buffer_start = (pd.to_datetime(start_date) - timedelta(days=150)).strftime('%Y-%m-%d')
 
         query = """
-        SELECT date, close
+        SELECT price_date as date, close
         FROM raw_price_data
-        WHERE symbol_ticker = ? AND date >= ? AND date <= ?
-        ORDER BY date
+        WHERE symbol_ticker = ? AND price_date >= ? AND price_date <= ?
+        ORDER BY price_date
         """
         df = pd.read_sql_query(query, self.conn, params=(symbol, buffer_start, end_date))
 
@@ -382,55 +360,29 @@ class HistoricalDataBackfiller:
         df['return_5d'] = df['close'].pct_change(5)
         df['return_20d'] = df['close'].pct_change(20)
 
-        # Calculate volatility for different windows
-        for window in [5, 10, 20, 30, 50, 100]:
-            df[f'volatility_{window}d'] = df['return_1d'].rolling(window).std() * np.sqrt(252)
+        # Calculate close-to-close volatility for different windows
+        df['close_to_close_vol_10d'] = df['return_1d'].rolling(10).std() * np.sqrt(252)
+        df['close_to_close_vol_20d'] = df['return_1d'].rolling(20).std() * np.sqrt(252)
+        df['close_to_close_vol_60d'] = df['return_1d'].rolling(60).std() * np.sqrt(252)
 
         # Filter to requested date range
         df = df[df.index >= start_date]
         df = df.reset_index()
         df['symbol_ticker'] = symbol
 
-        # Create table if not exists
-        create_table_sql = """
-        CREATE TABLE IF NOT EXISTS volatility_metrics (
-            symbol_ticker TEXT,
-            date TEXT,
-            return_1d REAL,
-            return_5d REAL,
-            return_20d REAL,
-            volatility_5d REAL,
-            volatility_10d REAL,
-            volatility_20d REAL,
-            volatility_30d REAL,
-            volatility_50d REAL,
-            volatility_100d REAL,
-            PRIMARY KEY (symbol_ticker, date)
-        )
-        """
-        self.conn.execute(create_table_sql)
-
-        # Insert metrics
+        # Insert metrics into existing schema
         for _, row in df.iterrows():
             try:
                 self.conn.execute("""
                     INSERT OR REPLACE INTO volatility_metrics
-                    (symbol_ticker, date, return_1d, return_5d, return_20d,
-                     volatility_5d, volatility_10d, volatility_20d, volatility_30d,
-                     volatility_50d, volatility_100d)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (symbol_ticker, vol_date, close_to_close_vol_10d, close_to_close_vol_20d, close_to_close_vol_60d)
+                    VALUES (?, ?, ?, ?, ?)
                 """, (
                     symbol,
                     row['date'].strftime('%Y-%m-%d'),
-                    row['return_1d'],
-                    row['return_5d'],
-                    row['return_20d'],
-                    row.get('volatility_5d'),
-                    row.get('volatility_10d'),
-                    row.get('volatility_20d'),
-                    row.get('volatility_30d'),
-                    row.get('volatility_50d'),
-                    row.get('volatility_100d')
+                    row.get('close_to_close_vol_10d'),
+                    row.get('close_to_close_vol_20d'),
+                    row.get('close_to_close_vol_60d')
                 ))
             except Exception as e:
                 logger.error(f"Error inserting volatility metrics for {symbol}: {e}")

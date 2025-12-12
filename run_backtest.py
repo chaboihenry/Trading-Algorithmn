@@ -93,15 +93,11 @@ class BacktestRunner:
         logger.info(f"Initial Capital: ${self.initial_capital:,.2f}")
         logger.info("-" * 80)
 
-        # Configure strategy
-        strategy = strategy_class()
-
-        if parameters:
-            strategy.initialize(parameters)
-
         # Run backtest using Yahoo data
         try:
-            results = strategy.backtest(
+            # Call backtest() directly on the class, not on an instance
+            # Lumibot will instantiate the strategy with the backtesting broker
+            results = strategy_class.backtest(
                 YahooDataBacktesting,
                 self.start_date,
                 self.end_date,
