@@ -11,7 +11,7 @@ The bot:
 - Checks pairs trading opportunities
 - Uses meta-learner to combine signals
 - Makes trading decisions
-- Sleeps for 24 hours and repeats
+- Sleeps for 1 hour and repeats (active risk management)
 
 Usage:
     # Set environment variables first:
@@ -162,7 +162,7 @@ class LiveTrader:
             logger.info("=" * 80)
             logger.info("TRADING BOT STARTED")
             logger.info("=" * 80)
-            logger.info("The bot is now running and will check for trading opportunities every 24 hours.")
+            logger.info("The bot is now running and will check for trading opportunities every hour.")
             logger.info("Press Ctrl+C to stop the bot.")
             logger.info("=" * 80)
 
