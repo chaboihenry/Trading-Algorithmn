@@ -55,10 +55,18 @@ class CombinedStrategy(Strategy):
     MIN_TRAINING_SAMPLES = 100  # Minimum samples needed to train
     CONFIDENCE_THRESHOLD = 0.6  # Only trade if meta-model confidence > 60%
 
-    # Risk management - Active 24/7
-    STOP_LOSS_PCT = 0.05  # Exit at -5% loss
-    TAKE_PROFIT_PCT = 0.15  # Exit at +15% profit
+    # Risk management - Active 24/7 with SERVER-SIDE bracket orders
+    STOP_LOSS_PCT = 0.05  # Exit at -5% loss (attached to every order)
+    TAKE_PROFIT_PCT = 0.15  # Exit at +15% profit (attached to every order)
     ENABLE_EXTENDED_HOURS = True  # Trade after hours
+
+    # Inverse ETFs for bearish sentiment (profit when market drops)
+    INVERSE_ETFS = {
+        'tech': 'SQQQ',    # 3x inverse NASDAQ (use when tech sentiment bearish)
+        'sp500': 'SPXS',   # 3x inverse S&P 500 (use when market sentiment bearish)
+        'general': 'SH'    # 1x inverse S&P 500 (conservative hedge)
+    }
+    MAX_INVERSE_ALLOCATION = 0.20  # Max 20% of portfolio in inverse positions
 
     def initialize(self, parameters: Dict = None):
         """
@@ -469,6 +477,226 @@ class CombinedStrategy(Strategy):
 
         return final_signal, confidence
 
+    def _rebalance_positions(self, portfolio_value: float, max_position_pct: float = 0.15) -> None:
+        """
+        Rebalance positions to prevent any single position from dominating the portfolio.
+
+        If one stock goes up significantly, it might become 30% of your portfolio.
+        This is risky - if that stock crashes, you lose big. This method trims
+        oversized positions back down to a reasonable level.
+
+        Args:
+            portfolio_value: Total portfolio value
+            max_position_pct: Maximum % any position should be (default 15%)
+        """
+        try:
+            if portfolio_value <= 0:
+                return
+
+            logger.info(f"Checking position sizes (max allowed: {max_position_pct:.0%})")
+
+            positions = self.get_positions()
+            if not positions or len(positions) == 0:
+                return
+
+            rebalanced = False
+
+            for position in positions:
+                symbol = position.symbol
+                quantity = position.quantity
+                current_price = self.get_last_price(symbol)
+
+                if not current_price or current_price <= 0:
+                    continue
+
+                position_value = quantity * current_price
+                position_pct = position_value / portfolio_value
+
+                logger.debug(f"{symbol}: {position_pct:.1%} of portfolio (${position_value:,.2f})")
+
+                # If position is too large, trim it down
+                if position_pct > max_position_pct:
+                    # Calculate how many shares to sell to get to max_position_pct
+                    target_value = portfolio_value * max_position_pct
+                    shares_to_sell = (position_value - target_value) / current_price
+
+                    if shares_to_sell >= 1:  # Only sell if >= 1 share
+                        logger.warning(f"⚖️  {symbol} is {position_pct:.1%} of portfolio (limit: {max_position_pct:.0%})")
+                        logger.warning(f"   Trimming position: selling {shares_to_sell:.2f} shares")
+
+                        # Sell the excess shares
+                        order = self.create_order(symbol, shares_to_sell, "sell")
+                        self.submit_order(order)
+                        rebalanced = True
+
+                        logger.info(f"✂️  Sold {shares_to_sell:.2f} shares of {symbol} @ ${current_price:.2f}")
+                        logger.info(f"   Reduced from {position_pct:.1%} to ~{max_position_pct:.0%} of portfolio")
+
+            if not rebalanced:
+                logger.info("✅ All positions properly sized")
+
+        except Exception as e:
+            logger.error(f"Error rebalancing positions: {e}")
+
+    def _check_market_sentiment_and_hedge(self, cash: float, portfolio_value: float) -> None:
+        """
+        Check overall market sentiment and use inverse ETFs to profit from declines.
+
+        When the market is bearish, instead of just watching positions drop, we can
+        profit by buying inverse ETFs (they go UP when the market goes DOWN).
+
+        This is like betting against the market as a hedge.
+
+        Args:
+            cash: Available cash
+            portfolio_value: Total portfolio value
+        """
+        try:
+            # Check sentiment for major indices symbols
+            bearish_signals = 0
+            total_checked = 0
+
+            # Sample a few tech stocks to gauge market sentiment
+            sample_symbols = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
+
+            for symbol in sample_symbols:
+                try:
+                    _, rsi = self._get_market_conditions(symbol)
+                    total_checked += 1
+
+                    if rsi > 70:  # Overbought = bearish signal
+                        bearish_signals += 1
+                except:
+                    continue
+
+            if total_checked == 0:
+                return
+
+            bearish_ratio = bearish_signals / total_checked
+
+            logger.info(f"Market sentiment check: {bearish_signals}/{total_checked} symbols overbought")
+            logger.info(f"Bearish ratio: {bearish_ratio:.1%}")
+
+            # If >= 60% of market is overbought, consider hedging with inverse ETF
+            if bearish_ratio >= 0.6:
+                # Check current inverse ETF positions
+                inverse_value = 0
+                for inv_symbol in self.INVERSE_ETFS.values():
+                    pos = self.get_position(inv_symbol)
+                    if pos:
+                        inverse_value += pos.quantity * self.get_last_price(inv_symbol)
+
+                inverse_allocation = inverse_value / portfolio_value if portfolio_value > 0 else 0
+
+                logger.info(f"Current inverse ETF allocation: {inverse_allocation:.1%}")
+
+                # Only add more if below max allocation
+                if inverse_allocation < self.MAX_INVERSE_ALLOCATION and cash > 1000:
+                    # Use conservative inverse ETF (SH = 1x inverse S&P 500)
+                    inv_symbol = self.INVERSE_ETFS['general']  # SH
+                    inv_price = self.get_last_price(inv_symbol)
+
+                    if inv_price and inv_price > 0:
+                        # Allocate up to 10% of portfolio to inverse position
+                        target_value = min(portfolio_value * 0.10, cash * 0.5)
+                        quantity = target_value / inv_price
+
+                        logger.warning(f"🔴 BEARISH MARKET DETECTED ({bearish_ratio:.1%} overbought)")
+                        logger.warning(f"🛡️  Hedging with inverse ETF {inv_symbol}")
+
+                        # Buy inverse ETF with bracket order
+                        success = self._create_bracket_order(inv_symbol, quantity, "buy", inv_price)
+                        if success:
+                            logger.info(f"✅ Hedge position: {quantity:.2f} shares of {inv_symbol}")
+                            logger.info(f"   This will profit if market drops!")
+
+            elif bearish_ratio < 0.3:
+                # Market is healthy, exit inverse positions if we have any
+                for inv_symbol in self.INVERSE_ETFS.values():
+                    pos = self.get_position(inv_symbol)
+                    if pos and pos.quantity > 0:
+                        logger.info(f"📈 Market bullish again - exiting inverse position {inv_symbol}")
+                        order = self.create_order(inv_symbol, pos.quantity, "sell")
+                        self.submit_order(order)
+
+        except Exception as e:
+            logger.error(f"Error in market sentiment hedge check: {e}")
+
+    def _create_bracket_order(self, symbol: str, quantity: float, side: str = "buy",
+                             current_price: float = None) -> bool:
+        """
+        Create a bracket order with automatic stop-loss and take-profit.
+
+        This uses Alpaca's server-side bracket orders which execute automatically
+        without the bot needing to be awake. Much better than iteration-based checks!
+
+        Args:
+            symbol: Stock symbol to trade
+            quantity: Number of shares
+            side: "buy" or "sell"
+            current_price: Current stock price (fetched if not provided)
+
+        Returns:
+            True if order submitted successfully, False otherwise
+
+        Example:
+            If buying AAPL at $150:
+            - Main order: Buy AAPL at market price
+            - Take-profit: Automatically sell at $172.50 (+15%)
+            - Stop-loss: Automatically sell at $142.50 (-5%)
+        """
+        try:
+            if current_price is None:
+                current_price = self.get_last_price(symbol)
+
+            if not current_price or current_price <= 0:
+                logger.error(f"Invalid price for {symbol}: {current_price}")
+                return False
+
+            # Calculate stop-loss and take-profit prices
+            if side == "buy":
+                take_profit_price = round(current_price * (1 + self.TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(current_price * (1 - self.STOP_LOSS_PCT), 2)
+            else:  # sell (for inverse ETFs or shorts)
+                take_profit_price = round(current_price * (1 - self.TAKE_PROFIT_PCT), 2)
+                stop_loss_price = round(current_price * (1 + self.STOP_LOSS_PCT), 2)
+
+            logger.info(f"Creating bracket order for {symbol}:")
+            logger.info(f"  Entry: {quantity:.2f} shares @ ${current_price:.2f}")
+            logger.info(f"  Take-profit: ${take_profit_price:.2f} (+{self.TAKE_PROFIT_PCT:.1%})")
+            logger.info(f"  Stop-loss: ${stop_loss_price:.2f} (-{self.STOP_LOSS_PCT:.1%})")
+
+            # Create the bracket order
+            # Lumibot will automatically create 3 orders: main, take-profit, stop-loss
+            order = self.create_order(
+                symbol,
+                quantity,
+                side,
+                type="bracket",
+                take_profit_price=take_profit_price,
+                stop_loss_price=stop_loss_price,
+                time_in_force="gtc" if self.ENABLE_EXTENDED_HOURS else "day"
+            )
+
+            self.submit_order(order)
+            logger.info(f"✅ Bracket order submitted for {symbol}")
+            logger.info(f"   Alpaca will automatically execute stop-loss/take-profit server-side")
+            return True
+
+        except Exception as e:
+            logger.error(f"Error creating bracket order for {symbol}: {e}")
+            logger.error(f"Falling back to simple market order...")
+
+            # Fallback: Create simple order without brackets
+            try:
+                order = self.create_order(symbol, quantity, side)
+                self.submit_order(order)
+                logger.warning(f"⚠️  Simple order submitted (no automatic stops)")
+                return True
+            except Exception as e2:
+                logger.error(f"Failed to submit any order: {e2}")
+                return False
+
     def _check_risk_management_alpaca(self, alpaca_position) -> Optional[str]:
         """Check if Alpaca position triggers stop-loss or take-profit."""
         try:
@@ -624,8 +852,9 @@ class CombinedStrategy(Strategy):
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
         logger.info("=" * 80)
 
-        # STEP 1: Risk Management - Check ALL positions first
-        # Use broker API directly instead of Lumibot wrapper to get entry prices
+        # STEP 1: Risk Management Check (LEGACY - for old positions without bracket orders)
+        # NOTE: All NEW orders use bracket orders with server-side stop-loss/take-profit
+        # This manual check is only a fallback for existing positions created before bracket orders
         try:
             from alpaca.trading.client import TradingClient
             import os
@@ -636,11 +865,18 @@ class CombinedStrategy(Strategy):
             alpaca_positions = trading_client.get_all_positions()
 
             if len(alpaca_positions) > 0:
-                logger.info(f"Checking {len(alpaca_positions)} positions for risk triggers...")
+                logger.info(f"Checking {len(alpaca_positions)} positions (fallback for pre-bracket positions)...")
+                legacy_positions = 0
                 for alpaca_pos in alpaca_positions:
+                    # Only manually exit if this is a legacy position without bracket orders
                     risk_trigger = self._check_risk_management_alpaca(alpaca_pos)
                     if risk_trigger:
+                        logger.warning(f"Legacy position {alpaca_pos.symbol} triggered {risk_trigger}")
                         self._submit_risk_exit_order_alpaca(alpaca_pos, risk_trigger)
+                        legacy_positions += 1
+
+                if legacy_positions == 0:
+                    logger.info("✅ All positions have bracket orders - server-side protection active")
             else:
                 logger.info("No positions to check")
         except Exception as e:
@@ -655,13 +891,22 @@ class CombinedStrategy(Strategy):
                 logger.info(f"Retraining meta-model ({days_since_retrain} days since last retrain)")
                 self._train_meta_model()
 
-        # STEP 2: Trading signals - SIMPLIFIED (no sentiment/pairs strategies needed)
-        logger.info("Checking for new trading opportunities...")
-
+        # STEP 2: Check market sentiment and hedge if needed
         cash = self.get_cash()
         portfolio_value = self.get_portfolio_value()
 
         logger.info(f"Portfolio value: ${portfolio_value:,.2f}")
+
+        # PRIORITY: Check if we should hedge with inverse ETFs
+        if cash is not None and portfolio_value > 0:
+            self._check_market_sentiment_and_hedge(cash if cash else 0, portfolio_value)
+
+        # STEP 3: Rebalance positions if any position is too large
+        self._rebalance_positions(portfolio_value)
+
+        # STEP 4: Trading signals - look for new opportunities
+        logger.info("Checking for new trading opportunities...")
+
         if cash is not None and cash > 0:
             logger.info(f"Available cash: ${cash:,.2f}")
 
@@ -687,19 +932,21 @@ class CombinedStrategy(Strategy):
                         position = self.get_position(symbol)
 
                         if rsi < 30 and position is None and cash > 1000:
-                            # Oversold, consider buying
+                            # Oversold, consider buying with BRACKET ORDER
                             price = self.get_last_price(symbol)
                             if price and price > 0:
                                 quantity = min(cash * 0.05, 500) / price  # Max $500 or 5% of cash per position
 
-                                order = self.create_order(symbol, quantity, "buy")
-                                self.submit_order(order)
-                                logger.info(f"BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
-                                cash -= quantity * price
+                                # Use bracket order with automatic stop-loss/take-profit
+                                success = self._create_bracket_order(symbol, quantity, "buy", price)
+                                if success:
+                                    logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
+                                    logger.info(f"   Server-side stops active: -5% stop-loss, +15% take-profit")
+                                    cash -= quantity * price
 
                         elif rsi > 70 and position is not None:
-                            # Overbought, consider selling (but risk mgmt handles this too)
-                            logger.info(f"SELL signal for {symbol} (RSI: {rsi:.1f}) - will exit at next threshold")
+                            # Overbought - let the bracket order's take-profit handle exit
+                            logger.info(f"📊 {symbol} overbought (RSI: {rsi:.1f}) - bracket order will auto-exit at +15%")
 
                     except Exception as e:
                         logger.error(f"Error processing {symbol}: {e}")
