@@ -188,6 +188,8 @@ class StopLossManager:
             logger.info(f"  Limit: ${limit_price:.2f}")
 
             # Create the stop-limit order
+            # NOTE: Alpaca doesn't support stop-limit orders with extended hours
+            # So we use DAY orders only (will re-create daily during market hours)
             from alpaca.trading.requests import StopLimitOrderRequest
 
             order_data = StopLimitOrderRequest(
@@ -195,10 +197,10 @@ class StopLossManager:
                 qty=quantity,
                 side=OrderSide.SELL,
                 type=OrderType.STOP_LIMIT,
-                time_in_force=TimeInForce.GTC if ENABLE_EXTENDED_HOURS else TimeInForce.DAY,
+                time_in_force=TimeInForce.DAY,  # Must be DAY for stop-limit
                 stop_price=stop_price,
                 limit_price=limit_price,
-                extended_hours=ENABLE_EXTENDED_HOURS
+                extended_hours=False  # Stop-limit not allowed in extended hours
             )
 
             order = self.client.submit_order(order_data)
