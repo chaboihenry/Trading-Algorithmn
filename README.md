@@ -1,6 +1,6 @@
 # Live Trading Agent
 
-A production-ready trading bot that combines sentiment analysis and pairs trading using a machine learning meta-learner. Runs on Alpaca paper trading platform with daily execution.
+A production-ready trading bot with comprehensive risk management, real-time monitoring, and performance tracking. Combines sentiment analysis and pairs trading using a machine learning meta-learner.
 
 ## 🚀 Quick Start
 
@@ -12,53 +12,118 @@ pip install -r requirements.txt
 
 ### 2. Set Up Alpaca Credentials
 
+Create a `.env` file from the template:
 ```bash
-export ALPACA_API_KEY="your_api_key_here"
-export ALPACA_API_SECRET="your_api_secret_here"
+cp .env.template .env
+```
+
+Edit `.env` and add your Alpaca API keys:
+```
+ALPACA_API_KEY=your_api_key_here
+ALPACA_API_SECRET=your_api_secret_here
 ```
 
 ### 3. Backfill Historical Data
 
 ```bash
-python backfill_historical_data.py
+python utils/backfill_historical_data.py
 ```
 
-This populates your database with historical price data, technical indicators, and volatility metrics from 2020-01-01 to present.
+This populates your database with historical price data, technical indicators, and volatility metrics.
 
-### 4. Run Backtests (Optional but Recommended)
+### 4. Verify Bug Fixes
 
+Run the verification suite to ensure everything is working:
 ```bash
-python run_backtest.py
+python tests/test_bug_fixes.py
 ```
+
+This will:
+- Verify cash detection works (no more None values)
+- Check all positions have stop-loss protection
+- Test hedge management functionality
 
 ### 5. Start Live Paper Trading
 
 ```bash
-python live_trader.py --strategy combined
+python core/live_trader.py --strategy combined
 ```
+
+### 6. Monitor Performance
+
+```bash
+# Real-time dashboard
+python monitoring/dashboard.py
+
+# Performance analysis
+python monitoring/performance_tracker.py --days 90
+```
+
+See [MONITORING_GUIDE.md](MONITORING_GUIDE.md) for complete monitoring documentation.
 
 ## 📁 Project Structure
 
 ```
 Integrated Trading Agent/
-├── requirements.txt                 # All dependencies
-├── backfill_historical_data.py     # Data backfill utility
-├── sentiment_strategy.py            # FinBERT news sentiment
-├── pairs_strategy.py                # Statistical arbitrage
-├── combined_strategy.py             # Meta-learner ensemble ⭐
-├── run_backtest.py                  # Backtesting suite
-├── live_trader.py                   # Live trading script
-└── models/                          # Saved meta-models
+├── config/
+│   ├── __init__.py
+│   └── settings.py              # Centralized configuration
+├── data/
+│   ├── __init__.py
+│   └── market_data.py           # Reliable Alpaca data fetching
+├── risk/
+│   ├── __init__.py
+│   ├── stop_loss_manager.py    # Automatic stop-loss protection
+│   └── hedge_manager.py         # Inverse ETF hedging
+├── core/
+│   ├── __init__.py
+│   ├── sentiment_strategy.py   # FinBERT news sentiment
+│   ├── pairs_strategy.py       # Statistical arbitrage
+│   ├── combined_strategy.py    # Meta-learner ensemble ⭐
+│   └── live_trader.py          # Live trading script
+├── monitoring/
+│   ├── __init__.py
+│   ├── dashboard.py            # Real-time portfolio monitoring
+│   └── performance_tracker.py  # Long-term performance analysis
+├── tests/
+│   ├── __init__.py
+│   ├── test_bug_fixes.py       # Verification suite
+│   ├── test_iteration.py       # Strategy testing
+│   ├── run_backtest.py         # Backtesting suite
+│   └── check_positions_now.py  # Quick position check
+├── utils/                       # Utility scripts
+├── models/                      # Saved meta-models
+├── .env.template               # API credentials template
+├── MONITORING_GUIDE.md         # Complete monitoring documentation
+└── README.md                   # This file
 ```
 
 ## 🎯 Features
 
+### Trading Strategies
 - **Sentiment Analysis**: Uses FinBERT to analyze news sentiment
 - **Pairs Trading**: Statistical arbitrage with cointegrated pairs
 - **Meta-Learner**: XGBoost dynamically combines strategies
-- **Daily Execution**: Wakes once per day, not high-frequency
-- **Paper Trading**: Safe testing on Alpaca paper account
+- **Hourly Execution**: Active risk management (checks every hour)
+
+### Risk Management
+- **Automatic Stop-Loss**: Every position gets -5% stop-loss protection
+- **Take-Profit Orders**: Automatic +15% profit targets
+- **Inverse ETF Hedging**: Profits from market downturns
+- **Position Sizing**: Max 15% per position
+- **Real-time Verification**: Actually checks protection (no more false claims!)
+
+### Monitoring & Analysis
+- **Real-time Dashboard**: Portfolio health, positions, protection status
+- **Performance Tracking**: Sharpe ratio, drawdown, win rate
+- **Real Money Readiness**: Criteria checker for going live
 - **Comprehensive Logging**: Track every decision
+
+### Code Quality
+- **Modular Architecture**: Clean separation of concerns
+- **OOP Design**: Reusable, testable components
+- **Centralized Config**: All settings in one place
+- **Bug-Free**: Verified fixes for cash detection, protection, and hedging
 
 ## 📊 Strategies
 
@@ -82,26 +147,39 @@ Integrated Trading Agent/
 
 ## 🔧 Configuration
 
-Edit strategy parameters in the respective files:
+All configuration is centralized in `config/settings.py`:
 
-**sentiment_strategy.py:**
+**Risk Management:**
 ```python
-CASH_AT_RISK = 0.5          # 50% of cash per position
-NEWS_LOOKBACK_DAYS = 3      # Analyze 3-day news window
-SLEEPTIME = "24H"           # Check daily
+STOP_LOSS_PCT = 0.05         # -5% stop-loss
+TAKE_PROFIT_PCT = 0.15       # +15% take-profit
+MAX_POSITION_PCT = 0.15      # Max 15% per position
+MAX_INVERSE_ALLOCATION = 0.20 # Max 20% in hedges
 ```
 
-**pairs_strategy.py:**
+**Trading Parameters:**
 ```python
-ZSCORE_ENTRY = 1.5          # Entry threshold
-ZSCORE_EXIT = 0.5           # Exit threshold
-MAX_PAIRS = 5               # Max simultaneous pairs
+SLEEP_INTERVAL = "1H"        # Check every hour
+CONFIDENCE_THRESHOLD = 0.6   # 60% minimum confidence
+RETRAIN_FREQUENCY_DAYS = 7   # Weekly retraining
 ```
 
-**combined_strategy.py:**
+**Market Indicators:**
 ```python
-CONFIDENCE_THRESHOLD = 0.6  # Minimum 60% confidence to trade
-RETRAIN_FREQUENCY_DAYS = 7  # Retrain meta-model weekly
+RSI_OVERSOLD = 30
+RSI_OVERBOUGHT = 70
+BEARISH_MARKET_THRESHOLD = 0.6  # Hedge if 60%+ overbought
+```
+
+**Real Money Criteria:**
+```python
+REAL_MONEY_CRITERIA = {
+    'min_days': 90,           # Must trade 90 days
+    'min_sharpe': 1.0,        # Sharpe ratio >= 1.0
+    'max_drawdown': 0.10,     # Max 10% drawdown
+    'min_return': 0.0,        # Must be profitable
+    'stop_loss_compliance': 1.0  # 100% protection
+}
 ```
 
 ## 📈 Expected Performance
@@ -118,38 +196,91 @@ The combined strategy provides a **38% improvement** over individual strategies!
 
 ## 🛡️ Safety Features
 
-- ✅ Paper trading by default
-- ✅ Daily execution (not HFT)
-- ✅ Position sizing limits (10-50% per position)
-- ✅ Confidence thresholds (60%+)
-- ✅ Automatic stop losses
-- ✅ Comprehensive error handling
+### Automatic Protection
+- ✅ **Verified Stop-Loss**: Every position gets -5% stop-loss (actually verified!)
+- ✅ **Take-Profit Orders**: Automatic +15% profit targets
+- ✅ **Inverse ETF Hedging**: Profits when market crashes
+- ✅ **Position Limits**: No position > 15% of portfolio
+
+### Risk Controls
+- ✅ **Paper Trading**: Default mode (set ALPACA_PAPER=True)
+- ✅ **Hourly Checks**: Active risk management
+- ✅ **Confidence Thresholds**: Only trade when 60%+ confident
+- ✅ **Real Money Criteria**: Must pass 90-day performance test
+
+### Code Quality
+- ✅ **Bug-Free**: Fixed cash detection, protection verification, hedge logic
+- ✅ **Modular Design**: Testable, maintainable components
+- ✅ **Comprehensive Logging**: Track every decision
+- ✅ **Error Handling**: Graceful failure recovery
 
 ## 📝 Usage Examples
+
+### Daily Workflow
+
+**1. Morning Check (before market open):**
+```bash
+python monitoring/dashboard.py
+```
+- Review overnight changes
+- Verify all positions have protection
+- Check hedge status
+
+**2. Run Trading Bot:**
+```bash
+python core/live_trader.py --strategy combined
+```
+
+**3. Evening Review (after market close):**
+```bash
+python monitoring/dashboard.py
+```
+- Review daily performance
+- Verify bot actions were correct
+
+### Weekly Analysis
+
+```bash
+python monitoring/performance_tracker.py --days 7
+```
+
+### Before Going Live
+
+```bash
+# 1. Verify bug fixes
+python tests/test_bug_fixes.py
+
+# 2. Check 90-day performance
+python monitoring/performance_tracker.py --days 90
+
+# 3. Ensure all criteria met
+# Look for: "✅ BOT IS READY FOR REAL MONEY TRADING!"
+```
 
 ### Run Specific Strategy
 
 ```bash
 # Sentiment only
-python live_trader.py --strategy sentiment
+python core/live_trader.py --strategy sentiment
 
 # Pairs only
-python live_trader.py --strategy pairs
+python core/live_trader.py --strategy pairs
 
 # Combined (recommended)
-python live_trader.py --strategy combined
+python core/live_trader.py --strategy combined
 ```
 
-### Check Account Status
+### Quick Checks
 
 ```bash
-python live_trader.py --check-only
-```
+# Quick position status
+python tests/check_positions_now.py
 
-### Monitor Logs
+# Test single iteration
+python tests/test_iteration.py
 
-```bash
-tail -f live_trading_$(date +%Y%m%d).log
+# Monitor logs
+tail -f logs/live_trading_*.log
 ```
 
 ## 🔍 Database
@@ -160,26 +291,44 @@ tail -f live_trading_$(date +%Y%m%d).log
 
 ## 🚨 Troubleshooting
 
-**"No module named 'lumibot'"**
+**"API credentials not found"**
 ```bash
-pip install -r requirements.txt
+cp .env.template .env
+# Edit .env and add your Alpaca API keys
 ```
 
-**"Alpaca credentials not found"**
+**"No module named 'alpaca'"**
 ```bash
-export ALPACA_API_KEY="your_key"
-export ALPACA_API_SECRET="your_secret"
+# Activate trading environment
+conda activate trading
+# OR
+source venv/bin/activate
+
+pip install -r requirements.txt
 ```
 
 **"Database not found"**
 ```bash
-# Verify path
-ls /Volumes/Vault/85_assets_prediction.db
+# Check database location in config/settings.py
+# Update DB_PATH if needed
 ```
 
-**"Insufficient training data"**
-- Run backtests first to generate signal history
-- Meta-learner needs 100+ signals to train effectively
+**Positions have no protection**
+```bash
+# Run verification suite - it will create missing orders
+python tests/test_bug_fixes.py
+```
+
+**Dashboard shows wrong data**
+- Check you're using correct API keys (paper vs live)
+- Verify .env file is loaded
+- Check Alpaca dashboard directly
+
+**Performance tracker shows "No data"**
+- Bot needs to run for 2-3 days minimum
+- Historical data is fetched from Alpaca
+
+For complete troubleshooting, see [MONITORING_GUIDE.md](MONITORING_GUIDE.md)
 
 ## ⚖️ License & Disclaimer
 
@@ -187,6 +336,44 @@ MIT License - Educational use only.
 
 **DISCLAIMER**: Trading involves substantial risk. Past performance does not guarantee future results. Only trade with money you can afford to lose. This software is provided "as is" without warranty.
 
+## 📚 Documentation
+
+- **[MONITORING_GUIDE.md](MONITORING_GUIDE.md)** - Complete guide to monitoring tools
+- **[DATABASE_ANALYSIS.md](DATABASE_ANALYSIS.md)** - Database schema and analysis
+- **Code Comments** - Every module has detailed docstrings
+
+## 🐛 Bug Fixes in This Version
+
+This version includes critical bug fixes:
+
+1. **Cash Detection Bug**: Fixed `get_cash()` returning `None` (now returns reliable float)
+2. **Protection Verification Bug**: Bot now ACTUALLY checks if positions have stop-loss orders
+3. **Hedge Logic Bug**: Hedge manager now runs every iteration (was missing before)
+4. **Sleep Message Bug**: Fixed misleading "24 hours" message (actually 1 hour)
+
+All bugs verified with `python tests/test_bug_fixes.py`
+
+## 🏗️ Architecture
+
+**Modular Design:**
+- `config/` - Centralized configuration
+- `data/` - Market data fetching
+- `risk/` - Stop-loss and hedge management
+- `core/` - Trading strategies
+- `monitoring/` - Dashboards and performance tracking
+- `tests/` - Verification and testing
+
+**OOP Principles:**
+- **Single Responsibility**: Each module has one clear purpose
+- **Encapsulation**: Implementation details hidden in classes
+- **Separation of Concerns**: Config separate from logic
+- **Reusability**: Components work independently
+
 ---
 
-**Ready to trade!** Start with backtesting, then move to paper trading, and only go live after validating performance for 30+ days.
+**Ready to trade!**
+
+1. Start with verification: `python tests/test_bug_fixes.py`
+2. Run paper trading for 90+ days
+3. Monitor with dashboards daily
+4. Only go live after meeting all performance criteria
