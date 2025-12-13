@@ -84,7 +84,7 @@ class HedgeManager:
                 SELECT rsi_14
                 FROM technical_indicators
                 WHERE symbol_ticker = ?
-                ORDER BY date DESC
+                ORDER BY indicator_date DESC
                 LIMIT 1
             """
 

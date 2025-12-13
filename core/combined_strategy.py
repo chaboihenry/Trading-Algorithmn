@@ -197,21 +197,21 @@ class CombinedStrategy(Strategy):
             p.close as entry_price,
             p2.close as exit_price_5d,
             (p2.close - p.close) / p.close as return_5d,
-            vm.volatility_20d,
+            vm.close_to_close_vol_20d as volatility_20d,
             ti.rsi_14
         FROM trading_signals ts
         LEFT JOIN raw_price_data p
             ON ts.symbol_ticker = p.symbol_ticker
-            AND ts.signal_date = p.date
+            AND ts.signal_date = p.price_date
         LEFT JOIN raw_price_data p2
             ON ts.symbol_ticker = p2.symbol_ticker
-            AND p2.date = date(ts.signal_date, '+5 days')
+            AND p2.price_date = date(ts.signal_date, '+5 days')
         LEFT JOIN volatility_metrics vm
             ON ts.symbol_ticker = vm.symbol_ticker
-            AND ts.signal_date = vm.date
+            AND ts.signal_date = vm.vol_date
         LEFT JOIN technical_indicators ti
             ON ts.symbol_ticker = ti.symbol_ticker
-            AND ts.signal_date = ti.date
+            AND ts.signal_date = ti.indicator_date
         WHERE ts.signal_date >= date('now', '-365 days')
           AND ts.metadata IS NOT NULL
         ORDER BY ts.signal_date
@@ -361,13 +361,13 @@ class CombinedStrategy(Strategy):
             conn = sqlite3.connect(self.db_path)
 
             query = """
-            SELECT vm.volatility_20d, ti.rsi_14
+            SELECT vm.close_to_close_vol_20d as volatility_20d, ti.rsi_14
             FROM volatility_metrics vm
             LEFT JOIN technical_indicators ti
                 ON vm.symbol_ticker = ti.symbol_ticker
-                AND vm.date = ti.date
+                AND vm.vol_date = ti.indicator_date
             WHERE vm.symbol_ticker = ?
-            ORDER BY vm.date DESC
+            ORDER BY vm.vol_date DESC
             LIMIT 1
             """
 
@@ -852,35 +852,32 @@ class CombinedStrategy(Strategy):
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
         logger.info("=" * 80)
 
-        # STEP 1: Risk Management Check (LEGACY - for old positions without bracket orders)
-        # NOTE: All NEW orders use bracket orders with server-side stop-loss/take-profit
-        # This manual check is only a fallback for existing positions created before bracket orders
+        # Check if market is open
         try:
-            from alpaca.trading.client import TradingClient
-            import os
-
-            api_key = os.getenv('ALPACA_API_KEY')
-            api_secret = os.getenv('ALPACA_API_SECRET')
-            trading_client = TradingClient(api_key, api_secret, paper=True)
-            alpaca_positions = trading_client.get_all_positions()
-
-            if len(alpaca_positions) > 0:
-                logger.info(f"Checking {len(alpaca_positions)} positions (fallback for pre-bracket positions)...")
-                legacy_positions = 0
-                for alpaca_pos in alpaca_positions:
-                    # Only manually exit if this is a legacy position without bracket orders
-                    risk_trigger = self._check_risk_management_alpaca(alpaca_pos)
-                    if risk_trigger:
-                        logger.warning(f"Legacy position {alpaca_pos.symbol} triggered {risk_trigger}")
-                        self._submit_risk_exit_order_alpaca(alpaca_pos, risk_trigger)
-                        legacy_positions += 1
-
-                if legacy_positions == 0:
-                    logger.info("✅ All positions have bracket orders - server-side protection active")
-            else:
-                logger.info("No positions to check")
+            clock = self.get_clock()
+            if not clock.is_open:
+                logger.info(f"⏰ Market is closed. Next open: {clock.next_open}")
+                logger.info("Skipping trading logic until market opens")
+                return
         except Exception as e:
-            logger.error(f"Error checking risk management: {e}")
+            logger.warning(f"Could not check market hours: {e}")
+            # Continue anyway - better to try trading than skip unnecessarily
+
+        # STEP 1: Risk Management Check - Ensure ALL positions have stop-loss and take-profit protection
+        # Uses the modular StopLossManager to verify and create missing protection orders
+        try:
+            from risk.stop_loss_manager import ensure_all_positions_protected
+
+            logger.info("Verifying position protection...")
+            protection_ok = ensure_all_positions_protected()
+
+            if protection_ok:
+                logger.info("✅ All positions fully protected (stop-loss + take-profit)")
+            else:
+                logger.warning("⚠️  Some positions lack protection - created missing orders")
+
+        except Exception as e:
+            logger.error(f"Error checking/creating protection: {e}")
             import traceback
             traceback.print_exc()
 

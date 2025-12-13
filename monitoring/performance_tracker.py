@@ -76,16 +76,16 @@ class PerformanceTracker:
         """
         try:
             from alpaca.trading.requests import GetPortfolioHistoryRequest
-            from alpaca.trading.enums import PortfolioHistoryTimeFrame
 
             # Calculate start date
             end_date = datetime.now()
             start_date = end_date - timedelta(days=days)
 
             # Request portfolio history
+            # timeframe parameter is a string: "1Min", "5Min", "15Min", "1H", "1D"
             request = GetPortfolioHistoryRequest(
                 period=f"{days}D",
-                timeframe=PortfolioHistoryTimeFrame.ONE_DAY
+                timeframe="1D"  # 1 day timeframe
             )
 
             history = self.client.get_portfolio_history(request)

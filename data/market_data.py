@@ -161,7 +161,8 @@ class MarketDataClient:
                 'day_trade_count': int(account.daytrade_count),
                 'pattern_day_trader': account.pattern_day_trader,
                 'account_blocked': account.account_blocked,
-                'trade_suspended': account.trade_suspended
+                'trade_suspended': getattr(account, 'trade_suspended', False),
+                'trading_blocked': getattr(account, 'trading_blocked', False)
             }
 
         except Exception as e:
@@ -182,11 +183,11 @@ class MarketDataClient:
                 logger.error("🚫 Account is blocked!")
                 return False
 
-            if account.trade_suspended:
+            if getattr(account, 'trade_suspended', False):
                 logger.error("🚫 Trading is suspended!")
                 return False
 
-            if account.trading_blocked:
+            if getattr(account, 'trading_blocked', False):
                 logger.error("🚫 Trading is blocked!")
                 return False
 
