@@ -28,10 +28,17 @@ Usage:
 """
 
 import os
+import sys
 import logging
 import argparse
 from datetime import datetime
 from pathlib import Path
+
+# Add project root to Python path so imports work
+# This allows scripts to be run from anywhere
+PROJECT_ROOT = Path(__file__).parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 

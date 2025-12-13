@@ -17,9 +17,9 @@ Usage:
     from lumibot_strategies.live_trader import LiveTrader
 """
 
-from .core.sentiment_strategy import SentimentStrategy
-from .core.pairs_strategy import PairsStrategy
-from .core.combined_strategy import CombinedStrategy
+from .sentiment_strategy import SentimentStrategy
+from .pairs_strategy import PairsStrategy
+from .combined_strategy import CombinedStrategy
 
 __all__ = ['SentimentStrategy', 'PairsStrategy', 'CombinedStrategy']
 __version__ = '1.0.0'
