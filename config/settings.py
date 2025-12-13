@@ -9,8 +9,13 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 
-# Load environment variables from .env file
-load_dotenv()
+# Get the project root directory (parent of config/)
+PROJECT_ROOT = Path(__file__).parent.parent
+
+# Load environment variables from .env file at project root
+# This ensures .env is found regardless of where scripts are run from
+env_path = PROJECT_ROOT / '.env'
+load_dotenv(dotenv_path=env_path)
 
 # =============================================================================
 # API CREDENTIALS
