@@ -235,17 +235,34 @@ class StopLossManager:
             logger.info(f"  Entry: ${entry_price:.2f}, Current: ${current_price:.2f}")
             logger.info(f"  Take-profit: ${tp_price:.2f} (+{TAKE_PROFIT_PCT:.1%})")
 
+            # Check if market is open to determine order parameters
+            # When market is closed, Alpaca requires DAY orders for limit orders
+            try:
+                clock = self.client.get_clock()
+                market_is_open = clock.is_open
+            except:
+                market_is_open = False  # Assume closed if can't check
+
             # Create limit sell order at take-profit price
             from alpaca.trading.requests import LimitOrderRequest
+
+            # If market is closed, must use DAY and no extended hours
+            # If market is open and extended hours enabled, use GTC
+            if market_is_open and ENABLE_EXTENDED_HOURS:
+                time_in_force = TimeInForce.GTC
+                extended_hours = True
+            else:
+                time_in_force = TimeInForce.DAY
+                extended_hours = False
 
             order_data = LimitOrderRequest(
                 symbol=symbol,
                 qty=quantity,
                 side=OrderSide.SELL,
                 type=OrderType.LIMIT,
-                time_in_force=TimeInForce.GTC if ENABLE_EXTENDED_HOURS else TimeInForce.DAY,
+                time_in_force=time_in_force,
                 limit_price=tp_price,
-                extended_hours=ENABLE_EXTENDED_HOURS
+                extended_hours=extended_hours
             )
 
             order = self.client.submit_order(order_data)

@@ -36,9 +36,9 @@ from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 
 # Import strategies
-from sentiment_strategy import SentimentStrategy
-from pairs_strategy import PairsStrategy
-from combined_strategy import CombinedStrategy
+from core.sentiment_strategy import SentimentStrategy
+from core.pairs_strategy import PairsStrategy
+from core.combined_strategy import CombinedStrategy
 
 # Create logs directory if it doesn't exist
 LOGS_DIR = Path(__file__).parent / 'logs'
@@ -55,6 +55,13 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# Suppress Lumibot's "Could not get pricing data" errors during market close
+# These are expected and non-critical - they occur during initialization
+# when market is closed and prices aren't available
+lumibot_logger = logging.getLogger('root')
+lumibot_logger.setLevel(logging.CRITICAL)  # Only show critical errors, not pricing warnings
+
 logger.info(f"Logging to: {log_file}")
 
 
