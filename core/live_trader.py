@@ -63,11 +63,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress Lumibot's "Could not get pricing data" errors during market close
-# These are expected and non-critical - they occur during initialization
-# when market is closed and prices aren't available
-lumibot_logger = logging.getLogger('root')
-lumibot_logger.setLevel(logging.CRITICAL)  # Only show critical errors, not pricing warnings
+# Suppress Lumibot's non-critical warnings during initialization
+# Note: We keep this disabled for now to see all output during testing
+# lumibot_logger = logging.getLogger('lumibot')
+# lumibot_logger.setLevel(logging.ERROR)
 
 logger.info(f"Logging to: {log_file}")
 
@@ -215,28 +214,26 @@ def check_account_status():
     logger.info("Checking Alpaca account status...")
 
     try:
-        import alpaca_trade_api as tradeapi
+        from alpaca.trading.client import TradingClient
+        from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
 
-        api_key = os.getenv('ALPACA_API_KEY')
-        api_secret = os.getenv('ALPACA_API_SECRET')
-        base_url = 'https://paper-api.alpaca.markets'  # Paper trading URL
-
-        api = tradeapi.REST(api_key, api_secret, base_url, api_version='v2')
+        # Use the same SDK as everywhere else
+        client = TradingClient(ALPACA_API_KEY, ALPACA_API_SECRET, paper=ALPACA_PAPER)
 
         # Get account info
-        account = api.get_account()
+        account = client.get_account()
 
-        logger.info("-" * 80)
+        logger.info("=" * 80)
         logger.info("ACCOUNT STATUS")
-        logger.info("-" * 80)
+        logger.info("=" * 80)
         logger.info(f"Account Number: {account.account_number}")
         logger.info(f"Status: {account.status}")
         logger.info(f"Buying Power: ${float(account.buying_power):,.2f}")
-        logger.info(f"Portfolio Value: ${float(account.portfolio_value):,.2f}")
+        logger.info(f"Portfolio Value: ${float(account.equity):,.2f}")
         logger.info(f"Cash: ${float(account.cash):,.2f}")
-        logger.info("-" * 80)
+        logger.info("=" * 80)
 
-        if account.status != 'ACTIVE':
+        if account.status.value != 'ACTIVE':
             logger.warning(f"Account status is {account.status}, not ACTIVE!")
             logger.warning("Trading may not work properly.")
 
