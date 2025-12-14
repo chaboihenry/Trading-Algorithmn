@@ -63,10 +63,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress Lumibot's non-critical warnings during initialization
-# Note: We keep this disabled for now to see all output during testing
-# lumibot_logger = logging.getLogger('lumibot')
-# lumibot_logger.setLevel(logging.ERROR)
+# Keep all logging enabled so you can see what the bot is doing
+# The "Could not get pricing data" errors are expected when market is closed
 
 logger.info(f"Logging to: {log_file}")
 
