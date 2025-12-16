@@ -7,7 +7,7 @@ This allows you to test the bot without waiting for the next scheduled iteration
 import os
 import logging
 from lumibot.brokers import Alpaca
-from combined_strategy import CombinedStrategy
+from core.combined_strategy import CombinedStrategy
 
 # Configure logging
 logging.basicConfig(

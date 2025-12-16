@@ -33,33 +33,47 @@ class PairsStrategy(Strategy):
     - Exits when spread normalizes
     """
 
-    # Strategy parameters
+    # FIXED (Problem 16): Strategy parameters now from centralized config
+    from config.settings import (
+        PAIRS_LOOKBACK_DAYS,
+        PAIRS_ZSCORE_ENTRY,
+        PAIRS_ZSCORE_EXIT,
+        PAIRS_MIN_CORRELATION,
+        PAIRS_MIN_QUALITY_SCORE,
+        PAIRS_MAX_PAIRS,
+        PAIRS_POSITION_SIZE,
+        DB_PATH,
+        TRADING_SYMBOLS
+    )
+
     SLEEPTIME = "24H"  # Check once per day
-    LOOKBACK_DAYS = 120  # Historical data for cointegration test
-    ZSCORE_ENTRY = 1.5   # Enter trades at this z-score threshold
-    ZSCORE_EXIT = 0.5    # Exit trades at this z-score threshold
-    MIN_CORRELATION = 0.7  # Minimum correlation to consider pair
-    MIN_QUALITY_SCORE = 0.6  # Minimum quality score for trading
-    MAX_PAIRS = 5  # Maximum number of pairs to trade simultaneously
-    POSITION_SIZE = 0.1  # Use 10% of portfolio per pair (5% per leg)
+    LOOKBACK_DAYS = PAIRS_LOOKBACK_DAYS
+    ZSCORE_ENTRY = PAIRS_ZSCORE_ENTRY
+    ZSCORE_EXIT = PAIRS_ZSCORE_EXIT
+    MIN_CORRELATION = PAIRS_MIN_CORRELATION
+    MIN_QUALITY_SCORE = PAIRS_MIN_QUALITY_SCORE
+    MAX_PAIRS = PAIRS_MAX_PAIRS
+    POSITION_SIZE = PAIRS_POSITION_SIZE
 
     def initialize(self, parameters: Dict = None):
         """
         Initialize pairs strategy.
 
+        FIXED (Problem 16): All defaults now from config.settings.
+
         Args:
             parameters: Optional dict with:
-                - db_path: Path to database (default: /Volumes/Vault/85_assets_prediction.db)
-                - lookback_days: Days of history for cointegration (default: 120)
-                - symbols: List of symbols to consider (default: all in assets table)
+                - db_path: Path to database (default: from config)
+                - lookback_days: Days of history for cointegration (default: from config)
+                - symbols: List of symbols to consider (default: from config)
         """
         self.sleeptime = self.SLEEPTIME
 
-        # Get parameters
+        # Get parameters (with config defaults)
         params = parameters or {}
-        self.db_path = params.get('db_path', '/Volumes/Vault/85_assets_prediction.db')
+        self.db_path = params.get('db_path', DB_PATH)
         self.lookback_days = params.get('lookback_days', self.LOOKBACK_DAYS)
-        self.symbols = params.get('symbols', None)
+        self.symbols = params.get('symbols', TRADING_SYMBOLS)
 
         # Track active pairs and spreads
         self.active_pairs = {}  # {(s1, s2): {'hedge_ratio': float, 'position': 'long'/'short'}}
@@ -85,30 +99,30 @@ class PairsStrategy(Strategy):
         if days is None:
             days = self.lookback_days
 
-        conn = sqlite3.connect(self.db_path)
+        # FIXED: Use context manager to prevent connection leaks
+        with sqlite3.connect(self.db_path) as conn:
+            if self.symbols:
+                # Fetch specific symbols
+                placeholders = ','.join(['?' for _ in self.symbols])
+                query = f"""
+                    SELECT symbol_ticker, price_date, close
+                    FROM raw_price_data
+                    WHERE symbol_ticker IN ({placeholders})
+                      AND price_date >= date('now', '-{days + 20} days')
+                    ORDER BY symbol_ticker, price_date
+                """
+                df = pd.read_sql(query, conn, params=self.symbols)
+            else:
+                # Fetch all symbols
+                query = f"""
+                    SELECT symbol_ticker, price_date, close
+                    FROM raw_price_data
+                    WHERE price_date >= date('now', '-{days + 20} days')
+                    ORDER BY symbol_ticker, price_date
+                """
+                df = pd.read_sql(query, conn)
+            # Connection automatically closed when exiting 'with' block
 
-        if self.symbols:
-            # Fetch specific symbols
-            placeholders = ','.join(['?' for _ in self.symbols])
-            query = f"""
-                SELECT symbol_ticker, price_date, close
-                FROM raw_price_data
-                WHERE symbol_ticker IN ({placeholders})
-                  AND price_date >= date('now', '-{days + 20} days')
-                ORDER BY symbol_ticker, price_date
-            """
-            df = pd.read_sql(query, conn, params=self.symbols)
-        else:
-            # Fetch all symbols
-            query = f"""
-                SELECT symbol_ticker, price_date, close
-                FROM raw_price_data
-                WHERE price_date >= date('now', '-{days + 20} days')
-                ORDER BY symbol_ticker, price_date
-            """
-            df = pd.read_sql(query, conn)
-
-        conn.close()
         return df
 
     def _augmented_dickey_fuller(self, series: np.ndarray) -> Tuple[float, float]:

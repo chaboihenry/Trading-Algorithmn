@@ -73,6 +73,16 @@ class HistoricalDataBackfiller:
             self.conn.close()
             logger.info("Database connection closed")
 
+    def __enter__(self):
+        """Context manager entry - establish connection."""
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit - close connection automatically."""
+        self.disconnect()
+        return False  # Don't suppress exceptions
+
     def get_symbols(self, custom_symbols: Optional[List[str]] = None) -> List[str]:
         """
         Get list of symbols to backfill.

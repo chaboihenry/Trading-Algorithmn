@@ -47,6 +47,9 @@ from core.sentiment_strategy import SentimentStrategy
 from core.pairs_strategy import PairsStrategy
 from core.combined_strategy import CombinedStrategy
 
+# Import connection manager to prevent socket exhaustion
+from utils.connection_manager import get_connection_manager
+
 # Create logs directory if it doesn't exist
 LOGS_DIR = Path(__file__).parent / 'logs'
 LOGS_DIR.mkdir(exist_ok=True)
@@ -148,9 +151,16 @@ class LiveTrader:
         """
         logger.info("Starting live trading...")
 
+        # FIXED: Initialize connection manager to prevent socket exhaustion
+        conn_manager = None
+
         try:
             # Create broker connection
             broker = Alpaca(self.alpaca_config)
+
+            # FIXED: Initialize connection manager with broker
+            # This ensures all connections are properly closed on shutdown
+            conn_manager = get_connection_manager(broker)
 
             # Get strategy class
             strategy_class = self.get_strategy()
@@ -198,6 +208,12 @@ class LiveTrader:
             logger.error("The bot has stopped. Please fix the error and restart.")
             logger.error("=" * 80)
             raise
+
+        finally:
+            # FIXED: Always cleanup connections on shutdown
+            if conn_manager:
+                logger.info("\nCleaning up connections before shutdown...")
+                conn_manager.cleanup_all()
 
 
 def check_account_status():

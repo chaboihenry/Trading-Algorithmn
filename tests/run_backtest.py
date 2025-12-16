@@ -28,9 +28,9 @@ import numpy as np
 from pathlib import Path
 
 # Import our strategies
-from sentiment_strategy import SentimentStrategy
-from pairs_strategy import PairsStrategy
-from combined_strategy import CombinedStrategy
+from core.sentiment_strategy import SentimentStrategy
+from core.pairs_strategy import PairsStrategy
+from core.combined_strategy import CombinedStrategy
 
 # Configure logging
 logging.basicConfig(

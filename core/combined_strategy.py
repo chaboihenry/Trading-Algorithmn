@@ -2,13 +2,13 @@
 Combined Strategy with Stacked Ensemble Meta-Learner
 
 This strategy combines sentiment and pairs trading signals using a machine learning
-meta-learner (XGBoost) that dynamically adjusts weights based on market conditions.
+meta-learner (Logistic Regression) that dynamically adjusts weights based on market conditions.
 
 Instead of fixed weights, the meta-learner:
 1. Takes signals from both strategies as input features
 2. Learns which strategy to trust in different conditions
 3. Adapts weights continuously based on historical performance
-4. Discovers non-linear interactions between strategies
+4. Uses regularized logistic regression (suitable for limited training data)
 
 This is based on your existing stacked_ensemble.py pattern but adapted for Lumibot
 and combining sentiment + pairs instead of multiple ML models.
@@ -23,9 +23,14 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from lumibot.strategies import Strategy
-import xgboost as xgb
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import TimeSeriesSplit
+
+# Alpaca API for direct bracket order creation (bypass Lumibot)
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import MarketOrderRequest, TakeProfitRequest, StopLossRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 
 # Base strategies not needed - using simplified approach
 # from sentiment_strategy import SentimentStrategy
@@ -49,24 +54,23 @@ class CombinedStrategy(Strategy):
     - Position sizing based on confidence
     """
 
-    # Strategy parameters - ACTIVE TRADING: Check every hour
-    SLEEPTIME = "1H"
-    RETRAIN_FREQUENCY_DAYS = 7  # Retrain meta-model weekly
-    MIN_TRAINING_SAMPLES = 100  # Minimum samples needed to train
-    CONFIDENCE_THRESHOLD = 0.6  # Only trade if meta-model confidence > 60%
+    # FIXED (Problem 16): Strategy parameters now from centralized config
+    # All these values come from config/settings.py (environment-specific)
+    # No more scattered magic numbers!
+    from config.settings import (
+        SLEEP_INTERVAL,
+        RETRAIN_FREQUENCY_DAYS,
+        MIN_TRAINING_SAMPLES,
+        CONFIDENCE_THRESHOLD,
+        STOP_LOSS_PCT,
+        TAKE_PROFIT_PCT,
+        ENABLE_EXTENDED_HOURS,
+        INVERSE_ETFS,
+        MAX_INVERSE_ALLOCATION
+    )
 
-    # Risk management - Active 24/7 with SERVER-SIDE bracket orders
-    STOP_LOSS_PCT = 0.05  # Exit at -5% loss (attached to every order)
-    TAKE_PROFIT_PCT = 0.15  # Exit at +15% profit (attached to every order)
-    ENABLE_EXTENDED_HOURS = True  # Trade after hours
-
-    # Inverse ETFs for bearish sentiment (profit when market drops)
-    INVERSE_ETFS = {
-        'tech': 'SQQQ',    # 3x inverse NASDAQ (use when tech sentiment bearish)
-        'sp500': 'SPXS',   # 3x inverse S&P 500 (use when market sentiment bearish)
-        'general': 'SH'    # 1x inverse S&P 500 (conservative hedge)
-    }
-    MAX_INVERSE_ALLOCATION = 0.20  # Max 20% of portfolio in inverse positions
+    SLEEPTIME = SLEEP_INTERVAL
+    # Other parameters are used directly from config.settings
 
     def initialize(self, parameters: Dict = None):
         """
@@ -80,8 +84,21 @@ class CombinedStrategy(Strategy):
         """
         self.sleeptime = self.SLEEPTIME
 
+        # FIXED (Problem 16): Use centralized config for all parameters
+        from config.settings import (
+            DB_PATH,
+            SENTIMENT_LOOKBACK_DAYS,
+            TRADING_SYMBOLS,
+            PAIRS_LOOKBACK_DAYS,
+            PAIRS_ZSCORE_ENTRY,
+            PAIRS_MIN_CORRELATION,
+            MAX_DAILY_LOSS_PCT,
+            WARNING_LOSS_PCT,
+            SCALING_START_LOSS_PCT
+        )
+
         params = parameters or {}
-        self.db_path = params.get('db_path', '/Volumes/Vault/85_assets_prediction.db')
+        self.db_path = params.get('db_path', DB_PATH)
         self.retrain = params.get('retrain', False)
 
         # We don't actually need separate strategy instances
@@ -89,11 +106,8 @@ class CombinedStrategy(Strategy):
         # (The original code tried to instantiate strategies without brokers, which fails)
 
         # Sentiment parameters (from SentimentStrategy)
-        self.NEWS_LOOKBACK_DAYS = 3
-        self.SYMBOLS = [
-            "AAPL", "MSFT", "GOOGL", "META", "NVDA", "AMZN", "TSLA",
-            "AMD", "NFLX", "CRM", "ADBE", "INTC", "PYPL", "SQ"
-        ]
+        self.NEWS_LOOKBACK_DAYS = SENTIMENT_LOOKBACK_DAYS
+        self.SYMBOLS = TRADING_SYMBOLS
 
         # Initialize FinBERT for sentiment
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
@@ -105,9 +119,9 @@ class CombinedStrategy(Strategy):
 
         # Pairs parameters (from PairsStrategy) - DISABLED FOR NOW
         # Focus on risk management first, pairs trading can be added later
-        self.LOOKBACK_DAYS = 120
-        self.ZSCORE_ENTRY = 1.5
-        self.MIN_CORRELATION = 0.7
+        self.LOOKBACK_DAYS = PAIRS_LOOKBACK_DAYS
+        self.ZSCORE_ENTRY = PAIRS_ZSCORE_ENTRY
+        self.MIN_CORRELATION = PAIRS_MIN_CORRELATION
         self.cointegrated_pairs = []  # Empty for now
 
         # TODO: Add pairs finding logic later
@@ -132,6 +146,41 @@ class CombinedStrategy(Strategy):
         # If no model or retrain requested, train new model
         if self.meta_model is None or self.retrain:
             self._train_meta_model()
+
+        # Initialize direct Alpaca Trading Client for bracket orders
+        # This bypasses Lumibot and gives us direct access to Alpaca's bracket order API
+        from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
+        self.alpaca_client = TradingClient(
+            ALPACA_API_KEY,
+            ALPACA_API_SECRET,
+            paper=ALPACA_PAPER
+        )
+        logger.info("✅ Direct Alpaca client initialized for bracket orders")
+
+        # Initialize reliable MarketDataClient (fixes Lumibot's unreliable get_cash())
+        # Lumibot's get_cash() sometimes returns None, causing crashes
+        # Our MarketDataClient ALWAYS returns a value (0.0 on error, never None)
+        from data.market_data import get_market_data_client
+        self.market_data = get_market_data_client()
+        logger.info("✅ Reliable market data client initialized")
+
+        # FIXED: Initialize health monitoring for 90-day reliability
+        from utils.health_monitor import get_health_monitor
+        from utils.memory_profiler import get_memory_profiler
+        self.health_monitor = get_health_monitor()
+        self.memory_profiler = get_memory_profiler()
+        logger.info("✅ Health monitoring and memory profiling initialized")
+
+        # FIXED (Problem 10, 16): Initialize daily P&L tracker with circuit breaker
+        # Parameters now from config.settings (environment-specific!)
+        from utils.daily_pnl_tracker import get_daily_pnl_tracker
+        self.daily_pnl = get_daily_pnl_tracker(
+            max_daily_loss_pct=MAX_DAILY_LOSS_PCT,
+            warning_loss_pct=WARNING_LOSS_PCT,
+            scaling_start_loss_pct=SCALING_START_LOSS_PCT
+        )
+        self.current_position_size_multiplier = 1.0  # Default to full size
+        logger.info("✅ Daily P&L tracker and circuit breaker initialized")
 
         logger.info("Combined Strategy initialized with meta-learner")
         logger.info(f"Meta-model active: {self.meta_model is not None}")
@@ -183,49 +232,232 @@ class CombinedStrategy(Strategy):
             DataFrame with columns: [date, symbol, sentiment_signal, sentiment_prob,
                                      pairs_signal, pairs_zscore, actual_return_5d, ...]
         """
-        conn = sqlite3.connect(self.db_path)
+        # FIXED: Use context manager to prevent connection leaks
+        with sqlite3.connect(self.db_path) as conn:
+            # Get historical signals and returns
+            # This query assumes you have a trading_signals table with signal history
+            query = """
+            SELECT
+                ts.signal_date,
+                ts.symbol_ticker,
+                ts.signal_type,
+                ts.strength,
+                ts.metadata,
+                p.close as entry_price,
+                p2.close as exit_price_5d,
+                (p2.close - p.close) / p.close as return_5d,
+                vm.close_to_close_vol_20d as volatility_20d,
+                ti.rsi_14
+            FROM trading_signals ts
+            LEFT JOIN raw_price_data p
+                ON ts.symbol_ticker = p.symbol_ticker
+                AND ts.signal_date = p.price_date
+            LEFT JOIN raw_price_data p2
+                ON ts.symbol_ticker = p2.symbol_ticker
+                AND p2.price_date = date(ts.signal_date, '+5 days')
+            LEFT JOIN volatility_metrics vm
+                ON ts.symbol_ticker = vm.symbol_ticker
+                AND ts.signal_date = vm.vol_date
+            LEFT JOIN technical_indicators ti
+                ON ts.symbol_ticker = ti.symbol_ticker
+                AND ts.signal_date = ti.indicator_date
+            WHERE ts.signal_date >= date('now', '-365 days')
+              AND ts.metadata IS NOT NULL
+            ORDER BY ts.signal_date
+            """
 
-        # Get historical signals and returns
-        # This query assumes you have a trading_signals table with signal history
-        query = """
-        SELECT
-            ts.signal_date,
-            ts.symbol_ticker,
-            ts.signal_type,
-            ts.strength,
-            ts.metadata,
-            p.close as entry_price,
-            p2.close as exit_price_5d,
-            (p2.close - p.close) / p.close as return_5d,
-            vm.close_to_close_vol_20d as volatility_20d,
-            ti.rsi_14
-        FROM trading_signals ts
-        LEFT JOIN raw_price_data p
-            ON ts.symbol_ticker = p.symbol_ticker
-            AND ts.signal_date = p.price_date
-        LEFT JOIN raw_price_data p2
-            ON ts.symbol_ticker = p2.symbol_ticker
-            AND p2.price_date = date(ts.signal_date, '+5 days')
-        LEFT JOIN volatility_metrics vm
-            ON ts.symbol_ticker = vm.symbol_ticker
-            AND ts.signal_date = vm.vol_date
-        LEFT JOIN technical_indicators ti
-            ON ts.symbol_ticker = ti.symbol_ticker
-            AND ts.signal_date = ti.indicator_date
-        WHERE ts.signal_date >= date('now', '-365 days')
-          AND ts.metadata IS NOT NULL
-        ORDER BY ts.signal_date
+            df = pd.read_sql(query, conn)
+            # Connection automatically closed when exiting 'with' block
+
+            if df.empty:
+                logger.warning("No historical signals found in database")
+                return pd.DataFrame()
+
+            logger.info(f"Loaded {len(df)} historical signals for training")
+            return df
+
+    def _get_sector_momentum(self) -> Dict[str, float]:
         """
+        Get sector ETF momentum (5-day returns).
 
-        df = pd.read_sql(query, conn)
-        conn.close()
+        FIXED (Problem 12, 16): Add sector momentum features from config.
 
-        if df.empty:
-            logger.warning("No historical signals found in database")
-            return pd.DataFrame()
+        Sector ETFs now from config.settings.SECTOR_ETFS:
+        - XLK: Technology
+        - XLF: Financials
+        - XLE: Energy
+        - XLV: Healthcare
+        - XLY: Consumer Discretionary
+        - XLP: Consumer Staples
 
-        logger.info(f"Loaded {len(df)} historical signals for training")
-        return df
+        Returns:
+            Dict of sector -> 5-day return %
+        """
+        from config.settings import SECTOR_ETFS, FEATURE_DEFAULTS
+        sector_etfs = list(SECTOR_ETFS.keys())
+        sector_returns = {}
+
+        try:
+            from utils.market_data_client import get_market_data_client
+            market_data = get_market_data_client()
+
+            for symbol in sector_etfs:
+                try:
+                    bars = market_data.get_stock_bars(symbol=symbol, days=7)
+                    if bars and len(bars) >= 2:
+                        # Calculate 5-day return
+                        closes = [bar.close for bar in bars]
+                        if len(closes) >= 6:
+                            ret_5d = ((closes[-1] - closes[-6]) / closes[-6]) * 100
+                            sector_returns[symbol] = ret_5d
+                        else:
+                            sector_returns[symbol] = FEATURE_DEFAULTS['sector_return']
+                    else:
+                        sector_returns[symbol] = FEATURE_DEFAULTS['sector_return']
+                except (AttributeError, IndexError, ZeroDivisionError) as e:
+                    # FIXED (Problem 14): Specific exceptions, with logging
+                    logger.warning(f"Failed to get sector momentum for {symbol}: {e}")
+                    sector_returns[symbol] = FEATURE_DEFAULTS['sector_return']
+
+        except Exception as e:
+            logger.warning(f"Error getting sector momentum: {e}")
+            for symbol in sector_etfs:
+                sector_returns[symbol] = FEATURE_DEFAULTS['sector_return']
+
+        return sector_returns
+
+    def _get_vix_features(self) -> Dict[str, float]:
+        """
+        Get VIX features (volatility index).
+
+        FIXED (Problem 12, 16): Add VIX level and term structure from config.
+
+        Returns:
+            Dict with:
+            - vix_level: Current VIX value
+            - vix_change: 5-day change in VIX
+            - vix_percentile: VIX relative to 30-day range (0-100)
+        """
+        from config.settings import FEATURE_DEFAULTS
+        vix_features = {
+            'vix_level': FEATURE_DEFAULTS['vix_level'],
+            'vix_change': FEATURE_DEFAULTS['vix_change'],
+            'vix_percentile': FEATURE_DEFAULTS['vix_percentile']
+        }
+
+        try:
+            from utils.market_data_client import get_market_data_client
+            market_data = get_market_data_client()
+
+            # Get VIX bars for last 30 days
+            bars = market_data.get_stock_bars(symbol='VIX', days=35)
+
+            if bars and len(bars) >= 2:
+                closes = [bar.close for bar in bars]
+
+                # Current VIX level
+                vix_features['vix_level'] = closes[-1]
+
+                # 5-day change
+                if len(closes) >= 6:
+                    vix_features['vix_change'] = closes[-1] - closes[-6]
+
+                # Percentile in 30-day range
+                if len(closes) >= 30:
+                    recent_30 = closes[-30:]
+                    vix_min = min(recent_30)
+                    vix_max = max(recent_30)
+
+                    if vix_max > vix_min:
+                        vix_features['vix_percentile'] = ((closes[-1] - vix_min) / (vix_max - vix_min)) * 100
+
+        except Exception as e:
+            logger.warning(f"Error getting VIX features: {e}")
+
+        return vix_features
+
+    def _get_market_breadth(self) -> float:
+        """
+        Get market breadth (advance/decline ratio).
+
+        FIXED (Problem 12): Add market breadth indicator.
+
+        Uses SPY components as proxy:
+        - Count how many of our tracked symbols are up today
+        - Ratio: advancing / (advancing + declining)
+        - 0.5 = neutral, >0.5 = more advancing, <0.5 = more declining
+
+        Returns:
+            Advance/decline ratio (0.0 to 1.0)
+        """
+        try:
+            from utils.market_data_client import get_market_data_client
+            market_data = get_market_data_client()
+
+            advancing = 0
+            declining = 0
+
+            for symbol in self.SYMBOLS[:10]:  # Use first 10 symbols
+                try:
+                    bars = market_data.get_stock_bars(symbol=symbol, days=3)
+                    if bars and len(bars) >= 2:
+                        closes = [bar.close for bar in bars]
+                        if closes[-1] > closes[-2]:
+                            advancing += 1
+                        elif closes[-1] < closes[-2]:
+                            declining += 1
+                except (AttributeError, IndexError, TypeError) as e:
+                    # FIXED (Problem 14): Specific exceptions, silently skip symbol
+                    logger.debug(f"Skipping {symbol} for breadth calculation: {e}")
+                    continue
+
+            total = advancing + declining
+            if total > 0:
+                return advancing / total
+            else:
+                from config.settings import FEATURE_DEFAULTS
+                return FEATURE_DEFAULTS['breadth_ratio']  # Neutral if no data
+
+        except Exception as e:
+            logger.warning(f"Error getting market breadth: {e}")
+            from config.settings import FEATURE_DEFAULTS
+            return FEATURE_DEFAULTS['breadth_ratio']
+
+    def _get_time_features(self) -> Dict[str, float]:
+        """
+        Get time-based features.
+
+        FIXED (Problem 12, 16): Add day-of-week and month-of-year patterns from config.
+
+        Returns:
+            Dict with:
+            - day_of_week: 0 (Monday) to 4 (Friday)
+            - month: 1 (January) to 12 (December)
+            - is_month_end: 1 if last 5 days of month, else 0
+            - is_month_start: 1 if first 5 days of month, else 0
+        """
+        from config.settings import TIME_FEATURES
+        now = datetime.now()
+
+        # Day of week (0=Monday, 4=Friday)
+        day_of_week = now.weekday()
+        if day_of_week > 4:  # Weekend
+            day_of_week = 4  # Treat as Friday
+
+        # Month (1-12)
+        month = now.month
+
+        # Month end/start effects (thresholds from config)
+        day_of_month = now.day
+        is_month_end = 1.0 if day_of_month >= TIME_FEATURES['month_end_threshold'] else 0.0
+        is_month_start = 1.0 if day_of_month <= TIME_FEATURES['month_start_threshold'] else 0.0
+
+        return {
+            'day_of_week': float(day_of_week),
+            'month': float(month),
+            'is_month_end': is_month_end,
+            'is_month_start': is_month_start
+        }
 
     def _prepare_meta_features(
         self,
@@ -239,6 +471,15 @@ class CombinedStrategy(Strategy):
         """
         Prepare feature vector for meta-learner.
 
+        FIXED (Problem 12): Enhanced feature engineering with:
+        - Original features (sentiment, pairs, volatility, RSI)
+        - Sector momentum (6 sector ETFs)
+        - VIX features (level, change, percentile)
+        - Market breadth (advance/decline ratio)
+        - Time features (day of week, month, month-end/start)
+
+        Total: 12 (original) + 6 (sectors) + 3 (VIX) + 1 (breadth) + 4 (time) = 26 features
+
         Args:
             sentiment_score: Sentiment signal (-1, 0, 1)
             sentiment_prob: Sentiment confidence (0-1)
@@ -248,9 +489,17 @@ class CombinedStrategy(Strategy):
             rsi: RSI indicator
 
         Returns:
-            Feature vector ready for meta-model
+            Feature vector ready for meta-model (26 features)
         """
-        features = np.array([
+        # FIXED (Problem 16): All defaults and normalization factors from config
+        from config.settings import (
+            FEATURE_DEFAULTS,
+            NORMALIZATION_FACTORS,
+            SECTOR_ETFS
+        )
+
+        # Original features (12 features)
+        base_features = [
             sentiment_score,
             sentiment_prob,
             abs(sentiment_score) * sentiment_prob,  # Weighted sentiment
@@ -258,26 +507,63 @@ class CombinedStrategy(Strategy):
             abs(pairs_zscore),  # Magnitude of deviation
             pairs_quality,
             pairs_zscore * pairs_quality,  # Weighted pairs signal
-            volatility if volatility else 0.2,  # Default volatility
-            rsi if rsi else 50,  # Default RSI
+            volatility if volatility else FEATURE_DEFAULTS['volatility'],
+            rsi if rsi else FEATURE_DEFAULTS['rsi'],
             # Interaction features
             sentiment_score * pairs_zscore,  # Agreement indicator
             abs(sentiment_score - np.sign(pairs_zscore)),  # Disagreement indicator
             sentiment_prob * pairs_quality,  # Combined confidence
-        ])
+        ]
 
-        return features.reshape(1, -1)
+        # FIXED (Problem 12, 16): Add sector momentum features (6 features) from config
+        sector_returns = self._get_sector_momentum()
+        sector_features = [
+            sector_returns.get(symbol, FEATURE_DEFAULTS['sector_return'])
+            for symbol in SECTOR_ETFS.keys()
+        ]
+
+        # FIXED (Problem 12, 16): Add VIX features (3 features) with config normalization
+        vix_data = self._get_vix_features()
+        vix_features = [
+            vix_data['vix_level'] / NORMALIZATION_FACTORS['vix_level'],
+            vix_data['vix_change'] / NORMALIZATION_FACTORS['vix_change'],
+            vix_data['vix_percentile'] / NORMALIZATION_FACTORS['vix_percentile'],
+        ]
+
+        # FIXED (Problem 12): Add market breadth (1 feature)
+        breadth = self._get_market_breadth()
+        breadth_features = [breadth]
+
+        # FIXED (Problem 12, 16): Add time features (4 features) with config normalization
+        time_data = self._get_time_features()
+        time_features = [
+            time_data['day_of_week'] / NORMALIZATION_FACTORS['day_of_week'],
+            time_data['month'] / NORMALIZATION_FACTORS['month'],
+            time_data['is_month_end'],          # Already 0 or 1
+            time_data['is_month_start'],        # Already 0 or 1
+        ]
+
+        # Combine all features (12 + 6 + 3 + 1 + 4 = 26 features)
+        all_features = base_features + sector_features + vix_features + breadth_features + time_features
+
+        return np.array(all_features).reshape(1, -1)
 
     def _train_meta_model(self):
         """
         Train the meta-learner on historical signals.
+
+        FIXED (Problem 11): Uses Logistic Regression instead of XGBoost for limited data.
+        - Simpler model prevents overfitting on 348 samples
+        - L2 regularization for robustness
+        - Time-series split prevents future data leakage
+        - No synthetic data augmentation (only real historical signals)
 
         The meta-model learns to predict profitability based on:
         - Strategy signals
         - Market conditions
         - Historical performance patterns
         """
-        logger.info("Training meta-learner...")
+        logger.info("Training meta-learner (Logistic Regression)...")
 
         # Get historical data
         historical_data = self._get_historical_signals()
@@ -288,21 +574,72 @@ class CombinedStrategy(Strategy):
             return
 
         # Extract features and labels
-        # (This is simplified - you'll need to parse metadata and extract actual signal info)
         try:
             # Create feature matrix
             features_list = []
             labels_list = []
 
+            # FIXED (Problem 16): Import config defaults for training data
+            from config.settings import (
+                FEATURE_DEFAULTS,
+                NORMALIZATION_FACTORS,
+                TIME_FEATURES as TIME_CONFIG
+            )
+
             for _, row in historical_data.iterrows():
-                # Parse metadata to extract signal details
-                # For now, using simplified features
-                features = [
-                    1 if row['signal_type'] == 'BUY' else -1 if row['signal_type'] == 'SELL' else 0,
-                    row['strength'] if pd.notna(row['strength']) else 0.5,
-                    row['volatility_20d'] if pd.notna(row['volatility_20d']) else 0.2,
-                    row['rsi_14'] if pd.notna(row['rsi_14']) else 50,
+                # FIXED (Problem 12, 16): Extract 26 features (matching _prepare_meta_features)
+                # Base features (12 features) - using config defaults
+                signal_type = 1 if row['signal_type'] == 'BUY' else -1 if row['signal_type'] == 'SELL' else 0
+                strength = row['strength'] if pd.notna(row['strength']) else FEATURE_DEFAULTS['sentiment_strength']
+                volatility = row['volatility_20d'] if pd.notna(row['volatility_20d']) else FEATURE_DEFAULTS['volatility']
+                rsi = row['rsi_14'] if pd.notna(row['rsi_14']) else FEATURE_DEFAULTS['rsi']
+
+                base_features = [
+                    signal_type,
+                    strength,
+                    abs(signal_type) * strength,  # Weighted signal
+                    FEATURE_DEFAULTS['pairs_zscore'],  # pairs_zscore (not in DB)
+                    FEATURE_DEFAULTS['pairs_zscore'],  # abs(pairs_zscore)
+                    FEATURE_DEFAULTS['pairs_quality'],  # pairs_quality
+                    FEATURE_DEFAULTS['pairs_zscore'],  # weighted pairs
+                    volatility,
+                    rsi,
+                    FEATURE_DEFAULTS['pairs_zscore'],  # interaction: sentiment * pairs
+                    abs(signal_type),  # disagreement indicator
+                    strength * NORMALIZATION_FACTORS['sentiment_interaction'],  # combined confidence
                 ]
+
+                # Sector features (6 features) - use defaults for historical data
+                sector_features = [FEATURE_DEFAULTS['sector_return']] * 6
+
+                # VIX features (3 features) - use defaults (normalized)
+                vix_features = [
+                    FEATURE_DEFAULTS['vix_level'] / NORMALIZATION_FACTORS['vix_level'],
+                    FEATURE_DEFAULTS['vix_change'] / NORMALIZATION_FACTORS['vix_change'],
+                    FEATURE_DEFAULTS['vix_percentile'] / NORMALIZATION_FACTORS['vix_percentile']
+                ]
+
+                # Market breadth (1 feature) - use default
+                breadth_features = [FEATURE_DEFAULTS['breadth_ratio']]
+
+                # Time features (4 features) - extract from signal_date if available
+                if pd.notna(row.get('signal_date')):
+                    try:
+                        sig_date = pd.to_datetime(row['signal_date'])
+                        day_of_week = float(sig_date.weekday()) / NORMALIZATION_FACTORS['day_of_week']
+                        month = float(sig_date.month) / NORMALIZATION_FACTORS['month']
+                        is_month_end = 1.0 if sig_date.day >= TIME_CONFIG['month_end_threshold'] else 0.0
+                        is_month_start = 1.0 if sig_date.day <= TIME_CONFIG['month_start_threshold'] else 0.0
+                        time_features = [day_of_week, month, is_month_end, is_month_start]
+                    except (ValueError, TypeError, AttributeError) as e:
+                        # FIXED (Problem 14): Specific exception types, with logging
+                        logger.warning(f"Failed to parse signal_date: {e}")
+                        time_features = [0.5, 0.5, 0.0, 0.0]  # defaults
+                else:
+                    time_features = [0.5, 0.5, 0.0, 0.0]  # defaults
+
+                # Combine all 26 features
+                features = base_features + sector_features + vix_features + breadth_features + time_features
 
                 # Label: 1 if profitable, 0 otherwise
                 label = 1 if (row['return_5d'] if pd.notna(row['return_5d']) else 0) > 0 else 0
@@ -313,22 +650,34 @@ class CombinedStrategy(Strategy):
             X = np.array(features_list)
             y = np.array(labels_list)
 
-            # Split train/test
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42
-            )
+            logger.info(f"Training on {len(X)} samples (real historical data only)")
+
+            # FIXED: Use TimeSeriesSplit instead of train_test_split
+            # This respects time ordering and prevents future data leakage
+            tscv = TimeSeriesSplit(n_splits=5)
+
+            # Use the last fold for final train/test split
+            train_idx, test_idx = list(tscv.split(X))[-1]
+            X_train, X_test = X[train_idx], X[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+
+            logger.info(f"Time-series split: {len(X_train)} train, {len(X_test)} test")
 
             # Scale features
             X_train_scaled = self.scaler.fit_transform(X_train)
             X_test_scaled = self.scaler.transform(X_test)
 
-            # Train XGBoost meta-model (small model to prevent overfitting)
-            self.meta_model = xgb.XGBClassifier(
-                n_estimators=50,
-                max_depth=3,
-                learning_rate=0.1,
+            # FIXED: Use Logistic Regression instead of XGBoost
+            # - Simpler model better suited for limited data (348 samples)
+            # - L2 regularization (C=1.0) prevents overfitting
+            # - More interpretable coefficients
+            # - Faster training and prediction
+            self.meta_model = LogisticRegression(
+                C=1.0,              # L2 regularization strength (1/lambda)
+                max_iter=1000,      # Sufficient iterations to converge
                 random_state=42,
-                tree_method='hist'  # M1 optimized
+                solver='lbfgs',     # Efficient for small datasets
+                class_weight='balanced'  # Handle class imbalance
             )
 
             self.meta_model.fit(X_train_scaled, y_train)
@@ -337,7 +686,24 @@ class CombinedStrategy(Strategy):
             train_score = self.meta_model.score(X_train_scaled, y_train)
             test_score = self.meta_model.score(X_test_scaled, y_test)
 
-            logger.info(f"Meta-model trained: train_acc={train_score:.3f}, test_acc={test_score:.3f}")
+            # Calculate cross-validation score for better estimate
+            cv_scores = []
+            for train_idx_cv, test_idx_cv in tscv.split(X):
+                X_train_cv = self.scaler.fit_transform(X[train_idx_cv])
+                X_test_cv = self.scaler.transform(X[test_idx_cv])
+
+                model_cv = LogisticRegression(C=1.0, max_iter=1000, random_state=42, solver='lbfgs', class_weight='balanced')
+                model_cv.fit(X_train_cv, y[train_idx_cv])
+                cv_scores.append(model_cv.score(X_test_cv, y[test_idx_cv]))
+
+            cv_mean = np.mean(cv_scores)
+            cv_std = np.std(cv_scores)
+
+            logger.info(f"Meta-model trained (Logistic Regression):")
+            logger.info(f"  Train accuracy: {train_score:.3f}")
+            logger.info(f"  Test accuracy: {test_score:.3f}")
+            logger.info(f"  CV accuracy: {cv_mean:.3f} ± {cv_std:.3f}")
+            logger.info(f"  Model: Simpler than XGBoost, better for limited data")
 
             # Save model
             self._save_meta_model()
@@ -345,7 +711,88 @@ class CombinedStrategy(Strategy):
 
         except Exception as e:
             logger.error(f"Error training meta-model: {e}")
+            import traceback
+            traceback.print_exc()
             self.meta_model = None
+
+    # =============================================================================
+    # RELIABLE MARKET DATA METHODS (Override unreliable Lumibot methods)
+    # =============================================================================
+
+    def get_cash_safe(self) -> float:
+        """
+        Get available cash balance (RELIABLE version).
+
+        This OVERRIDES Lumibot's get_cash() which sometimes returns None.
+        Uses our MarketDataClient which ALWAYS returns a float (0.0 on error, never None).
+
+        Returns:
+            float: Cash available for trading (NEVER None)
+        """
+        try:
+            cash = self.market_data.get_cash()
+            logger.debug(f"Cash (reliable): ${cash:,.2f}")
+            return cash
+        except Exception as e:
+            logger.error(f"Error in get_cash_safe: {e}")
+            return 0.0  # Return 0 instead of None to prevent crashes
+
+    def get_portfolio_value_safe(self) -> float:
+        """
+        Get total portfolio value (RELIABLE version).
+
+        This OVERRIDES Lumibot's get_portfolio_value() which can be unreliable.
+        Uses our MarketDataClient which ALWAYS returns a float.
+
+        Returns:
+            float: Total account equity (NEVER None)
+        """
+        try:
+            value = self.market_data.get_portfolio_value()
+            logger.debug(f"Portfolio value (reliable): ${value:,.2f}")
+            return value
+        except Exception as e:
+            logger.error(f"Error in get_portfolio_value_safe: {e}")
+            return 0.0
+
+    def get_positions_safe(self) -> List:
+        """
+        Get all open positions (RELIABLE version).
+
+        This OVERRIDES Lumibot's get_positions() which can be unreliable.
+        Uses our MarketDataClient which ALWAYS returns a list (empty [] on error, never None).
+
+        Returns:
+            List: Position objects (NEVER None)
+        """
+        try:
+            positions = self.market_data.get_positions()
+            logger.debug(f"Positions (reliable): {len(positions)} found")
+            return positions
+        except Exception as e:
+            logger.error(f"Error in get_positions_safe: {e}")
+            return []  # Return empty list instead of None
+
+    def get_position_safe(self, symbol: str):
+        """
+        Get position for specific symbol (RELIABLE version).
+
+        Args:
+            symbol: Stock ticker
+
+        Returns:
+            Position object or None (but never crashes)
+        """
+        try:
+            position = self.market_data.get_position(symbol)
+            return position
+        except Exception as e:
+            logger.error(f"Error in get_position_safe for {symbol}: {e}")
+            return None
+
+    # =============================================================================
+    # MARKET CONDITIONS
+    # =============================================================================
 
     def _get_market_conditions(self, symbol: str) -> Tuple[float, float]:
         """
@@ -358,28 +805,28 @@ class CombinedStrategy(Strategy):
             Tuple of (volatility, rsi)
         """
         try:
-            conn = sqlite3.connect(self.db_path)
+            # FIXED: Use context manager to prevent connection leaks
+            with sqlite3.connect(self.db_path) as conn:
+                query = """
+                SELECT vm.close_to_close_vol_20d as volatility_20d, ti.rsi_14
+                FROM volatility_metrics vm
+                LEFT JOIN technical_indicators ti
+                    ON vm.symbol_ticker = ti.symbol_ticker
+                    AND vm.vol_date = ti.indicator_date
+                WHERE vm.symbol_ticker = ?
+                ORDER BY vm.vol_date DESC
+                LIMIT 1
+                """
 
-            query = """
-            SELECT vm.close_to_close_vol_20d as volatility_20d, ti.rsi_14
-            FROM volatility_metrics vm
-            LEFT JOIN technical_indicators ti
-                ON vm.symbol_ticker = ti.symbol_ticker
-                AND vm.vol_date = ti.indicator_date
-            WHERE vm.symbol_ticker = ?
-            ORDER BY vm.vol_date DESC
-            LIMIT 1
-            """
+                result = pd.read_sql(query, conn, params=(symbol,))
+                # Connection automatically closed when exiting 'with' block
 
-            result = pd.read_sql(query, conn, params=(symbol,))
-            conn.close()
-
-            if not result.empty:
-                volatility = result['volatility_20d'].iloc[0]
-                rsi = result['rsi_14'].iloc[0]
-                return volatility, rsi
-            else:
-                return 0.2, 50  # Defaults
+                if not result.empty:
+                    volatility = result['volatility_20d'].iloc[0]
+                    rsi = result['rsi_14'].iloc[0]
+                    return volatility, rsi
+                else:
+                    return 0.2, 50  # Defaults
 
         except Exception as e:
             logger.warning(f"Error fetching market conditions: {e}")
@@ -415,8 +862,10 @@ class CombinedStrategy(Strategy):
                 try:
                     _, zscore = self.pairs_strategy._calculate_current_spread(s1, s2, hedge)
                     pairs_zscore = zscore
-                except:
-                    pass
+                except (AttributeError, ValueError, TypeError) as e:
+                    # FIXED (Problem 14): Specific exceptions, with logging
+                    logger.warning(f"Failed to calculate pairs z-score for {s1}/{s2}: {e}")
+                    # pairs_zscore remains 0.0 (default)
                 break
 
         # Get market conditions
@@ -542,6 +991,8 @@ class CombinedStrategy(Strategy):
         """
         Check overall market sentiment and use inverse ETFs to profit from declines.
 
+        FIXED (Problem 9): Now uses HedgeManager with dynamic timing.
+
         When the market is bearish, instead of just watching positions drop, we can
         profit by buying inverse ETFs (they go UP when the market goes DOWN).
 
@@ -552,83 +1003,43 @@ class CombinedStrategy(Strategy):
             portfolio_value: Total portfolio value
         """
         try:
-            # Check sentiment for major indices symbols
-            bearish_signals = 0
-            total_checked = 0
+            # FIXED (Problem 9): Use HedgeManager instead of duplicate logic
+            from risk.hedge_manager import HedgeManager
 
-            # Sample a few tech stocks to gauge market sentiment
-            sample_symbols = ['AAPL', 'MSFT', 'GOOGL', 'NVDA', 'TSLA']
+            if not hasattr(self, 'hedge_manager'):
+                self.hedge_manager = HedgeManager()
 
-            for symbol in sample_symbols:
-                try:
-                    _, rsi = self._get_market_conditions(symbol)
-                    total_checked += 1
+            # Run hedge manager with dynamic timing
+            result = self.hedge_manager.manage_hedges(cash, portfolio_value)
 
-                    if rsi > 70:  # Overbought = bearish signal
-                        bearish_signals += 1
-                except:
-                    continue
+            # FIXED (Problem 9): Adjust sleeptime based on market conditions
+            if 'next_check_minutes' in result:
+                next_check_min = result['next_check_minutes']
+                self.sleeptime = f"{next_check_min}M"
+                logger.info(f"⏰ Adjusted check interval to {next_check_min} minutes")
 
-            if total_checked == 0:
-                return
-
-            bearish_ratio = bearish_signals / total_checked
-
-            logger.info(f"Market sentiment check: {bearish_signals}/{total_checked} symbols overbought")
-            logger.info(f"Bearish ratio: {bearish_ratio:.1%}")
-
-            # If >= 60% of market is overbought, consider hedging with inverse ETF
-            if bearish_ratio >= 0.6:
-                # Check current inverse ETF positions
-                inverse_value = 0
-                for inv_symbol in self.INVERSE_ETFS.values():
-                    pos = self.get_position(inv_symbol)
-                    if pos:
-                        inverse_value += pos.quantity * self.get_last_price(inv_symbol)
-
-                inverse_allocation = inverse_value / portfolio_value if portfolio_value > 0 else 0
-
-                logger.info(f"Current inverse ETF allocation: {inverse_allocation:.1%}")
-
-                # Only add more if below max allocation
-                if inverse_allocation < self.MAX_INVERSE_ALLOCATION and cash > 1000:
-                    # Use conservative inverse ETF (SH = 1x inverse S&P 500)
-                    inv_symbol = self.INVERSE_ETFS['general']  # SH
-                    inv_price = self.get_last_price(inv_symbol)
-
-                    if inv_price and inv_price > 0:
-                        # Allocate up to 10% of portfolio to inverse position
-                        target_value = min(portfolio_value * 0.10, cash * 0.5)
-                        quantity = target_value / inv_price
-
-                        logger.warning(f"🔴 BEARISH MARKET DETECTED ({bearish_ratio:.1%} overbought)")
-                        logger.warning(f"🛡️  Hedging with inverse ETF {inv_symbol}")
-
-                        # Buy inverse ETF with bracket order
-                        success = self._create_bracket_order(inv_symbol, quantity, "buy", inv_price)
-                        if success:
-                            logger.info(f"✅ Hedge position: {quantity:.2f} shares of {inv_symbol}")
-                            logger.info(f"   This will profit if market drops!")
-
-            elif bearish_ratio < 0.3:
-                # Market is healthy, exit inverse positions if we have any
-                for inv_symbol in self.INVERSE_ETFS.values():
-                    pos = self.get_position(inv_symbol)
-                    if pos and pos.quantity > 0:
-                        logger.info(f"📈 Market bullish again - exiting inverse position {inv_symbol}")
-                        order = self.create_order(inv_symbol, pos.quantity, "sell")
-                        self.submit_order(order)
+            # Note: HedgeManager already handles all hedge trades internally
+            return
 
         except Exception as e:
-            logger.error(f"Error in market sentiment hedge check: {e}")
+            logger.error(f"Error in hedge management: {e}")
+            import traceback
+            traceback.print_exc()
+            # Keep default sleeptime on error
+            self.sleeptime = self.SLEEPTIME
 
     def _create_bracket_order(self, symbol: str, quantity: float, side: str = "buy",
                              current_price: float = None) -> bool:
         """
         Create a bracket order with automatic stop-loss and take-profit.
 
-        This uses Alpaca's server-side bracket orders which execute automatically
-        without the bot needing to be awake. Much better than iteration-based checks!
+        CRITICAL FIX: Uses Alpaca's native bracket orders directly (bypasses Lumibot).
+        Lumibot's bracket implementation may not work correctly with Alpaca's API.
+
+        This creates ONE order that triggers TWO protective orders (OTO-OCO):
+        - Entry order triggers when submitted
+        - Once filled, creates OCO pair (stop-loss + take-profit)
+        - When one OCO order fills, the other auto-cancels
 
         Args:
             symbol: Stock symbol to trade
@@ -657,41 +1068,68 @@ class CombinedStrategy(Strategy):
             if side == "buy":
                 take_profit_price = round(current_price * (1 + self.TAKE_PROFIT_PCT), 2)
                 stop_loss_price = round(current_price * (1 - self.STOP_LOSS_PCT), 2)
+                order_side = OrderSide.BUY
             else:  # sell (for inverse ETFs or shorts)
                 take_profit_price = round(current_price * (1 - self.TAKE_PROFIT_PCT), 2)
                 stop_loss_price = round(current_price * (1 + self.STOP_LOSS_PCT), 2)
+                order_side = OrderSide.SELL
 
-            logger.info(f"Creating bracket order for {symbol}:")
-            logger.info(f"  Entry: {quantity:.2f} shares @ ${current_price:.2f}")
+            logger.info(f"Creating BRACKET order for {symbol}:")
+            logger.info(f"  Entry: {quantity:.2f} shares @ ${current_price:.2f} ({side})")
             logger.info(f"  Take-profit: ${take_profit_price:.2f} (+{self.TAKE_PROFIT_PCT:.1%})")
             logger.info(f"  Stop-loss: ${stop_loss_price:.2f} (-{self.STOP_LOSS_PCT:.1%})")
 
-            # Create the bracket order
-            # Lumibot will automatically create 3 orders: main, take-profit, stop-loss
-            order = self.create_order(
-                symbol,
-                quantity,
-                side,
-                type="bracket",
-                take_profit_price=take_profit_price,
-                stop_loss_price=stop_loss_price,
-                time_in_force="gtc" if self.ENABLE_EXTENDED_HOURS else "day"
+            # Determine time_in_force
+            # Check if market is open for extended hours handling
+            try:
+                clock = self.alpaca_client.get_clock()
+                market_is_open = clock.is_open
+            except (AttributeError, ConnectionError, TimeoutError) as e:
+                # FIXED (Problem 14): Specific exceptions, with logging
+                logger.warning(f"Failed to get market clock status: {e}")
+                market_is_open = False
+
+            if market_is_open and self.ENABLE_EXTENDED_HOURS:
+                time_in_force = TimeInForce.GTC
+            else:
+                time_in_force = TimeInForce.DAY
+
+            # Create BRACKET order using native Alpaca API
+            # ONE request creates: entry + stop-loss + take-profit
+            bracket_order = MarketOrderRequest(
+                symbol=symbol,
+                qty=quantity,
+                side=order_side,
+                time_in_force=time_in_force,
+                order_class=OrderClass.BRACKET,  # This is the key - BRACKET not OCO
+                take_profit=TakeProfitRequest(limit_price=take_profit_price),
+                stop_loss=StopLossRequest(stop_price=stop_loss_price)  # Uses stop-MARKET
             )
 
-            self.submit_order(order)
-            logger.info(f"✅ Bracket order submitted for {symbol}")
-            logger.info(f"   Alpaca will automatically execute stop-loss/take-profit server-side")
+            # Submit directly to Alpaca (bypass Lumibot)
+            result = self.alpaca_client.submit_order(order_data=bracket_order)
+
+            logger.info(f"✅ BRACKET order submitted for {symbol} (Order ID: {str(result.id)})")
+            logger.info(f"   Entry will trigger stop-loss + take-profit automatically")
+            logger.info(f"   Server-side execution - bot doesn't need to be awake!")
             return True
 
         except Exception as e:
             logger.error(f"Error creating bracket order for {symbol}: {e}")
-            logger.error(f"Falling back to simple market order...")
+            logger.error(f"This may be due to:")
+            logger.error(f"  1. Market is closed and bracket orders not allowed")
+            logger.error(f"  2. Symbol doesn't support bracket orders (crypto, options)")
+            logger.error(f"  3. Insufficient buying power")
+            import traceback
+            traceback.print_exc()
 
-            # Fallback: Create simple order without brackets
+            # Fallback: Create simple order through Lumibot
+            logger.error(f"Falling back to simple market order (NO PROTECTION)...")
             try:
                 order = self.create_order(symbol, quantity, side)
                 self.submit_order(order)
-                logger.warning(f"⚠️  Simple order submitted (no automatic stops)")
+                logger.warning(f"⚠️  Simple order submitted - position will be UNPROTECTED")
+                logger.warning(f"   stop_loss_manager will add protection on next iteration")
                 return True
             except Exception as e2:
                 logger.error(f"Failed to submit any order: {e2}")
@@ -847,9 +1285,47 @@ class CombinedStrategy(Strategy):
     def on_trading_iteration(self):
         """
         Main trading logic - combines signals from both strategies using meta-learner.
+
+        FIXED (Problem 10): Now includes daily P&L tracking and circuit breaker.
         """
+        # FIXED: Record iteration start for health monitoring
+        try:
+            self.health_monitor.record_iteration()
+            self.memory_profiler.take_snapshot()
+        except Exception as e:
+            logger.debug(f"Health monitoring error: {e}")
+
         logger.info("=" * 80)
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
+        logger.info("=" * 80)
+
+        # FIXED (Problem 10): Update daily P&L and check circuit breaker
+        try:
+            portfolio_value = self.get_portfolio_value_safe()
+            snapshot = self.daily_pnl.update(current_portfolio_value=portfolio_value)
+
+            # Log current daily P&L
+            logger.info(f"📊 Daily P&L: ${snapshot.total_pnl:+,.2f} ({snapshot.pnl_percent:+.2f}%)")
+
+            # Check if trading is allowed (circuit breaker)
+            can_trade, trade_reason = self.daily_pnl.can_trade()
+            if not can_trade:
+                logger.error(f"🚨 TRADING BLOCKED: {trade_reason}")
+                logger.error("Circuit breaker active - skipping all trading logic")
+                return  # Exit early, no trading today
+
+            # Check position size multiplier and store for later use
+            self.current_position_size_multiplier = self.daily_pnl.get_position_size_multiplier()
+            if self.current_position_size_multiplier < 1.0:
+                logger.warning(f"⚠️ Position sizing reduced to {self.current_position_size_multiplier * 100:.0f}% due to daily losses")
+
+        except Exception as e:
+            logger.error(f"Error updating daily P&L: {e}")
+            import traceback
+            traceback.print_exc()
+            # Fallback to full size if error
+            self.current_position_size_multiplier = 1.0
+
         logger.info("=" * 80)
 
         # Check if market is open
@@ -889,8 +1365,8 @@ class CombinedStrategy(Strategy):
                 self._train_meta_model()
 
         # STEP 2: Check market sentiment and hedge if needed
-        cash = self.get_cash()
-        portfolio_value = self.get_portfolio_value()
+        cash = self.get_cash_safe()  # FIXED: Use reliable version (never returns None)
+        portfolio_value = self.get_portfolio_value_safe()  # FIXED: Use reliable version
 
         logger.info(f"Portfolio value: ${portfolio_value:,.2f}")
 
@@ -932,14 +1408,31 @@ class CombinedStrategy(Strategy):
                             # Oversold, consider buying with BRACKET ORDER
                             price = self.get_last_price(symbol)
                             if price and price > 0:
-                                quantity = min(cash * 0.05, 500) / price  # Max $500 or 5% of cash per position
+                                # FIXED (Problem 10): Apply position size multiplier based on daily P&L
+                                base_quantity = min(cash * 0.05, 500) / price  # Max $500 or 5% of cash per position
+                                quantity = base_quantity * self.current_position_size_multiplier
+
+                                if quantity < 1:
+                                    logger.info(f"⏭️  Skipping {symbol}: position size too small after daily loss scaling")
+                                    continue
 
                                 # Use bracket order with automatic stop-loss/take-profit
                                 success = self._create_bracket_order(symbol, quantity, "buy", price)
                                 if success:
-                                    logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
+                                    if self.current_position_size_multiplier < 1.0:
+                                        logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f}) "
+                                                   f"[scaled to {self.current_position_size_multiplier * 100:.0f}%]")
+                                    else:
+                                        logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
                                     logger.info(f"   Server-side stops active: -5% stop-loss, +15% take-profit")
                                     cash -= quantity * price
+
+                                    # Update daily P&L with trade
+                                    try:
+                                        self.daily_pnl.update(portfolio_value, trade_executed=True)
+                                    except (AttributeError, TypeError) as e:
+                                        # FIXED (Problem 14): Specific exceptions, with logging
+                                        logger.warning(f"Failed to update daily P&L: {e}")
 
                         elif rsi > 70 and position is not None:
                             # Overbought - let the bracket order's take-profit handle exit
@@ -947,13 +1440,42 @@ class CombinedStrategy(Strategy):
 
                     except Exception as e:
                         logger.error(f"Error processing {symbol}: {e}")
+                        try:
+                            self.health_monitor.record_error()
+                        except (AttributeError, TypeError) as err:
+                            # FIXED (Problem 14): Specific exceptions, with logging
+                            logger.debug(f"Failed to record error in health monitor: {err}")
                         continue
             else:
                 logger.info("Meta-model not trained - skipping new trades")
         else:
             logger.info("No cash available for new trades")
 
-        logger.info(f"Final portfolio value: ${self.get_portfolio_value():,.2f}")
+        logger.info(f"Final portfolio value: ${self.get_portfolio_value_safe():,.2f}")  # FIXED: Use reliable version
+
+        # FIXED: Health and memory monitoring at end of iteration
+        try:
+            # Check for memory leaks
+            if self.memory_profiler.detect_leaks():
+                logger.warning("Memory leak detected - performing cleanup")
+                self.memory_profiler.cleanup()
+
+            # Periodic health summary (every 6 iterations = ~6 hours)
+            if self.health_monitor.iteration_count % 6 == 0:
+                self.health_monitor.log_health_summary()
+                self.memory_profiler.report()
+
+                # Force garbage collection every 6 hours
+                self.memory_profiler.force_cleanup()
+
+                # FIXED (Problem 10): Log daily P&L summary every 6 hours
+                try:
+                    self.daily_pnl.log_daily_summary()
+                except Exception as e:
+                    logger.debug(f"Daily P&L summary error: {e}")
+
+        except Exception as e:
+            logger.debug(f"Health monitoring error: {e}")
 
         logger.info("=" * 80)
         logger.info("Trading iteration complete")

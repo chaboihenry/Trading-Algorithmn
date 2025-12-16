@@ -200,50 +200,13 @@ class MarketDataClient:
 
 
 # =============================================================================
-# HELPER FUNCTIONS (not part of class)
-# =============================================================================
-
-def get_latest_price(client: MarketDataClient, symbol: str) -> Optional[float]:
-    """
-    Get the latest price for a symbol.
-
-    This is a standalone FUNCTION (not a method in the class).
-    You can call it without creating a MarketDataClient instance.
-
-    Args:
-        client: MarketDataClient instance
-        symbol: Stock ticker
-
-    Returns:
-        Latest price or None
-    """
-    try:
-        from alpaca.data.historical import StockHistoricalDataClient
-        from alpaca.data.requests import StockLatestTradeRequest
-
-        data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
-        request = StockLatestTradeRequest(symbol_or_symbols=symbol)
-        trade = data_client.get_stock_latest_trade(request)
-
-        if symbol in trade:
-            price = float(trade[symbol].price)
-            logger.debug(f"{symbol}: ${price:.2f}")
-            return price
-
-        return None
-
-    except Exception as e:
-        logger.error(f"Error getting price for {symbol}: {e}")
-        return None
-
-
-# =============================================================================
-# MODULE-LEVEL INSTANCE (Singleton pattern)
+# MODULE-LEVEL SINGLETONS (Connection pooling)
 # =============================================================================
 
 # Create one global instance that all code can share
 # This is more efficient than creating multiple connections
 _market_data_client = None
+_stock_data_client = None  # Singleton for historical data client
 
 def get_market_data_client() -> MarketDataClient:
     """
@@ -258,3 +221,61 @@ def get_market_data_client() -> MarketDataClient:
         _market_data_client = MarketDataClient()
 
     return _market_data_client
+
+
+def get_stock_data_client():
+    """
+    Get the global StockHistoricalDataClient instance (creates it if needed).
+
+    CRITICAL FIX: Previously, get_latest_price() created a NEW client on EVERY call,
+    causing massive socket exhaustion. Now we reuse a single client.
+
+    Returns:
+        Singleton StockHistoricalDataClient instance
+    """
+    global _stock_data_client
+
+    if _stock_data_client is None:
+        from alpaca.data.historical import StockHistoricalDataClient
+        _stock_data_client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_API_SECRET)
+        logger.info("✅ Stock data client initialized (singleton)")
+
+    return _stock_data_client
+
+
+# =============================================================================
+# HELPER FUNCTIONS (not part of class)
+# =============================================================================
+
+def get_latest_price(client: MarketDataClient, symbol: str) -> Optional[float]:
+    """
+    Get the latest price for a symbol.
+
+    FIXED: Now uses singleton StockHistoricalDataClient instead of creating
+    a new client on every call (which caused socket exhaustion).
+
+    Args:
+        client: MarketDataClient instance (unused, kept for compatibility)
+        symbol: Stock ticker
+
+    Returns:
+        Latest price or None
+    """
+    try:
+        from alpaca.data.requests import StockLatestTradeRequest
+
+        # FIXED: Use singleton instead of creating new client every time!
+        data_client = get_stock_data_client()
+        request = StockLatestTradeRequest(symbol_or_symbols=symbol)
+        trade = data_client.get_stock_latest_trade(request)
+
+        if symbol in trade:
+            price = float(trade[symbol].price)
+            logger.debug(f"{symbol}: ${price:.2f}")
+            return price
+
+        return None
+
+    except Exception as e:
+        logger.error(f"Error getting price for {symbol}: {e}")
+        return None
