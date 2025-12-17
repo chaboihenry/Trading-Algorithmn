@@ -19,7 +19,7 @@ import logging
 from typing import List, Dict, Optional, Tuple
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
-    GetOrdersRequest, MarketOrderRequest, TakeProfitRequest, StopLossRequest
+    GetOrdersRequest, LimitOrderRequest, TakeProfitRequest, StopLossRequest
 )
 from alpaca.trading.enums import (
     OrderSide, OrderType, TimeInForce, QueryOrderStatus, OrderClass
@@ -205,20 +205,29 @@ class StopLossManager:
             except:
                 market_is_open = False
 
-            # Determine time_in_force based on market status
-            # OCO orders with extended hours need special handling
-            if market_is_open and ENABLE_EXTENDED_HOURS:
+            # CRITICAL FIX: Fractional quantities MUST use DAY time_in_force
+            # Check if quantity has decimals
+            is_fractional = (quantity % 1) != 0
+
+            # Determine time_in_force based on fractional status and market status
+            if is_fractional:
+                # Fractional orders MUST be DAY per Alpaca rules
+                time_in_force = TimeInForce.DAY
+                logger.info(f"   Using DAY time_in_force (fractional quantity: {quantity:.4f})")
+            elif market_is_open and ENABLE_EXTENDED_HOURS:
                 time_in_force = TimeInForce.GTC
             else:
                 time_in_force = TimeInForce.DAY
 
             # Create ONE OCO order with BOTH protective legs
-            # This is the correct way per Alpaca API - single request with take_profit and stop_loss
-            oco_order = MarketOrderRequest(
+            # CRITICAL FIX: OCO orders MUST use LimitOrderRequest, not MarketOrderRequest
+            # Alpaca requires the main leg to be a limit order for OCO orders
+            oco_order = LimitOrderRequest(
                 symbol=symbol,
                 qty=quantity,
                 side=OrderSide.SELL,  # SELL to exit long position
                 time_in_force=time_in_force,
+                limit_price=tp_price,  # REQUIRED for OCO - set to take-profit price
                 order_class=OrderClass.OCO,
                 take_profit=TakeProfitRequest(limit_price=tp_price),  # Take profit leg
                 stop_loss=StopLossRequest(stop_price=stop_price)      # Stop loss leg (uses stop-MARKET)

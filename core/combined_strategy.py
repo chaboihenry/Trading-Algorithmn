@@ -19,9 +19,13 @@ import numpy as np
 import pandas as pd
 import sqlite3
 import joblib
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from functools import wraps
+from http.client import RemoteDisconnected
+import requests.exceptions
 from lumibot.strategies import Strategy
 from sklearn.preprocessing import StandardScaler
 from sklearn.linear_model import LogisticRegression
@@ -37,6 +41,69 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
 # from pairs_strategy import PairsStrategy
 
 logger = logging.getLogger(__name__)
+
+
+# CRITICAL FIX (Problem 4): Retry decorator for connection errors
+# Handles dropped connections with exponential backoff
+def retry_on_connection_error(max_retries=3, initial_delay=5, backoff_factor=2):
+    """
+    Decorator to retry API calls on connection errors with exponential backoff.
+
+    When Alpaca's connection drops (as happened at 17:00), this will automatically
+    retry the operation instead of crashing the bot.
+
+    Args:
+        max_retries: Maximum number of retry attempts (default 3)
+        initial_delay: Initial delay in seconds before first retry (default 5)
+        backoff_factor: Multiplier for delay after each retry (default 2)
+
+    Example:
+        With defaults, retries will happen at:
+        - First retry: after 5 seconds
+        - Second retry: after 10 seconds (5 * 2)
+        - Third retry: after 20 seconds (10 * 2)
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(max_retries + 1):  # +1 for initial attempt
+                try:
+                    return func(*args, **kwargs)
+
+                except (ConnectionError, ConnectionResetError, ConnectionAbortedError,
+                        RemoteDisconnected, requests.exceptions.ConnectionError,
+                        TimeoutError, OSError) as e:
+                    # Catch all connection-related errors:
+                    # - ConnectionError, ConnectionResetError, ConnectionAbortedError
+                    # - RemoteDisconnected (http.client - when remote closes connection)
+                    # - requests.exceptions.ConnectionError (when using requests library)
+                    # - TimeoutError (when connection times out)
+                    # - OSError (low-level network errors)
+                    last_exception = e
+
+                    if attempt < max_retries:
+                        logger.warning(f"🔌 Connection error in {func.__name__}: {e}")
+                        logger.warning(f"   Retrying in {delay} seconds (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(delay)
+                        delay *= backoff_factor  # Exponential backoff
+                    else:
+                        logger.error(f"❌ Max retries ({max_retries}) exceeded for {func.__name__}")
+                        raise
+
+                except Exception as e:
+                    # For non-connection errors, fail immediately
+                    logger.error(f"Non-connection error in {func.__name__}: {e}")
+                    raise
+
+            # Should never reach here, but just in case
+            if last_exception:
+                raise last_exception
+
+        return wrapper
+    return decorator
 
 
 class CombinedStrategy(Strategy):
@@ -952,6 +1019,16 @@ class CombinedStrategy(Strategy):
 
             for position in positions:
                 symbol = position.symbol
+
+                # CRITICAL FIX (Problem 3): Skip cash positions - USD is NOT a tradeable stock!
+                # Alpaca sometimes includes "USD" as a position representing cash balance
+                # Attempting to "sell USD" causes errors
+                # Make check case-insensitive and strip whitespace to be extra safe
+                symbol_clean = symbol.strip().upper()
+                if symbol_clean in ["USD", "USDC", "USDT", "USDP"]:
+                    logger.info(f"⏭️  Skipping cash position: {symbol} (not a tradeable stock)")
+                    continue
+
                 quantity = position.quantity
                 current_price = self.get_last_price(symbol)
 
@@ -973,8 +1050,21 @@ class CombinedStrategy(Strategy):
                         logger.warning(f"⚖️  {symbol} is {position_pct:.1%} of portfolio (limit: {max_position_pct:.0%})")
                         logger.warning(f"   Trimming position: selling {shares_to_sell:.2f} shares")
 
+                        # CRITICAL FIX (Problem 2): Fractional orders must use DAY time_in_force
+                        # Alpaca rejects fractional orders with GTC - they MUST be DAY
+                        is_fractional = (shares_to_sell % 1) != 0  # Check if has decimal
+                        time_in_force = "day" if is_fractional else ("gtc" if self.ENABLE_EXTENDED_HOURS else "day")
+
+                        if is_fractional:
+                            logger.info(f"   Using DAY time_in_force for fractional order ({shares_to_sell:.4f} shares)")
+
                         # Sell the excess shares
-                        order = self.create_order(symbol, shares_to_sell, "sell")
+                        order = self.create_order(
+                            symbol,
+                            shares_to_sell,
+                            "sell",
+                            time_in_force=time_in_force
+                        )
                         self.submit_order(order)
                         rebalanced = True
 
@@ -1079,6 +1169,10 @@ class CombinedStrategy(Strategy):
             logger.info(f"  Take-profit: ${take_profit_price:.2f} (+{self.TAKE_PROFIT_PCT:.1%})")
             logger.info(f"  Stop-loss: ${stop_loss_price:.2f} (-{self.STOP_LOSS_PCT:.1%})")
 
+            # CRITICAL FIX: Fractional quantities MUST use DAY time_in_force
+            # Check if quantity has decimals
+            is_fractional = (quantity % 1) != 0
+
             # Determine time_in_force
             # Check if market is open for extended hours handling
             try:
@@ -1089,7 +1183,12 @@ class CombinedStrategy(Strategy):
                 logger.warning(f"Failed to get market clock status: {e}")
                 market_is_open = False
 
-            if market_is_open and self.ENABLE_EXTENDED_HOURS:
+            # Determine time_in_force based on fractional status
+            if is_fractional:
+                # Fractional orders MUST be DAY per Alpaca rules
+                time_in_force = TimeInForce.DAY
+                logger.info(f"   Using DAY time_in_force (fractional quantity: {quantity:.4f})")
+            elif market_is_open and self.ENABLE_EXTENDED_HOURS:
                 time_in_force = TimeInForce.GTC
             else:
                 time_in_force = TimeInForce.DAY
@@ -1282,11 +1381,13 @@ class CombinedStrategy(Strategy):
         except Exception as e:
             logger.error(f"Error exiting {symbol}: {e}")
 
+    @retry_on_connection_error(max_retries=3, initial_delay=5, backoff_factor=2)
     def on_trading_iteration(self):
         """
         Main trading logic - combines signals from both strategies using meta-learner.
 
         FIXED (Problem 10): Now includes daily P&L tracking and circuit breaker.
+        FIXED (Problem 4): Now protected with retry logic for connection errors.
         """
         # FIXED: Record iteration start for health monitoring
         try:
@@ -1329,8 +1430,10 @@ class CombinedStrategy(Strategy):
         logger.info("=" * 80)
 
         # Check if market is open
+        # CRITICAL FIX (Problem 5): Use alpaca_client.get_clock() instead of self.get_clock()
+        # Lumibot's get_clock() may not be available; use direct Alpaca client
         try:
-            clock = self.get_clock()
+            clock = self.alpaca_client.get_clock()
             if not clock.is_open:
                 logger.info(f"⏰ Market is closed. Next open: {clock.next_open}")
                 logger.info("Skipping trading logic until market opens")
@@ -1386,25 +1489,34 @@ class CombinedStrategy(Strategy):
             # Only trade if we have cash and meta-model is trained
             if self.meta_model is not None:
                 logger.info("Trading signals enabled with meta-model")
-                # Trade only symbols we already have positions in or our core list
-                symbols_to_check = set(self.SYMBOLS[:5])  # Top 5 only to reduce API calls
+                # FIXED: Check more symbols (top 20 instead of just 5) for better opportunities
+                symbols_to_check = set(self.SYMBOLS[:20])  # Increased from 5 to 20
+                logger.info(f"Scanning {len(symbols_to_check)} symbols for opportunities...")
+
+                opportunities_found = 0
 
                 for symbol in symbols_to_check:
                     try:
                         # Simple approach: just use technical indicators from DB
                         volatility, rsi = self._get_market_conditions(symbol)
 
-                        # Simple rules without sentiment/pairs:
-                        # - RSI < 30 = oversold (potential buy)
-                        # - RSI > 70 = overbought (potential sell)
-                        # - High volatility = skip
+                        # Log current conditions for transparency
+                        logger.debug(f"📊 {symbol}: RSI={rsi:.1f}, Volatility={volatility:.1%}")
 
-                        if volatility > 0.4:  # Too volatile, skip
+                        # FIXED: More reasonable RSI thresholds for active trading
+                        # - RSI < 40 = oversold (potential buy) - changed from 30
+                        # - RSI > 60 = overbought (potential sell) - changed from 70
+                        # - High volatility = skip (but raised threshold)
+
+                        if volatility > 0.6:  # Raised from 0.4 - allow more volatile stocks
+                            logger.debug(f"   {symbol}: Too volatile ({volatility:.1%}), skipping")
                             continue
 
                         position = self.get_position(symbol)
 
-                        if rsi < 30 and position is None and cash > 1000:
+                        # FIXED: More lenient RSI threshold (40 instead of 30) and lower cash requirement
+                        if rsi < 40 and position is None and cash > 500:  # Changed from rsi < 30 and cash > 1000
+                            opportunities_found += 1
                             # Oversold, consider buying with BRACKET ORDER
                             price = self.get_last_price(symbol)
                             if price and price > 0:
@@ -1434,9 +1546,10 @@ class CombinedStrategy(Strategy):
                                         # FIXED (Problem 14): Specific exceptions, with logging
                                         logger.warning(f"Failed to update daily P&L: {e}")
 
-                        elif rsi > 70 and position is not None:
+                        elif rsi > 60 and position is not None:  # Changed from 70 to 60
                             # Overbought - let the bracket order's take-profit handle exit
                             logger.info(f"📊 {symbol} overbought (RSI: {rsi:.1f}) - bracket order will auto-exit at +15%")
+                            opportunities_found += 1
 
                     except Exception as e:
                         logger.error(f"Error processing {symbol}: {e}")
@@ -1446,10 +1559,17 @@ class CombinedStrategy(Strategy):
                             # FIXED (Problem 14): Specific exceptions, with logging
                             logger.debug(f"Failed to record error in health monitor: {err}")
                         continue
+
+                # Summary of opportunities found
+                if opportunities_found > 0:
+                    logger.info(f"✅ Found {opportunities_found} trading opportunities")
+                else:
+                    logger.warning(f"⚠️  No trading opportunities found (scanned {len(symbols_to_check)} symbols)")
+                    logger.info(f"   Tip: Current RSI thresholds are <40 (buy) and >60 (sell)")
             else:
                 logger.info("Meta-model not trained - skipping new trades")
         else:
-            logger.info("No cash available for new trades")
+            logger.info(f"No cash available for new trades (cash: ${cash:,.2f if cash else 0})")
 
         logger.info(f"Final portfolio value: ${self.get_portfolio_value_safe():,.2f}")  # FIXED: Use reliable version
 
