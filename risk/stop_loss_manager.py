@@ -63,6 +63,38 @@ class StopLossManager:
             logger.error(f"Error getting take-profit orders: {e}")
             return []
 
+    def _cancel_all_orders_for_symbol(self, symbol: str) -> None:
+        """Cancel all open orders for a symbol to free held shares.
+
+        When Alpaca holds shares for existing orders, you can't create new orders
+        for the same shares. This method cancels ALL orders for a symbol, then waits
+        0.5 seconds for Alpaca to release the shares.
+
+        Args:
+            symbol: Stock ticker to cancel orders for
+        """
+        try:
+            request = GetOrdersRequest(status=QueryOrderStatus.OPEN, limit=100)
+            orders = self.client.get_orders(request)
+
+            symbol_orders = [order for order in orders if order.symbol == symbol]
+
+            if symbol_orders:
+                logger.info(f"Canceling {len(symbol_orders)} existing orders for {symbol}")
+                for order in symbol_orders:
+                    try:
+                        self.client.cancel_order_by_id(order.id)
+                    except Exception as e:
+                        logger.warning(f"Could not cancel order {order.id}: {e}")
+
+                # Wait for Alpaca to release shares
+                import time
+                time.sleep(0.5)
+                logger.debug(f"Shares released for {symbol}")
+
+        except Exception as e:
+            logger.error(f"Error canceling orders for {symbol}: {e}")
+
     def verify_protection(self, positions: List) -> Dict[str, Dict]:
         """Verify which positions have stop-loss and take-profit protection."""
         stop_orders = self._get_stop_orders()
@@ -98,26 +130,32 @@ class StopLossManager:
 
     def create_oco_protection(self, symbol: str, quantity: float,
                               entry_price: float, current_price: float) -> Optional[str]:
-        """Create stop-loss and take-profit protection for a position.
+        """Create stop-loss protection for a position.
 
-        For fractional shares: Creates two separate simple orders (Alpaca limitation).
-        For whole shares: Creates OCO order where one cancels the other.
+        CRITICAL FIX: Alpaca holds shares when orders exist, blocking new orders.
+        Solution: Cancel ALL existing orders first, wait for shares to release.
+
+        For fractional shares: Creates STOP-LOSS ONLY (Alpaca can't handle take-profit on fractional)
+        For whole shares: Creates OCO order (both stop-loss and take-profit)
         """
         try:
+            # STEP 1: Cancel all existing orders to free shares
+            self._cancel_all_orders_for_symbol(symbol)
+
             stop_price = round(entry_price * (1 - STOP_LOSS_PCT), 2)
             tp_price = round(entry_price * (1 + TAKE_PROFIT_PCT), 2)
 
             logger.info(f"Creating protection for {symbol}:")
             logger.info(f"  Quantity: {quantity:.4f} shares")
-            logger.info(f"  Stop: ${stop_price:.2f} | Take-profit: ${tp_price:.2f}")
+            logger.info(f"  Stop-loss: ${stop_price:.2f} ({-STOP_LOSS_PCT:.1%})")
 
             is_fractional = (quantity % 1) != 0
 
             if is_fractional:
-                # Fractional shares require TWO SEPARATE simple orders (Alpaca limitation)
-                logger.info(f"  Fractional quantity - creating separate orders")
+                # Fractional shares: STOP-LOSS ONLY
+                # Alpaca limitation: Can't hold fractional shares with multiple orders
+                logger.info(f"  Fractional quantity - creating stop-loss only")
 
-                # Create stop-loss order
                 stop_order = StopOrderRequest(
                     symbol=symbol,
                     qty=quantity,
@@ -127,21 +165,12 @@ class StopLossManager:
                 )
                 stop_result = self.client.submit_order(order_data=stop_order)
 
-                # Create take-profit order
-                tp_order = LimitOrderRequest(
-                    symbol=symbol,
-                    qty=quantity,
-                    side=OrderSide.SELL,
-                    time_in_force=TimeInForce.DAY,
-                    limit_price=tp_price
-                )
-                tp_result = self.client.submit_order(order_data=tp_order)
-
-                logger.info(f"✅ Protection created (2 orders): Stop ID {stop_result.id}, TP ID {tp_result.id}")
+                logger.info(f"✅ Stop-loss created (ID: {stop_result.id})")
+                logger.info(f"   Note: No take-profit for fractional shares (Alpaca limitation)")
                 return str(stop_result.id)
 
             else:
-                # Whole shares can use OCO order
+                # Whole shares: OCO order (both stop-loss and take-profit)
                 try:
                     clock = self.client.get_clock()
                     market_is_open = clock.is_open
@@ -149,6 +178,8 @@ class StopLossManager:
                     market_is_open = False
 
                 time_in_force = TimeInForce.GTC if (market_is_open and ENABLE_EXTENDED_HOURS) else TimeInForce.DAY
+
+                logger.info(f"  Take-profit: ${tp_price:.2f} (+{TAKE_PROFIT_PCT:.1%})")
 
                 oco_order = LimitOrderRequest(
                     symbol=symbol,
@@ -162,7 +193,7 @@ class StopLossManager:
                 )
 
                 result = self.client.submit_order(order_data=oco_order)
-                logger.info(f"✅ OCO protection created (Order ID: {result.id})")
+                logger.info(f"✅ OCO protection created (ID: {result.id})")
                 return str(result.id)
 
         except Exception as e:
@@ -196,20 +227,7 @@ class StopLossManager:
                 entry_price = float(position.avg_entry_price)
                 current_price = float(position.current_price)
 
-                # Cancel partial protection to avoid conflicts
-                if status['has_stop_loss'] or status['has_take_profit']:
-                    if status['stop_order_id']:
-                        try:
-                            self.client.cancel_order_by_id(status['stop_order_id'])
-                        except Exception as e:
-                            logger.warning(f"Could not cancel stop-loss: {e}")
-
-                    if status['tp_order_id']:
-                        try:
-                            self.client.cancel_order_by_id(status['tp_order_id'])
-                        except Exception as e:
-                            logger.warning(f"Could not cancel take-profit: {e}")
-
+                # create_oco_protection() handles canceling existing orders
                 order_id = self.create_oco_protection(
                     symbol, quantity, entry_price, current_price
                 )

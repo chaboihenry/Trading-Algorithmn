@@ -1242,6 +1242,92 @@ class CombinedStrategy(Strategy):
         except Exception as e:
             logger.error(f"Error exiting {symbol}: {e}")
 
+    def _monthly_liquidation(self) -> None:
+        """Liquidate all positions on the 1st of each month.
+
+        WHY: Realizes all profits and losses, gives a fresh start each month.
+        This is like "taking profits off the table" - you capture gains and
+        avoid holding losing positions indefinitely.
+
+        HOW IT WORKS:
+        1. Get all current positions
+        2. Sell each position at market price (instant execution)
+        3. Skip inverse ETFs (hedge_manager handles those separately)
+        4. Log total proceeds from sales
+
+        OOP CONCEPT: This is a METHOD of CombinedStrategy class.
+        It has access to self.get_positions(), self.create_order(), etc.
+        """
+        try:
+            logger.info("=" * 80)
+            logger.info("📅 MONTHLY LIQUIDATION - 1st of the month")
+            logger.info("=" * 80)
+
+            # Get all current positions (stocks we own)
+            positions = self.get_positions()
+
+            if not positions or len(positions) == 0:
+                logger.info("No positions to liquidate")
+                return
+
+            total_proceeds = 0.0
+            positions_sold = 0
+
+            # Inverse ETFs to skip (hedge_manager handles these)
+            inverse_etfs = ["SH", "SPXS", "SQQQ", "PSQ", "DOG", "DXD", "SDS", "SDOW", "SPXU", "SOXS", "TZA"]
+
+            logger.info(f"Liquidating {len(positions)} positions...")
+
+            for position in positions:
+                try:
+                    symbol = position.symbol
+                    quantity = position.quantity
+
+                    # Skip inverse ETFs (let hedge_manager handle them)
+                    if symbol in inverse_etfs:
+                        logger.info(f"⏭️  Skipping inverse ETF: {symbol} (hedge_manager handles this)")
+                        continue
+
+                    # Get current price
+                    current_price = self.get_last_price(symbol)
+                    if not current_price or current_price <= 0:
+                        logger.warning(f"Could not get price for {symbol}, skipping")
+                        continue
+
+                    # Calculate proceeds (what we'll get from selling)
+                    proceeds = quantity * current_price
+
+                    # Create market sell order (sells immediately at best available price)
+                    order = self.create_order(
+                        symbol,
+                        quantity,
+                        "sell",
+                        type="market"
+                    )
+                    self.submit_order(order)
+
+                    # Log the sale
+                    logger.info(f"💰 SOLD {symbol}: {quantity:.2f} shares @ ${current_price:.2f} = ${proceeds:,.2f}")
+
+                    total_proceeds += proceeds
+                    positions_sold += 1
+
+                except Exception as e:
+                    logger.error(f"Error liquidating {position.symbol}: {e}")
+                    continue
+
+            logger.info("=" * 80)
+            logger.info(f"✅ Monthly liquidation complete:")
+            logger.info(f"   Positions sold: {positions_sold}")
+            logger.info(f"   Total proceeds: ${total_proceeds:,.2f}")
+            logger.info(f"   Fresh start for the new month!")
+            logger.info("=" * 80)
+
+        except Exception as e:
+            logger.error(f"Error during monthly liquidation: {e}")
+            import traceback
+            traceback.print_exc()
+
     @retry_on_connection_error(max_retries=3, initial_delay=5, backoff_factor=2)
     def on_trading_iteration(self):
         """Main trading logic combining signals from both strategies using meta-learner."""
@@ -1254,6 +1340,14 @@ class CombinedStrategy(Strategy):
         logger.info("=" * 80)
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
         logger.info("=" * 80)
+
+        # Check if it's the 1st of the month for monthly liquidation
+        today = datetime.now()
+        if today.day == 1:
+            logger.info("📅 It's the 1st of the month - running monthly liquidation")
+            self._monthly_liquidation()
+            logger.info("✅ Monthly liquidation complete - fresh start for the month")
+            return  # Exit early, let positions reset
 
         try:
             portfolio_value = self.get_portfolio_value_safe()
