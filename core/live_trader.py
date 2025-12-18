@@ -50,11 +50,11 @@ from core.combined_strategy import CombinedStrategy
 # Import connection manager to prevent socket exhaustion
 from utils.connection_manager import get_connection_manager
 
-# Create logs directory if it doesn't exist
-LOGS_DIR = Path(__file__).parent / 'logs'
+# Use root-level logs directory (not core/logs)
+LOGS_DIR = PROJECT_ROOT / 'logs'
 LOGS_DIR.mkdir(exist_ok=True)
 
-# Configure logging to save in logs folder
+# Configure logging to save in root logs folder
 log_file = LOGS_DIR / f'live_trading_{datetime.now().strftime("%Y%m%d")}.log'
 logging.basicConfig(
     level=logging.INFO,

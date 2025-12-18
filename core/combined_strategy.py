@@ -134,7 +134,8 @@ class CombinedStrategy(Strategy):
         self.scaler = StandardScaler()
         self.last_retrain_date = None
 
-        self.models_dir = Path(__file__).parent / 'models'
+        # Use root-level models directory (not core/models)
+        self.models_dir = Path(__file__).parent.parent / 'models'
         self.models_dir.mkdir(exist_ok=True)
 
         model_path = params.get('model_path')
