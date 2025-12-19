@@ -466,6 +466,43 @@ class HedgeManager:
             current_rsi = float(rsi.iloc[-1])
 
             logger.info(f"✅ Real-time RSI for {symbol}: {current_rsi:.1f}")
+
+            # UPDATE DATABASE with fresh RSI to prevent stale data on next check
+            try:
+                from config.settings import DB_PATH
+                today = datetime.now().strftime('%Y-%m-%d')
+
+                with sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+
+                    # Check if record exists for today
+                    cursor.execute(
+                        "SELECT COUNT(*) FROM technical_indicators WHERE symbol_ticker = ? AND indicator_date = ?",
+                        (symbol, today)
+                    )
+                    exists = cursor.fetchone()[0] > 0
+
+                    if exists:
+                        # Update existing record
+                        cursor.execute(
+                            "UPDATE technical_indicators SET rsi_14 = ? WHERE symbol_ticker = ? AND indicator_date = ?",
+                            (current_rsi, symbol, today)
+                        )
+                        logger.debug(f"Updated RSI in database for {symbol}")
+                    else:
+                        # Insert new record with just RSI (other indicators NULL)
+                        cursor.execute(
+                            "INSERT INTO technical_indicators (symbol_ticker, indicator_date, rsi_14) VALUES (?, ?, ?)",
+                            (symbol, today, current_rsi)
+                        )
+                        logger.debug(f"Inserted fresh RSI in database for {symbol}")
+
+                    conn.commit()
+
+            except Exception as db_error:
+                logger.warning(f"Could not update database with fresh RSI for {symbol}: {db_error}")
+                # Don't fail - we still have the RSI value to return
+
             return current_rsi
 
         except Exception as e:
