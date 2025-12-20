@@ -798,7 +798,10 @@ class CombinedStrategy(Strategy):
 
     def _get_market_conditions(self, symbol: str) -> Tuple[float, float]:
         """
-        Fetch current market conditions.
+        Fetch current market conditions with real-time RSI fallback.
+
+        FIXED: Now checks data staleness and calculates real-time RSI when DB is stale (>1 day old).
+        This prevents trading on outdated data.
 
         Args:
             symbol: Stock symbol
@@ -810,7 +813,7 @@ class CombinedStrategy(Strategy):
             # FIXED: Use context manager to prevent connection leaks
             with sqlite3.connect(self.db_path) as conn:
                 query = """
-                SELECT vm.close_to_close_vol_20d as volatility_20d, ti.rsi_14
+                SELECT vm.close_to_close_vol_20d as volatility_20d, ti.rsi_14, ti.indicator_date
                 FROM volatility_metrics vm
                 LEFT JOIN technical_indicators ti
                     ON vm.symbol_ticker = ti.symbol_ticker
@@ -823,16 +826,93 @@ class CombinedStrategy(Strategy):
                 result = pd.read_sql(query, conn, params=(symbol,))
                 # Connection automatically closed when exiting 'with' block
 
-                if not result.empty:
-                    volatility = result['volatility_20d'].iloc[0]
+                if not result.empty and result['rsi_14'].iloc[0] is not None:
+                    volatility = result['volatility_20d'].iloc[0] if result['volatility_20d'].iloc[0] is not None else 0.2
                     rsi = result['rsi_14'].iloc[0]
-                    return volatility, rsi
+                    indicator_date_str = result['indicator_date'].iloc[0]
+
+                    # FIXED: Check data freshness
+                    try:
+                        indicator_date = datetime.strptime(indicator_date_str, '%Y-%m-%d')
+                        now = datetime.now()
+                        data_age_hours = (now - indicator_date).total_seconds() / 3600
+
+                        # If data is more than 24 hours old, calculate real-time RSI
+                        if data_age_hours > 24:
+                            logger.warning(f"⚠️ {symbol} RSI data is {data_age_hours/24:.1f} days old - calculating real-time")
+
+                            # Use hedge_manager's real-time RSI calculation
+                            from risk.hedge_manager import HedgeManager
+                            hedge_mgr = HedgeManager()
+                            fresh_rsi = hedge_mgr._calculate_rsi_realtime(symbol)
+
+                            if fresh_rsi is not None:
+                                rsi = fresh_rsi
+                                logger.info(f"✅ Using fresh RSI for {symbol}: {rsi:.1f}")
+                            else:
+                                logger.warning(f"Failed to calculate real-time RSI for {symbol}, using stale data")
+
+                        return volatility, rsi
+
+                    except ValueError:
+                        # Date parsing failed, return what we have
+                        return volatility, rsi
                 else:
+                    # No data in DB - try real-time calculation
+                    logger.warning(f"No RSI data for {symbol} - calculating real-time")
+                    try:
+                        from risk.hedge_manager import HedgeManager
+                        hedge_mgr = HedgeManager()
+                        fresh_rsi = hedge_mgr._calculate_rsi_realtime(symbol)
+                        if fresh_rsi is not None:
+                            return 0.2, fresh_rsi
+                    except Exception as e:
+                        logger.error(f"Failed to calculate real-time RSI: {e}")
+
                     return 0.2, 50  # Defaults
 
         except Exception as e:
             logger.warning(f"Error fetching market conditions: {e}")
             return 0.2, 50
+
+    def _get_enhanced_technicals(self, symbol: str) -> Dict[str, float]:
+        """
+        Fetch enhanced technical indicators for better entry/exit signals.
+
+        Returns:
+            Dict with keys: macd, macd_signal, bb_upper, bb_lower, bb_middle, adx_14, current_price
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                query = """
+                SELECT macd, macd_signal, macd_histogram,
+                       bb_upper, bb_lower, bb_middle, adx_14,
+                       sma_20, sma_50
+                FROM technical_indicators
+                WHERE symbol_ticker = ?
+                ORDER BY indicator_date DESC
+                LIMIT 1
+                """
+                result = pd.read_sql(query, conn, params=(symbol,))
+
+                if not result.empty:
+                    return {
+                        'macd': result['macd'].iloc[0] if result['macd'].iloc[0] is not None else 0.0,
+                        'macd_signal': result['macd_signal'].iloc[0] if result['macd_signal'].iloc[0] is not None else 0.0,
+                        'macd_histogram': result['macd_histogram'].iloc[0] if result['macd_histogram'].iloc[0] is not None else 0.0,
+                        'bb_upper': result['bb_upper'].iloc[0] if result['bb_upper'].iloc[0] is not None else None,
+                        'bb_lower': result['bb_lower'].iloc[0] if result['bb_lower'].iloc[0] is not None else None,
+                        'bb_middle': result['bb_middle'].iloc[0] if result['bb_middle'].iloc[0] is not None else None,
+                        'adx_14': result['adx_14'].iloc[0] if result['adx_14'].iloc[0] is not None else 0.0,
+                        'sma_20': result['sma_20'].iloc[0] if result['sma_20'].iloc[0] is not None else None,
+                        'sma_50': result['sma_50'].iloc[0] if result['sma_50'].iloc[0] is not None else None
+                    }
+                else:
+                    return {}
+
+        except Exception as e:
+            logger.debug(f"Error fetching enhanced technicals for {symbol}: {e}")
+            return {}
 
     def _get_combined_signal(self, symbol: str) -> Tuple[int, float]:
         """
@@ -1421,41 +1501,83 @@ class CombinedStrategy(Strategy):
                 for symbol in symbols_to_check:
                     try:
                         volatility, rsi = self._get_market_conditions(symbol)
+                        technicals = self._get_enhanced_technicals(symbol)
                         logger.debug(f"📊 {symbol}: RSI={rsi:.1f}, Vol={volatility:.1%}")
 
-                        if volatility > 0.6:
-                            logger.debug(f"   {symbol}: Too volatile, skipping")
+                        # FIXED: Relaxed volatility threshold (was 0.6, now 0.8)
+                        if volatility > 0.8:
+                            logger.debug(f"   {symbol}: Extremely volatile, skipping")
                             continue
 
                         position = self.get_position(symbol)
+                        price = self.get_last_price(symbol)
 
-                        if rsi < 40 and position is None and cash > 500:
+                        if not price or price <= 0:
+                            continue
+
+                        # MULTI-CONDITION ENTRY LOGIC (FIXED: Much more flexible than RSI < 40)
+                        should_buy = False
+                        entry_reason = ""
+
+                        if position is None and cash > 500:
+                            # CONDITION 1: RSI oversold (relaxed from 40 to 50)
+                            if rsi < 50:
+                                should_buy = True
+                                entry_reason = f"RSI oversold ({rsi:.1f})"
+
+                            # CONDITION 2: MACD bullish crossover
+                            elif technicals and technicals.get('macd') and technicals.get('macd_signal'):
+                                macd = technicals['macd']
+                                macd_signal = technicals['macd_signal']
+                                macd_hist = technicals.get('macd_histogram', 0)
+
+                                # Bullish: MACD above signal AND histogram positive
+                                if macd > macd_signal and macd_hist > 0:
+                                    should_buy = True
+                                    entry_reason = f"MACD bullish crossover (hist: {macd_hist:.2f})"
+
+                            # CONDITION 3: Price near lower Bollinger Band (bounce play)
+                            elif technicals and technicals.get('bb_lower') is not None:
+                                bb_lower = technicals['bb_lower']
+                                bb_middle = technicals.get('bb_middle')
+
+                                # Buy if price is within 2% of lower band
+                                if price <= bb_lower * 1.02:
+                                    should_buy = True
+                                    entry_reason = f"Near lower BB (${price:.2f} vs ${bb_lower:.2f})"
+
+                            # CONDITION 4: Price above SMA50 but RSI not overbought (trend following)
+                            elif technicals and technicals.get('sma_50') is not None and rsi < 65:
+                                sma_50 = technicals['sma_50']
+                                if price > sma_50 and rsi >= 45:
+                                    should_buy = True
+                                    entry_reason = f"Trend following (price above SMA50, RSI {rsi:.1f})"
+
+                        if should_buy:
                             opportunities_found += 1
-                            price = self.get_last_price(symbol)
-                            if price and price > 0:
-                                base_quantity = min(cash * 0.05, 500) / price
-                                quantity = base_quantity * self.current_position_size_multiplier
+                            base_quantity = min(cash * 0.05, 500) / price
+                            quantity = base_quantity * self.current_position_size_multiplier
 
-                                if quantity < 1:
-                                    logger.info(f"⏭️  Skipping {symbol}: position size too small")
-                                    continue
+                            if quantity < 1:
+                                logger.info(f"⏭️  Skipping {symbol}: position size too small")
+                                continue
 
-                                success = self._create_bracket_order(symbol, quantity, "buy", price)
-                                if success:
-                                    if self.current_position_size_multiplier < 1.0:
-                                        logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f}) "
-                                                   f"[scaled {self.current_position_size_multiplier * 100:.0f}%]")
-                                    else:
-                                        logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} (RSI: {rsi:.1f})")
-                                    cash -= quantity * price
+                            success = self._create_bracket_order(symbol, quantity, "buy", price)
+                            if success:
+                                if self.current_position_size_multiplier < 1.0:
+                                    logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} | {entry_reason} "
+                                               f"[scaled {self.current_position_size_multiplier * 100:.0f}%]")
+                                else:
+                                    logger.info(f"📈 BUY {symbol}: {quantity:.2f} shares @ ${price:.2f} | {entry_reason}")
+                                cash -= quantity * price
 
-                                    try:
-                                        self.daily_pnl.update(portfolio_value, trade_executed=True)
-                                    except (AttributeError, TypeError) as e:
-                                        logger.warning(f"Failed to update daily P&L: {e}")
+                                try:
+                                    self.daily_pnl.update(portfolio_value, trade_executed=True)
+                                except (AttributeError, TypeError) as e:
+                                    logger.warning(f"Failed to update daily P&L: {e}")
 
-                        elif rsi > 60 and position is not None:
-                            logger.info(f"📊 {symbol} overbought (RSI: {rsi:.1f})")
+                        elif rsi > 70 and position is not None:
+                            logger.info(f"📊 {symbol} overbought (RSI: {rsi:.1f}) - consider selling")
                             opportunities_found += 1
 
                     except Exception as e:
@@ -1470,7 +1592,8 @@ class CombinedStrategy(Strategy):
                     logger.info(f"✅ Found {opportunities_found} trading opportunities")
                 else:
                     logger.warning(f"⚠️  No opportunities (scanned {len(symbols_to_check)} symbols)")
-                    logger.info(f"   RSI thresholds: <40 (buy) >60 (sell)")
+                    logger.info(f"   Entry conditions: RSI<50 OR MACD bullish OR near BB lower OR trend following")
+                    logger.info(f"   Exit: RSI>70 (overbought)")
             else:
                 logger.info("Meta-model not trained - skipping new trades")
         else:
