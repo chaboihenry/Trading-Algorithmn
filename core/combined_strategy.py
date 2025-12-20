@@ -114,12 +114,14 @@ class CombinedStrategy(Strategy):
         self.NEWS_LOOKBACK_DAYS = SENTIMENT_LOOKBACK_DAYS
         self.SYMBOLS = TRADING_SYMBOLS
 
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
-        import torch
-        self.tokenizer = AutoTokenizer.from_pretrained("ProsusAI/finbert")
-        self.sentiment_model = AutoModelForSequenceClassification.from_pretrained("ProsusAI/finbert")
-        self.sentiment_model.eval()
-        self.torch = torch
+        # CRITICAL FIX: Lazy loading for FinBERT sentiment model
+        # Loading FinBERT can take 30-60 seconds and blocks Ctrl+C
+        # Model will be loaded on first use instead of during initialization
+        self.tokenizer = None
+        self.sentiment_model = None
+        self.torch = None
+        self._sentiment_model_loaded = False
+        logger.info("⚡ Lazy loading enabled for FinBERT sentiment model")
 
         self.LOOKBACK_DAYS = PAIRS_LOOKBACK_DAYS
         self.ZSCORE_ENTRY = PAIRS_ZSCORE_ENTRY
@@ -133,16 +135,13 @@ class CombinedStrategy(Strategy):
         self.models_dir = Path(__file__).parent.parent / 'models'
         self.models_dir.mkdir(exist_ok=True)
 
-        model_path = params.get('model_path')
-        if model_path:
-            self._load_meta_model(model_path)
-        else:
-            # Try to load latest model
-            self._load_latest_meta_model()
-
-        # If no model or retrain requested, train new model
-        if self.meta_model is None or self.retrain:
-            self._train_meta_model()
+        # CRITICAL FIX: Lazy loading to avoid TensorFlow blocking during initialization
+        # TensorFlow import can take 2-5 minutes and blocks Ctrl+C signals
+        # Model will be loaded/trained on first use instead of during initialization
+        self._model_ready = False
+        self._model_load_attempted = False
+        logger.info("⚡ Lazy loading enabled - model will load on first use")
+        logger.info("   This prevents TensorFlow from blocking startup (avoids 2-5 min delay)")
 
         # Initialize direct Alpaca Trading Client for bracket orders
         # This bypasses Lumibot and gives us direct access to Alpaca's bracket order API
@@ -567,6 +566,57 @@ class CombinedStrategy(Strategy):
 
         return np.array(all_features).reshape(1, -1)
 
+    def _ensure_model_ready(self) -> bool:
+        """
+        Ensure Keras MLP model is loaded and ready (lazy loading).
+
+        CRITICAL FIX: This method defers TensorFlow import until first use.
+        - Called before any prediction that needs the model
+        - Only runs once (tracked by _model_load_attempted flag)
+        - Loads existing model or trains new one if needed
+        - Returns True if model is ready, False if loading/training failed
+
+        Returns:
+            bool: True if model is ready, False otherwise
+        """
+        # Already attempted to load/train model
+        if self._model_load_attempted:
+            return self._model_ready
+
+        # Mark that we've attempted to load the model
+        self._model_load_attempted = True
+
+        logger.info("=" * 80)
+        logger.info("LAZY LOADING: Initializing Keras MLP model on first use")
+        logger.info("=" * 80)
+        logger.info("⚡ TensorFlow will now initialize (this may take 1-2 minutes on first run)")
+
+        try:
+            # Try to load existing model first
+            self._load_latest_meta_model()
+
+            # If no model loaded and retrain is requested, train new model
+            if self.meta_model is None or self.retrain:
+                logger.info("No existing model found - training new Keras MLP...")
+                self._train_meta_model()
+
+            # Check if model is ready
+            if self.meta_model is not None:
+                self._model_ready = True
+                logger.info("✅ Keras MLP model ready for predictions")
+                return True
+            else:
+                logger.warning("⚠️  Model loading/training failed - predictions will be disabled")
+                self._model_ready = False
+                return False
+
+        except Exception as e:
+            logger.error(f"Error in lazy model loading: {e}")
+            import traceback
+            traceback.print_exc()
+            self._model_ready = False
+            return False
+
     def _train_meta_model(self):
         """
         Train the Keras MLP meta-learner on comprehensive features from database.
@@ -930,6 +980,10 @@ class CombinedStrategy(Strategy):
         Returns:
             Tuple of (signal, confidence) where signal is -1/0/1 and confidence is 0-1
         """
+        # CRITICAL FIX: Ensure model is loaded before use (lazy loading)
+        # This is where TensorFlow will be imported on first prediction
+        self._ensure_model_ready()
+
         # Get sentiment signal
         try:
             sentiment_prob, sentiment_signal = self.sentiment_strategy.get_news_sentiment(symbol)
@@ -1444,6 +1498,10 @@ class CombinedStrategy(Strategy):
         logger.info("=" * 80)
         logger.info(f"COMBINED STRATEGY - Trading Iteration at {datetime.now()}")
         logger.info("=" * 80)
+
+        # CRITICAL FIX: Ensure model is loaded on first trading iteration (lazy loading)
+        # This ensures TensorFlow doesn't block during bot initialization
+        self._ensure_model_ready()
 
         # Check if it's the 1st of the month for monthly liquidation
         today = datetime.now()

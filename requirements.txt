@@ -1,0 +1,28 @@
+# Core Trading Dependencies
+alpaca-py>=0.9.0
+lumibot>=2.8.0
+yfinance>=0.2.0
+pandas>=2.0.0
+numpy>=1.24.0
+scikit-learn>=1.3.0
+requests>=2.31.0
+
+# Sentiment Analysis (FinBERT)
+transformers>=4.30.0
+torch>=2.0.0
+
+# Machine Learning (Keras MLP)
+tensorflow>=2.15.0
+
+# Technical Indicators
+ta-lib>=0.4.0  # Optional: requires binary installation
+
+# Visualization (optional)
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Logging
+coloredlogs>=15.0
