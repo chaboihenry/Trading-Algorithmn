@@ -129,10 +129,10 @@ class KerasMLP:
 
         # Callbacks
         callbacks = [
-            # Early stopping: stop if validation loss doesn't improve for 50 epochs
+            # Early stopping: stop if validation loss doesn't improve for 10 epochs
             EarlyStopping(
                 monitor='val_loss',
-                patience=50,
+                patience=10,
                 restore_best_weights=True,
                 verbose=1
             ),

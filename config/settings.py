@@ -128,7 +128,7 @@ MAX_INVERSE_ALLOCATION = 0.20  # Max 20% of portfolio in inverse positions
 SLEEP_INTERVAL = CURRENT_ENV_CONFIG['sleep_interval']
 RETRAIN_FREQUENCY_DAYS = 7  # Retrain meta-model weekly
 CONFIDENCE_THRESHOLD = CURRENT_ENV_CONFIG['confidence_threshold']
-MIN_TRAINING_SAMPLES = 100  # Minimum samples to train meta-model
+MIN_TRAINING_SAMPLES = 1500  # Minimum samples to train neural network meta-model
 
 # Market hours (environment-specific)
 ENABLE_EXTENDED_HOURS = CURRENT_ENV_CONFIG['enable_extended_hours']
@@ -397,10 +397,10 @@ def validate_config() -> bool:
         )
 
     # 7. Training samples
-    if MIN_TRAINING_SAMPLES < 50:
+    if MIN_TRAINING_SAMPLES < 1000:
         errors.append(
             f"MIN_TRAINING_SAMPLES ({MIN_TRAINING_SAMPLES}) too low! "
-            "Need at least 50 samples for reliable training."
+            "Need at least 1000 samples for reliable neural network training."
         )
 
     # 8. Pairs parameters

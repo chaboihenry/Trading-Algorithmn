@@ -178,6 +178,11 @@ class CombinedStrategy(Strategy):
         self.current_position_size_multiplier = 1.0  # Default to full size
         logger.info("✅ Daily P&L tracker and circuit breaker initialized")
 
+        # CRITICAL FIX: Initialize Lumibot internal attributes to prevent AttributeError on Ctrl+C
+        # These are used by Lumibot's _dump_stats() method during shutdown
+        self._backtesting_start = None
+        self._backtesting_end = None
+
         logger.info("Combined Strategy initialized with meta-learner")
         logger.info(f"Meta-model active: {self.meta_model is not None}")
 
@@ -254,6 +259,8 @@ class CombinedStrategy(Strategy):
         with sqlite3.connect(self.db_path) as conn:
             # Get historical signals and returns
             # This query assumes you have a trading_signals table with signal history
+            # EXPANDED DATA COLLECTION: Increased from 365 to 730 days (2 years) to get 2000+ samples
+            # Added more technical indicators: ADX, Bollinger Band width, MACD histogram, Stochastic, OBV, ATR
             query = """
             SELECT
                 ts.signal_date,
@@ -265,7 +272,17 @@ class CombinedStrategy(Strategy):
                 p2.close as exit_price_5d,
                 (p2.close - p.close) / p.close as return_5d,
                 vm.close_to_close_vol_20d as volatility_20d,
-                ti.rsi_14
+                ti.rsi_14,
+                ti.adx_14,
+                ti.bb_width,
+                ti.macd_histogram,
+                ti.stochastic_k,
+                ti.stochastic_d,
+                ti.obv,
+                ti.atr_14,
+                ti.macd,
+                ti.macd_signal,
+                ti.bb_percent
             FROM trading_signals ts
             LEFT JOIN raw_price_data p
                 ON ts.symbol_ticker = p.symbol_ticker
@@ -279,7 +296,7 @@ class CombinedStrategy(Strategy):
             LEFT JOIN technical_indicators ti
                 ON ts.symbol_ticker = ti.symbol_ticker
                 AND ts.signal_date = ti.indicator_date
-            WHERE ts.signal_date >= date('now', '-365 days')
+            WHERE ts.signal_date >= date('now', '-730 days')
               AND ts.metadata IS NOT NULL
             ORDER BY ts.signal_date
             """
@@ -676,7 +693,22 @@ class CombinedStrategy(Strategy):
                 if symbol not in features_df.index:
                     continue
 
-                feature_rows.append(features_df.loc[symbol].values)
+                # EXPANDED FEATURES: Add original features plus lagged technical indicators from historical data
+                current_features = features_df.loc[symbol].values
+
+                # Add lagged features (t-1 values) from historical data row
+                # These provide temporal context about recent changes
+                lagged_features = []
+                for col in ['rsi_14', 'adx_14', 'macd_histogram', 'volatility_20d', 'obv', 'stochastic_k']:
+                    val = row.get(col)
+                    if val is not None and not pd.isna(val):
+                        lagged_features.append(float(val))
+                    else:
+                        lagged_features.append(0.0)
+
+                # Combine current features with lagged features
+                combined_features = np.concatenate([current_features, lagged_features])
+                feature_rows.append(combined_features)
 
                 # Create label based on signal type and profitability
                 signal_type = row['signal_type']
