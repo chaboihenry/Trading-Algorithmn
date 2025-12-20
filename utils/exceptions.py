@@ -140,8 +140,8 @@ class StrategyError(TradingException):
     Example:
         raise StrategyError(
             "Meta-model prediction failed",
-            model_type="LogisticRegression",
-            feature_count=26,
+            model_type="KerasMLP",
+            feature_count=40,
             error=str(original_error)
         )
     """
