@@ -176,6 +176,10 @@ def test_full_strategy():
                 'close': 400 + np.random.randn(500).cumsum(),
                 'volume': np.random.randint(50000000, 100000000, 500)
             }, index=dates)
+        else:
+            # Handle MultiIndex columns from yfinance
+            if isinstance(spy.columns, pd.MultiIndex):
+                spy.columns = spy.columns.get_level_values(0)
 
         # Lowercase column names
         spy.columns = spy.columns.str.lower()

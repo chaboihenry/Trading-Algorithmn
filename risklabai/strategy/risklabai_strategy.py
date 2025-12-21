@@ -238,7 +238,10 @@ class RiskLabAIStrategy:
         )
 
         # Use purged CV for validation
-        cv = self.cv.get_cv(labels[['t1']])
+        # Create samples_info DataFrame with 't0' (start) and 't1' (end) times
+        samples_info = pd.DataFrame(index=labels.index)
+        samples_info['t1'] = labels['End Time']  # Use End Time from triple-barrier labels
+        cv = self.cv.get_cv(samples_info)
 
         scores = cross_val_score(
             self.primary_model,

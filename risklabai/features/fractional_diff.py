@@ -29,7 +29,7 @@ class FractionalDifferentiator:
         threshold: Weight cutoff threshold
     """
 
-    def __init__(self, d: Optional[float] = None, threshold: float = 1e-5):
+    def __init__(self, d: Optional[float] = None, threshold: float = 0.01):
         """
         Initialize fractional differentiator.
 
@@ -65,12 +65,22 @@ class FractionalDifferentiator:
         try:
             # Convert to DataFrame (RiskLabAI expects DataFrame)
             df = pd.DataFrame(series)
-            
-            self._optimal_d = find_optimal_ffd_simple(
-                series=df,
-                threshold=self.threshold,
-                max_d=max_d
+
+            result_df = find_optimal_ffd_simple(
+                input_series=df,
+                p_value_threshold=p_value
             )
+
+            # Extract the optimal d value from the result
+            # find_optimal_ffd_simple returns a DataFrame with the optimal d column
+            if 'd_value' in result_df.columns:
+                self._optimal_d = result_df['d_value'].iloc[0]
+            elif 'Optimal d' in result_df.columns:
+                self._optimal_d = result_df['Optimal d'].iloc[0]
+            else:
+                # If we can't find the d value, use default
+                self._optimal_d = 0.4
+                logger.warning(f"Could not extract d value, using default {self._optimal_d}")
 
             logger.info(f"Optimal d found: {self._optimal_d:.3f}")
             return self._optimal_d

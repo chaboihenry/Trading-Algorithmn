@@ -114,16 +114,16 @@ class TripleBarrierLabeler:
             events = pd.DataFrame(index=close.index)
             # Calculate vertical barrier (timeout)
             events['t1'] = vertical_barrier(
-                timestamps=close.index,
                 close=close,
-                num_days=self.max_holding_period
+                time_events=close.index,
+                number_days=self.max_holding_period
             )
         elif 't1' not in events.columns:
             # Add vertical barrier if not present
             events['t1'] = vertical_barrier(
-                timestamps=events.index,
                 close=close,
-                num_days=self.max_holding_period
+                time_events=events.index,
+                number_days=self.max_holding_period
             )
 
         # Prepare target (volatility-based barriers)
@@ -134,10 +134,11 @@ class TripleBarrierLabeler:
         events = events.loc[target.index]
 
         # Create events DataFrame with required columns for triple_barrier
+        # RiskLabAI expects specific column names: 'End Time', 'Base Width', 'Side'
         events_for_labeling = pd.DataFrame(index=events.index)
-        events_for_labeling['t1'] = events['t1']
-        events_for_labeling['trgt'] = target
-        events_for_labeling['side'] = side if side is not None else pd.Series(1, index=events.index)
+        events_for_labeling['End Time'] = events['t1']
+        events_for_labeling['Base Width'] = target
+        events_for_labeling['Side'] = side if side is not None else pd.Series(1, index=events.index)
 
         logger.debug(f"Processing {len(events_for_labeling)} events")
 
@@ -145,7 +146,7 @@ class TripleBarrierLabeler:
             # Apply triple-barrier labeling
             # ptsl = [profit_taking, stop_loss] as multiples of target
             ptsl = [self.profit_taking_mult, self.stop_loss_mult]
-            
+
             # molecule is list of timestamps to process
             molecule = list(events_for_labeling.index)
 
@@ -155,6 +156,35 @@ class TripleBarrierLabeler:
                 ptsl=ptsl,
                 molecule=molecule
             )
+
+            # Add 'bin' and 'ret' columns based on which barrier was hit
+            # bin: -1 (stop loss), 0 (vertical/timeout), 1 (profit taking)
+            # ret: actual return at barrier touch
+
+            labels['ret'] = 0.0
+            labels['bin'] = 0
+
+            for idx in labels.index:
+                # Get start and end prices
+                start_price = close.loc[idx]
+                end_time = labels.loc[idx, 'End Time']
+
+                if pd.notna(end_time) and end_time in close.index:
+                    end_price = close.loc[end_time]
+                    ret = (end_price / start_price) - 1
+                    labels.loc[idx, 'ret'] = ret
+
+                    # Determine which barrier was hit
+                    threshold = target.loc[idx] if idx in target.index else 0
+                    if threshold > 0:
+                        profit_barrier = self.profit_taking_mult * threshold
+                        loss_barrier = -self.stop_loss_mult * threshold
+
+                        if ret >= profit_barrier:
+                            labels.loc[idx, 'bin'] = 1  # Profit taking
+                        elif ret <= loss_barrier:
+                            labels.loc[idx, 'bin'] = -1  # Stop loss
+                        # else: bin = 0 (vertical barrier / timeout)
 
             logger.info(f"Generated {len(labels)} labels")
             if 'bin' in labels.columns:

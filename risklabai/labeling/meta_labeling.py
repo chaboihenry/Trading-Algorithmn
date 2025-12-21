@@ -62,6 +62,10 @@ class MetaLabeler:
             # Use RiskLabAI's meta_labeling function
             meta_labels = meta_labeling(events=events, close=close)
 
+            # RiskLabAI returns 'Label' column, rename to 'bin' for consistency
+            if 'Label' in meta_labels.columns:
+                meta_labels['bin'] = meta_labels['Label']
+
             logger.info(f"Meta-labels created: {len(meta_labels)}")
 
             # Log distribution
