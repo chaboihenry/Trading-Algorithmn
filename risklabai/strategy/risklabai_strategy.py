@@ -210,8 +210,8 @@ class RiskLabAIStrategy:
 
         # Step 3: Create triple-barrier labels
         logger.info("Step 3: Creating triple-barrier labels...")
+        # Create event DataFrame (vertical barrier will be added by labeler)
         event_df = pd.DataFrame(index=events)
-        event_df['t1'] = events + pd.Timedelta(days=self.labeler.max_holding_period)
 
         labels = self.labeler.label(
             close=bars['close'],
@@ -219,7 +219,8 @@ class RiskLabAIStrategy:
         )
 
         # Align labels with features
-        labels = labels.loc[features.index]
+        labels = labels.loc[labels.index.isin(features.index)]
+        features = features.loc[features.index.isin(labels.index)]
 
         logger.info(f"  Label distribution: {labels['bin'].value_counts().to_dict()}")
 
@@ -269,40 +270,44 @@ class RiskLabAIStrategy:
 
         # Step 6: Train meta model (bet sizing)
         logger.info("Step 6: Training meta model...")
-        primary_predictions = pd.Series(
-            self.primary_model.predict(X),
-            index=X.index
-        )
 
+        # Create meta-labels from triple barrier results
         meta_labels = self.meta_labeler.create_meta_labels(
-            labels,
-            primary_predictions
+            events=labels,  # Triple barrier output
+            close=bars['close']
         )
 
-        self.meta_model = RandomForestClassifier(
-            n_estimators=50,
-            max_depth=3,
-            min_samples_leaf=20,
-            n_jobs=-1,
-            random_state=42
-        )
+        # Align meta labels with features
+        meta_labels = meta_labels.loc[meta_labels.index.isin(X.index)]
+        X_meta = X.loc[X.index.isin(meta_labels.index)]
 
-        y_meta = meta_labels['bin']
+        if len(meta_labels) < min_samples // 2:
+            logger.warning(f"Insufficient meta-labels ({len(meta_labels)}), skipping meta model")
+            self.meta_model = None
+            meta_scores_mean = 0.0
+        else:
+            self.meta_model = RandomForestClassifier(
+                n_estimators=50,
+                max_depth=3,
+                min_samples_leaf=20,
+                n_jobs=-1,
+                random_state=42
+            )
 
-        # Align features and meta labels
-        X_meta = X.loc[y_meta.index]
+            y_meta = meta_labels['bin']
 
-        self.meta_model.fit(X_meta, y_meta)
+            self.meta_model.fit(X_meta, y_meta)
 
-        meta_scores = cross_val_score(
-            self.meta_model,
-            X_meta,
-            y_meta,
-            cv=cv,
-            scoring='accuracy',
-            n_jobs=1
-        )
-        logger.info(f"  Meta model CV accuracy: {meta_scores.mean():.3f} ± {meta_scores.std():.3f}")
+            meta_scores = cross_val_score(
+                self.meta_model,
+                X_meta,
+                y_meta,
+                cv=cv,
+                scoring='accuracy',
+                n_jobs=1
+            )
+            meta_scores_mean = meta_scores.mean()
+            logger.info(f"  Meta model CV accuracy: {meta_scores_mean:.3f} ± {meta_scores.std():.3f}")
 
         logger.info("=" * 60)
         logger.info("TRAINING COMPLETE")
@@ -312,7 +317,7 @@ class RiskLabAIStrategy:
             'success': True,
             'n_samples': len(features),
             'primary_accuracy': scores.mean(),
-            'meta_accuracy': meta_scores.mean(),
+            'meta_accuracy': meta_scores_mean,
             'top_features': self.important_features
         }
 
@@ -331,8 +336,8 @@ class RiskLabAIStrategy:
             - signal: +1 (long), -1 (short), 0 (no trade)
             - bet_size: 0 to 1 (sizing based on confidence)
         """
-        if self.primary_model is None or self.meta_model is None:
-            logger.warning("Models not trained!")
+        if self.primary_model is None:
+            logger.warning("Primary model not trained!")
             return 0, 0.0
 
         # Create features from latest data
@@ -348,17 +353,22 @@ class RiskLabAIStrategy:
         direction = self.primary_model.predict(X)[0]
 
         # Meta model: should we trade? (probability)
-        trade_prob = self.meta_model.predict_proba(X)[0, 1]
+        if self.meta_model is not None:
+            trade_prob = self.meta_model.predict_proba(X)[0, 1]
 
-        # Convert probability to bet size
-        if trade_prob < 0.5:
-            # Don't trade if meta model says no
-            return 0, 0.0
+            # Convert probability to bet size
+            if trade_prob < 0.5:
+                # Don't trade if meta model says no
+                return 0, 0.0
+            else:
+                # Bet size proportional to confidence
+                bet_size = min(trade_prob, 1.0)
+                logger.debug(f"Signal: {direction}, Bet size: {bet_size:.3f}")
+                return int(direction), float(bet_size)
         else:
-            # Bet size proportional to confidence
-            bet_size = min(trade_prob, 1.0)
-            logger.debug(f"Signal: {direction}, Bet size: {bet_size:.3f}")
-            return int(direction), float(bet_size)
+            # No meta model - use fixed bet size
+            logger.debug(f"Signal: {direction}, Bet size: 0.5 (no meta model)")
+            return int(direction), 0.5
 
     def optimize_portfolio(
         self,
