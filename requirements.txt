@@ -1,28 +1,48 @@
-# Core Trading Dependencies
-alpaca-py>=0.9.0
+# Core Trading Framework
 lumibot>=2.8.0
-yfinance>=0.2.0
+
+# Broker Integration
+alpaca-py>=0.9.0
+alpaca-trade-api>=3.0.0
+
+# Data Processing
 pandas>=2.0.0
 numpy>=1.24.0
+scipy>=1.10.0
+
+# Machine Learning
 scikit-learn>=1.3.0
-requests>=2.31.0
+xgboost>=2.0.0
+tensorflow>=2.15.0
+statsmodels>=0.14.0
 
 # Sentiment Analysis (FinBERT)
 transformers>=4.30.0
 torch>=2.0.0
 
-# Machine Learning (Keras MLP)
-tensorflow>=2.15.0
+# Market Data
+yfinance>=0.2.28
 
-# Technical Indicators
-ta-lib>=0.4.0  # Optional: requires binary installation
+# RiskLabAI and Dependencies
+RiskLabAI>=1.0.7
+memory-profiler>=0.61.0
+sympy>=1.12
+numba>=0.58.0
+ta>=0.11.0
 
-# Visualization (optional)
+# Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
-# Configuration
+# Utilities
 python-dotenv>=1.0.0
-
-# Logging
+joblib>=1.3.0
+requests>=2.31.0
 coloredlogs>=15.0
+
+# Technical Indicators (Optional: requires binary installation)
+# ta-lib>=0.4.0
+
+# Optional: For better performance on M1 Macs
+# tensorflow-macos>=2.13.0
+# tensorflow-metal>=1.0.0
