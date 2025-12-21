@@ -105,6 +105,14 @@ class RiskLabAICombined(Strategy):
         logger.info(f"Trading iteration: {datetime.now()}")
         logger.info("-" * 60)
 
+        # Step 0: Check if market is open
+        try:
+            if not self._is_market_open():
+                logger.info("Market is currently closed. Skipping trading iteration.")
+                return
+        except Exception as e:
+            logger.warning(f"Could not check market status: {e}. Continuing anyway...")
+
         # Step 1: Check if we need to retrain (weekly)
         if self._should_retrain():
             logger.info("Retraining models...")
@@ -121,6 +129,35 @@ class RiskLabAICombined(Strategy):
             except Exception as e:
                 logger.error(f"Error processing {symbol}: {e}")
                 continue
+
+    def _is_market_open(self) -> bool:
+        """
+        Check if the market is currently open.
+
+        Returns:
+            bool: True if market is open, False otherwise
+        """
+        try:
+            # Use Lumibot's built-in method if available
+            if hasattr(self, 'get_datetime'):
+                current_time = self.get_datetime()
+            else:
+                current_time = datetime.now()
+
+            # Check if it's a weekday (Monday=0, Sunday=6)
+            if current_time.weekday() >= 5:  # Saturday or Sunday
+                return False
+
+            # Check market hours (9:30 AM - 4:00 PM ET)
+            market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
+            market_close = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
+
+            return market_open <= current_time <= market_close
+
+        except Exception as e:
+            logger.warning(f"Error checking market hours: {e}")
+            # If we can't determine market status, assume it's open to avoid blocking trades
+            return True
 
     def _should_retrain(self) -> bool:
         """Check if models need retraining."""
