@@ -2,31 +2,18 @@
 RiskLabAI Data Structures Module
 
 Implements alternative bar types that sample based on market activity
-rather than clock time. These have better statistical properties
-(closer to normal distribution, less serial correlation).
+rather than clock time. Uses the actual RiskLabAI library API.
 
-Types:
-- Dollar Bars: Sample every $X traded
-- Volume Bars: Sample every X shares traded
-- Tick Bars: Sample every X trades
-- Imbalance Bars: Sample when buy/sell imbalance exceeds threshold
-- Run Bars: Sample when run of buys/sells is unusually long
+Bar Types:
+- Standard Bars: Dollar, volume, tick bars
+- Imbalance Bars: Fixed imbalance bars
+- Run Bars: Fixed run bars
 """
 
-from RiskLabAI.data import (
-    dollar_bars,
-    volume_bars,
-    tick_bars,
-    tick_imbalance_bars,
-    volume_imbalance_bars,
-    dollar_imbalance_bars,
-    tick_run_bars,
-    volume_run_bars,
-    dollar_run_bars
-)
+from RiskLabAI.data.structures import StandardBars, FixedImbalanceBars, FixedRunBars
 import pandas as pd
 import numpy as np
-from typing import Literal, Optional
+from typing import Literal, Optional, List, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -34,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 class BarGenerator:
     """
-    Generates information-driven bars from tick/trade data.
+    Generates information-driven bars from tick/trade data using RiskLabAI.
 
     Why this matters:
     - Time bars oversample during quiet periods, undersample during volatile periods
@@ -52,22 +39,40 @@ class BarGenerator:
             'dollar', 'volume', 'tick',
             'dollar_imbalance', 'volume_imbalance', 'tick_imbalance',
             'dollar_run', 'volume_run', 'tick_run'
-        ] = 'dollar_imbalance',
-        threshold: Optional[float] = None
+        ] = 'dollar',
+        threshold: float = 50000
     ):
         """
         Initialize bar generator.
 
         Args:
             bar_type: Which bar type to generate
-            threshold: Sampling threshold. If None, auto-calculated.
-                - For dollar bars: dollars per bar (e.g., 1_000_000)
-                - For volume bars: shares per bar (e.g., 10_000)
+            threshold: Sampling threshold
+                - For dollar bars: dollars per bar (e.g., 50,000)
+                - For volume bars: shares per bar (e.g., 10,000)
                 - For tick bars: trades per bar (e.g., 100)
-                - For imbalance/run bars: auto-calculated from expected imbalance
         """
         self.bar_type = bar_type
         self.threshold = threshold
+
+        # Map bar type to RiskLabAI class and type string
+        self.bar_class_map = {
+            'dollar': (StandardBars, 'dollar_bars'),
+            'volume': (StandardBars, 'volume_bars'),
+            'tick': (StandardBars, 'tick_bars'),
+            'dollar_imbalance': (FixedImbalanceBars, 'dollar_imbalance'),
+            'volume_imbalance': (FixedImbalanceBars, 'volume_imbalance'),
+            'tick_imbalance': (FixedImbalanceBars, 'tick_imbalance'),
+            'dollar_run': (FixedRunBars, 'dollar_run'),
+            'volume_run': (FixedRunBars, 'volume_run'),
+            'tick_run': (FixedRunBars, 'tick_run'),
+        }
+
+        if bar_type not in self.bar_class_map:
+            raise ValueError(f"Invalid bar_type: {bar_type}")
+
+        bar_class, bar_type_str = self.bar_class_map[bar_type]
+        self.bar_generator = bar_class(bar_type=bar_type_str, threshold=threshold)
 
         logger.info(f"BarGenerator initialized: type={bar_type}, threshold={threshold}")
 
@@ -76,44 +81,56 @@ class BarGenerator:
         Convert tick data to information-driven bars.
 
         Args:
-            tick_data: DataFrame with columns [datetime, price, volume]
-                      Index should be datetime
+            tick_data: DataFrame with columns [date_time, price, volume]
+                      Expected format from RiskLabAI: List of tuples/arrays
 
         Returns:
-            DataFrame with OHLCV bars based on information sampling
+            DataFrame with OHLCV bars
         """
         logger.info(f"Generating {self.bar_type} bars from {len(tick_data)} ticks")
 
-        # Validate input data
         if tick_data.empty:
             logger.warning("Empty tick data provided")
             return pd.DataFrame()
 
-        # Map bar type to RiskLabAI function
-        bar_functions = {
-            'dollar': dollar_bars,
-            'volume': volume_bars,
-            'tick': tick_bars,
-            'dollar_imbalance': dollar_imbalance_bars,
-            'volume_imbalance': volume_imbalance_bars,
-            'tick_imbalance': tick_imbalance_bars,
-            'dollar_run': dollar_run_bars,
-            'volume_run': volume_run_bars,
-            'tick_run': tick_run_bars,
-        }
-
-        bar_func = bar_functions[self.bar_type]
-
-        # Generate bars
         try:
-            if self.threshold is not None:
-                bars = bar_func(tick_data, threshold=self.threshold)
-            else:
-                # Auto-calculate threshold if not provided
-                bars = bar_func(tick_data)
+            # Convert DataFrame to list of tuples format expected by RiskLabAI
+            # Expected: [(date_time, price, volume), ...]
+            if isinstance(tick_data, pd.DataFrame):
+                # Ensure we have the required columns
+                required_cols = ['date_time', 'price', 'volume']
+                if not all(col in tick_data.columns for col in required_cols):
+                    # Try alternative column names
+                    if 'close' in tick_data.columns:
+                        tick_data = tick_data.rename(columns={'close': 'price'})
+                    if 'timestamp' in tick_data.columns:
+                        tick_data = tick_data.rename(columns={'timestamp': 'date_time'})
 
-            logger.info(f"Generated {len(bars)} bars")
-            return bars
+                # Convert to list of tuples
+                data_list = tick_data[['date_time', 'price', 'volume']].values.tolist()
+            else:
+                data_list = tick_data
+
+            # Generate bars using RiskLabAI
+            bars_list = self.bar_generator.construct_bars_from_data(data_list)
+
+            # Convert to DataFrame
+            if len(bars_list) == 0:
+                logger.warning("No bars generated")
+                return pd.DataFrame()
+
+            # RiskLabAI returns: [date_time, open, high, low, close, volume, cum_buy_volume, cum_ticks, cum_dollar_value]
+            bars_df = pd.DataFrame(bars_list, columns=[
+                'date_time', 'open', 'high', 'low', 'close', 'volume',
+                'cum_buy_volume', 'cum_ticks', 'cum_dollar_value'
+            ])
+
+            # Set index
+            bars_df['date_time'] = pd.to_datetime(bars_df['date_time'])
+            bars_df.set_index('date_time', inplace=True)
+
+            logger.info(f"Generated {len(bars_df)} bars")
+            return bars_df
 
         except Exception as e:
             logger.error(f"Error generating bars: {e}")
@@ -134,15 +151,15 @@ class BarGenerator:
         Returns:
             Estimated threshold value
         """
-        if 'dollar_value' in tick_data.columns:
-            total_value = tick_data['dollar_value'].sum()
-        elif 'price' in tick_data.columns and 'volume' in tick_data.columns:
+        if 'price' in tick_data.columns and 'volume' in tick_data.columns:
             total_value = (tick_data['price'] * tick_data['volume']).sum()
+        elif 'cum_dollar_value' in tick_data.columns:
+            total_value = tick_data['cum_dollar_value'].iloc[-1]
         else:
             raise ValueError("Cannot estimate threshold: missing price/volume data")
 
         # Assume data is from one trading day
         estimated_threshold = total_value / target_bars_per_day
 
-        logger.info(f"Estimated threshold: ${estimated_threshold:,.0f}")
+        logger.info(f"Estimated threshold: {estimated_threshold:,.0f}")
         return estimated_threshold

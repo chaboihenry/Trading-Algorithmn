@@ -2,27 +2,24 @@
 Triple-Barrier Method for Labeling
 
 Instead of labeling based on fixed-time returns (which ignores volatility),
-the triple-barrier method sets dynamic barriers:
+the triple-barrier method sets dynamic barriers using RiskLabAI's implementation.
+
+Barriers:
 - Upper barrier (take-profit): Triggered when price rises X%
 - Lower barrier (stop-loss): Triggered when price falls Y%
 - Vertical barrier (timeout): Triggered after T periods
 
 Labels: +1 (hit upper), -1 (hit lower), 0 (hit vertical/timeout)
-
-This creates labels that match how real traders actually operate.
 """
 
-from RiskLabAI.labeling import (
-    get_events,
-    get_bins,
-    drop_labels,
-    get_vertical_barrier,
-    get_3_barriers,
-    get_daily_vol
+from RiskLabAI.data.labeling import (
+    triple_barrier,
+    vertical_barrier,
+    daily_volatility_with_log_returns
 )
 import pandas as pd
 import numpy as np
-from typing import Optional
+from typing import Optional, List
 import logging
 
 logger = logging.getLogger(__name__)
@@ -30,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 class TripleBarrierLabeler:
     """
-    Labels price data using the triple-barrier method.
+    Labels price data using the triple-barrier method via RiskLabAI.
 
     The beauty of this approach:
     1. Barriers adapt to volatility (wider in volatile periods)
@@ -70,7 +67,7 @@ class TripleBarrierLabeler:
 
     def get_daily_volatility(self, close: pd.Series, span: Optional[int] = None) -> pd.Series:
         """
-        Calculate daily volatility using exponentially weighted std dev.
+        Calculate daily volatility using RiskLabAI's method.
 
         Args:
             close: Series of closing prices
@@ -82,8 +79,7 @@ class TripleBarrierLabeler:
         if span is None:
             span = self.volatility_lookback
 
-        # Use RiskLabAI's get_daily_vol function
-        vol = get_daily_vol(close=close, span=span)
+        vol = daily_volatility_with_log_returns(close, span=span)
 
         logger.debug(f"Volatility calculated: mean={vol.mean():.4f}, std={vol.std():.4f}")
         return vol
@@ -105,11 +101,7 @@ class TripleBarrierLabeler:
                  When provided, enables meta-labeling
 
         Returns:
-            DataFrame with columns:
-            - t1: Time when first barrier was touched
-            - ret: Return at barrier touch
-            - trgt: Target (volatility at event time)
-            - bin: Label (-1, 0, +1)
+            DataFrame with triple-barrier labels
         """
         logger.info(f"Labeling {len(close)} price points")
 
@@ -118,51 +110,55 @@ class TripleBarrierLabeler:
 
         # If no events provided, use all timestamps
         if events is None:
-            logger.debug("No events provided, using all timestamps")
+            logger.debug("No events provided, using all timestamps as events")
             events = pd.DataFrame(index=close.index)
-            events['t1'] = get_vertical_barrier(
-                close.index,
-                close,
+            # Calculate vertical barrier (timeout)
+            events['t1'] = vertical_barrier(
+                timestamps=close.index,
+                close=close,
                 num_days=self.max_holding_period
             )
         elif 't1' not in events.columns:
             # Add vertical barrier if not present
-            events['t1'] = get_vertical_barrier(
-                events.index,
-                close,
+            events['t1'] = vertical_barrier(
+                timestamps=events.index,
+                close=close,
                 num_days=self.max_holding_period
             )
 
-        # Prepare target (volatility)
+        # Prepare target (volatility-based barriers)
         target = daily_vol.reindex(events.index)
         target = target[target > 0]  # Remove zero volatility periods
 
         # Align events with target
         events = events.loc[target.index]
 
-        logger.debug(f"Processing {len(events)} events")
+        # Create events DataFrame with required columns for triple_barrier
+        events_for_labeling = pd.DataFrame(index=events.index)
+        events_for_labeling['t1'] = events['t1']
+        events_for_labeling['trgt'] = target
+        events_for_labeling['side'] = side if side is not None else pd.Series(1, index=events.index)
+
+        logger.debug(f"Processing {len(events_for_labeling)} events")
 
         try:
-            # Get triple barrier events
-            barriers = get_3_barriers(
+            # Apply triple-barrier labeling
+            # ptsl = [profit_taking, stop_loss] as multiples of target
+            ptsl = [self.profit_taking_mult, self.stop_loss_mult]
+            
+            # molecule is list of timestamps to process
+            molecule = list(events_for_labeling.index)
+
+            labels = triple_barrier(
                 close=close,
-                events=events,
-                pt_sl=[self.profit_taking_mult, self.stop_loss_mult],
-                target=target,
-                min_ret=0.01,  # Minimum return threshold
-                num_threads=1,
-                vertical_barrier_times=events['t1'],
-                side=side
+                events=events_for_labeling,
+                ptsl=ptsl,
+                molecule=molecule
             )
 
-            # Get binary labels
-            labels = get_bins(barriers, close)
-
-            # Drop rare labels if severely imbalanced
-            labels = drop_labels(labels, min_pct=0.05)
-
             logger.info(f"Generated {len(labels)} labels")
-            logger.info(f"Label distribution: {labels['bin'].value_counts().to_dict()}")
+            if 'bin' in labels.columns:
+                logger.info(f"Label distribution: {labels['bin'].value_counts().to_dict()}")
 
             return labels
 
@@ -182,10 +178,10 @@ class TripleBarrierLabeler:
         """
         stats = {
             'total_labels': len(labels),
-            'label_counts': labels['bin'].value_counts().to_dict(),
-            'label_percentages': (labels['bin'].value_counts(normalize=True) * 100).to_dict(),
-            'mean_return': labels['ret'].mean(),
-            'std_return': labels['ret'].std(),
+            'label_counts': labels['bin'].value_counts().to_dict() if 'bin' in labels.columns else {},
+            'label_percentages': (labels['bin'].value_counts(normalize=True) * 100).to_dict() if 'bin' in labels.columns else {},
+            'mean_return': labels['ret'].mean() if 'ret' in labels.columns else None,
+            'std_return': labels['ret'].std() if 'ret' in labels.columns else None,
             'mean_target': labels['trgt'].mean() if 'trgt' in labels.columns else None
         }
 

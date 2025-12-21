@@ -1,18 +1,14 @@
 """
 Meta-Labeling for Bet Sizing
 
-Once you have a primary model predicting direction (buy/sell),
-meta-labeling builds a SECONDARY model that predicts:
-"Should I actually take this trade, and if so, how much?"
+Uses RiskLabAI's meta-labeling implementation to create labels for bet sizing.
 
-This separates the problem into:
-1. Direction model: Long or short? (your primary strategy)
+Separates:
+1. Direction model: Long or short? (primary strategy)
 2. Size model: What's the probability this bet will succeed?
-
-The size model's output probability becomes the bet size.
 """
 
-from RiskLabAI.labeling import meta_labeling
+from RiskLabAI.data.labeling import meta_labeling
 import pandas as pd
 import numpy as np
 from typing import Optional
@@ -23,16 +19,12 @@ logger = logging.getLogger(__name__)
 
 class MetaLabeler:
     """
-    Creates meta-labels for bet sizing.
+    Creates meta-labels for bet sizing using RiskLabAI.
 
     The genius of meta-labeling:
     - Primary model determines SIDE (long/short)
     - Meta-labeling determines SIZE (how much to bet)
     - Size = probability of primary model being correct
-
-    This reduces overfitting because:
-    - Primary model doesn't need to learn everything
-    - Meta-model specializes in filtering false positives
 
     Attributes:
         primary_model: Model that predicts trade direction
@@ -50,34 +42,25 @@ class MetaLabeler:
 
     def create_meta_labels(
         self,
-        triple_barrier_events: pd.DataFrame,
-        primary_predictions: pd.Series
+        events: pd.DataFrame,
+        close: pd.Series
     ) -> pd.DataFrame:
         """
         Create meta-labels from triple-barrier events.
 
         Args:
-            triple_barrier_events: Output from TripleBarrierLabeler.label()
-                                  Must have 'bin' column with labels
-            primary_predictions: +1/-1 predictions from primary model
-                                Aligned with triple_barrier_events index
+            events: Output from TripleBarrierLabeler.label()
+                   Must have barrier touch information
+            close: Closing price series
 
         Returns:
-            DataFrame with meta-labels:
-            - 1: Primary model prediction was profitable
-            - 0: Primary model prediction was unprofitable
+            DataFrame with meta-labels
         """
-        logger.info(f"Creating meta-labels for {len(triple_barrier_events)} events")
+        logger.info(f"Creating meta-labels for {len(events)} events")
 
-        # Align predictions with events
-        predictions_aligned = primary_predictions.reindex(triple_barrier_events.index)
-
-        # Create meta-labels using RiskLabAI
         try:
-            meta_labels = meta_labeling(
-                events=triple_barrier_events,
-                side=predictions_aligned
-            )
+            # Use RiskLabAI's meta_labeling function
+            meta_labels = meta_labeling(events=events, close=close)
 
             logger.info(f"Meta-labels created: {len(meta_labels)}")
 
@@ -111,97 +94,18 @@ class MetaLabeler:
         Returns:
             Series of bet sizes (0 to scale_factor)
         """
-        # Get probability of class 1 (profitable trade)
         try:
             probabilities = meta_model.predict_proba(features)[:, 1]
         except AttributeError:
-            # Model doesn't support predict_proba
-            logger.warning("Model doesn't support predict_proba, using predictions as probabilities")
+            logger.warning("Model doesn't support predict_proba, using predictions")
             probabilities = meta_model.predict(features)
 
-        # Convert to Series
         bet_sizes = pd.Series(probabilities, index=features.index)
-
-        # Clip low probabilities to 0
         bet_sizes[bet_sizes < min_probability] = 0
-
-        # Scale bet sizes
         bet_sizes = bet_sizes * scale_factor
-
-        # Ensure within [0, scale_factor]
         bet_sizes = bet_sizes.clip(0, scale_factor)
 
         logger.debug(f"Bet sizes: mean={bet_sizes.mean():.3f}, "
                     f"non-zero={(bet_sizes > 0).sum()}/{len(bet_sizes)}")
 
         return bet_sizes
-
-    def evaluate_meta_model(
-        self,
-        meta_model,
-        X_test: pd.DataFrame,
-        y_test: pd.Series
-    ) -> dict:
-        """
-        Evaluate meta-model performance.
-
-        Args:
-            meta_model: Trained meta-model
-            X_test: Test features
-            y_test: Test labels
-
-        Returns:
-            Dictionary with evaluation metrics
-        """
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-
-        predictions = meta_model.predict(X_test)
-        probabilities = meta_model.predict_proba(X_test)[:, 1] if hasattr(meta_model, 'predict_proba') else predictions
-
-        metrics = {
-            'accuracy': accuracy_score(y_test, predictions),
-            'precision': precision_score(y_test, predictions, zero_division=0),
-            'recall': recall_score(y_test, predictions, zero_division=0),
-            'f1': f1_score(y_test, predictions, zero_division=0),
-            'mean_probability': probabilities.mean(),
-            'std_probability': probabilities.std()
-        }
-
-        logger.info(f"Meta-model evaluation: {metrics}")
-        return metrics
-
-    def adaptive_bet_sizing(
-        self,
-        probabilities: pd.Series,
-        strategy: str = 'linear'
-    ) -> pd.Series:
-        """
-        Apply adaptive bet sizing strategy.
-
-        Args:
-            probabilities: Model probabilities
-            strategy: Sizing strategy:
-                     - 'linear': Direct probability
-                     - 'quadratic': Square of probability (more aggressive)
-                     - 'kelly': Kelly criterion approximation
-
-        Returns:
-            Series of bet sizes
-        """
-        if strategy == 'linear':
-            return probabilities
-
-        elif strategy == 'quadratic':
-            # More aggressive: square the probability
-            return probabilities ** 2
-
-        elif strategy == 'kelly':
-            # Kelly criterion: f = (p * b - q) / b
-            # Simplified for binary outcomes where b = 1
-            # f = 2p - 1 (only bet when p > 0.5)
-            kelly_sizes = 2 * probabilities - 1
-            kelly_sizes = kelly_sizes.clip(lower=0)
-            return kelly_sizes
-
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
