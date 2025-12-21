@@ -1,25 +1,26 @@
 """
-Lumibot Trading Strategies Package
+RiskLabAI Trading System Package
 
-This package contains three trading strategies implemented using the Lumibot framework:
+This package contains the state-of-the-art RiskLabAI trading strategy implementing
+cutting-edge financial machine learning techniques from Marcos López de Prado:
 
-1. SentimentStrategy - News sentiment analysis using FinBERT
-2. PairsStrategy - Statistical arbitrage with cointegrated pairs
-3. CombinedStrategy - Meta-learner ensemble combining both strategies
+- Information-driven data structures (dollar bars, volume bars, imbalance bars)
+- Triple-barrier labeling with volatility-adaptive targets
+- Meta-labeling for bet sizing
+- Fractional differentiation for stationary features
+- CUSUM event filtering
+- Purged K-fold cross-validation
+- Hierarchical Risk Parity (HRP) portfolio optimization
 
 Usage:
-    from lumibot_strategies import SentimentStrategy, PairsStrategy, CombinedStrategy
+    from core import RiskLabAICombined
 
-    # For backtesting
-    from lumibot_strategies.run_backtest import BacktestRunner
-
-    # For live trading
-    from lumibot_strategies.live_trader import LiveTrader
+    # For live/paper trading
+    strategy = RiskLabAICombined(broker=broker, parameters={'symbols': ['SPY', 'QQQ']})
+    strategy.run_all()
 """
 
-from .sentiment_strategy import SentimentStrategy
-from .pairs_strategy import PairsStrategy
-from .combined_strategy import CombinedStrategy
+from .risklabai_combined import RiskLabAICombined
 
-__all__ = ['SentimentStrategy', 'PairsStrategy', 'CombinedStrategy']
-__version__ = '1.0.0'
+__all__ = ['RiskLabAICombined']
+__version__ = '2.0.0'  # RiskLabAI-powered
