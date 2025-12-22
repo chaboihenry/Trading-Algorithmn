@@ -240,7 +240,21 @@ class RiskLabAIStrategy:
         # Use purged CV for validation
         # Create samples_info DataFrame with 't0' (start) and 't1' (end) times
         samples_info = pd.DataFrame(index=labels.index)
-        samples_info['t1'] = labels['End Time']  # Use End Time from triple-barrier labels
+        samples_info['t1'] = pd.to_datetime(labels['End Time'])
+
+        # CRITICAL FIX: Ensure timezone consistency for cross-validation
+        # The purged K-fold can't handle mixed tz-aware and tz-naive timestamps
+        if samples_info.index.tz is not None:
+            # Index has timezone - make sure t1 also has it
+            if samples_info['t1'].dt.tz is None:
+                samples_info['t1'] = samples_info['t1'].dt.tz_localize(samples_info.index.tz)
+            elif samples_info['t1'].dt.tz != samples_info.index.tz:
+                # Different timezones - convert t1 to match index
+                samples_info['t1'] = samples_info['t1'].dt.tz_convert(samples_info.index.tz)
+        elif samples_info['t1'].dt.tz is not None:
+            # t1 has timezone but index doesn't - remove timezone from t1
+            samples_info['t1'] = samples_info['t1'].dt.tz_localize(None)
+
         cv = self.cv.get_cv(samples_info)
 
         scores = cross_val_score(

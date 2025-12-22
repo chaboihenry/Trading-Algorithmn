@@ -67,7 +67,10 @@ class TripleBarrierLabeler:
 
     def get_daily_volatility(self, close: pd.Series, span: Optional[int] = None) -> pd.Series:
         """
-        Calculate daily volatility using RiskLabAI's method.
+        Calculate daily volatility using exponentially weighted standard deviation.
+
+        This is a robust alternative to RiskLabAI's daily_volatility_with_log_returns
+        that handles various data formats better.
 
         Args:
             close: Series of closing prices
@@ -79,7 +82,17 @@ class TripleBarrierLabeler:
         if span is None:
             span = self.volatility_lookback
 
-        vol = daily_volatility_with_log_returns(close, span=span)
+        # Calculate log returns
+        returns = np.log(close / close.shift(1)).dropna()
+
+        # Calculate exponentially weighted volatility
+        vol = returns.ewm(span=span).std()
+
+        # Reindex to match close series (fill forward for missing values)
+        vol = vol.reindex(close.index).ffill()
+
+        # Fill any remaining NaNs at the beginning with the first valid value
+        vol = vol.bfill()
 
         logger.debug(f"Volatility calculated: mean={vol.mean():.4f}, std={vol.std():.4f}")
         return vol
@@ -105,21 +118,27 @@ class TripleBarrierLabeler:
         """
         logger.info(f"Labeling {len(close)} price points")
 
-        # Get daily volatility
-        daily_vol = self.get_daily_volatility(close)
-
         # If no events provided, use all timestamps
         if events is None:
             logger.debug("No events provided, using all timestamps as events")
             events = pd.DataFrame(index=close.index)
-            # Calculate vertical barrier (timeout)
-            events['t1'] = vertical_barrier(
-                close=close,
-                time_events=close.index,
-                number_days=self.max_holding_period
-            )
-        elif 't1' not in events.columns:
-            # Add vertical barrier if not present
+        else:
+            # CRITICAL FIX: Ensure event timestamps exist in close index
+            # RiskLabAI's daily_volatility function expects events to be a subset of close
+            valid_times = events.index.intersection(close.index)
+            if len(valid_times) < len(events):
+                logger.warning(f"Filtering events: {len(events)} -> {len(valid_times)} (matching close index)")
+            events = events.loc[valid_times]
+
+            if len(events) == 0:
+                logger.error("No valid event timestamps found in close index!")
+                return pd.DataFrame()
+
+        # Get daily volatility (now that events match close index)
+        daily_vol = self.get_daily_volatility(close)
+
+        # Add vertical barrier if not present
+        if 't1' not in events.columns:
             events['t1'] = vertical_barrier(
                 close=close,
                 time_events=events.index,
