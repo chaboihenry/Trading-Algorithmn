@@ -16,7 +16,7 @@ from typing import Optional, Dict, List
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass
-from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
+from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
 
 logger = logging.getLogger(__name__)
 

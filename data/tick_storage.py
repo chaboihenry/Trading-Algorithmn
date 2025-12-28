@@ -1,0 +1,476 @@
+"""
+Tick Data Storage Module
+
+This module handles all database operations for tick data persistence.
+Think of it as the "warehouse manager" - it knows how to store ticks,
+retrieve them, and keep track of what's been collected.
+
+OOP Concepts Used:
+1. Class: TickStorage encapsulates all database operations
+2. Methods: Functions that belong to the class and operate on its data
+3. Context Manager (with statement): Ensures database connections are properly closed
+4. Type Hints: Documents what type of data each parameter expects
+
+Why use a class here?
+- Encapsulation: All database logic in one place
+- State management: Keeps track of database path
+- Reusability: Create multiple instances for different databases if needed
+- Clean interface: Users don't need to know SQL, just call methods
+"""
+
+import sqlite3
+import logging
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class TickStorage:
+    """
+    Manages tick data persistence in SQLite database.
+
+    This class is like a librarian for your tick data - it knows how to:
+    - Save new ticks to the database (save_ticks)
+    - Find and load old ticks (load_ticks)
+    - Track what's already stored (get_backfill_status, update_backfill_status)
+    - Count how many ticks you have (get_tick_count)
+
+    The class uses a "lazy connection" pattern - it doesn't connect to the
+    database until you actually need it. This saves resources.
+
+    Attributes:
+        db_path (str): Path to the SQLite database file
+        _connection (Optional[sqlite3.Connection]): Database connection (created on demand)
+
+    Example usage:
+        >>> storage = TickStorage("/Volumes/Vault/trading_data/tick-data-storage.db")
+        >>> ticks = [
+        ...     {'symbol': 'SPY', 'timestamp': '2024-01-01 09:30:00', 'price': 450.0, 'size': 100},
+        ...     {'symbol': 'SPY', 'timestamp': '2024-01-01 09:30:01', 'price': 450.1, 'size': 50}
+        ... ]
+        >>> storage.save_ticks('SPY', ticks)
+        >>> loaded = storage.load_ticks('SPY', start='2024-01-01', end='2024-01-02')
+    """
+
+    def __init__(self, db_path: str):
+        """
+        Initialize the tick storage with database path.
+
+        Args:
+            db_path: Full path to SQLite database file
+                     Example: "/Volumes/Vault/trading_data/tick-data-storage.db"
+
+        Note:
+            This doesn't open a database connection yet. The connection
+            is created "lazily" when you first need it (in _get_connection).
+        """
+        self.db_path = db_path
+        self._connection = None  # Lazy connection - created when needed
+
+        # Verify database exists
+        if not Path(db_path).exists():
+            raise FileNotFoundError(
+                f"Database not found at {db_path}. "
+                f"Run scripts/init_tick_tables.py first to create it."
+            )
+
+        logger.debug(f"TickStorage initialized for: {db_path}")
+
+    def _get_connection(self) -> sqlite3.Connection:
+        """
+        Get or create database connection (lazy loading pattern).
+
+        This method creates a database connection the first time it's called,
+        then reuses that same connection for all future calls. This is more
+        efficient than creating a new connection for every operation.
+
+        Returns:
+            sqlite3.Connection: Active database connection
+
+        OOP Pattern: This is a "getter" method that ensures the connection
+        exists before returning it. It's private (starts with _) because
+        users of this class don't need to call it directly.
+        """
+        if self._connection is None:
+            self._connection = sqlite3.connect(self.db_path)
+            # Set row factory to return rows as dictionaries (easier to work with)
+            self._connection.row_factory = sqlite3.Row
+
+        return self._connection
+
+    def save_ticks(self, symbol: str, ticks: List[Dict]) -> int:
+        """
+        Save multiple ticks to database in one efficient batch operation.
+
+        Uses executemany() which is much faster than inserting one tick at a time.
+        For example, saving 10,000 ticks:
+        - Individual inserts: ~10 seconds
+        - Batch insert: ~0.1 seconds (100x faster!)
+
+        Args:
+            symbol: Stock ticker like "SPY", "QQQ", "IWM"
+            ticks: List of tick dictionaries, each containing:
+                   - timestamp: datetime or ISO string
+                   - price: float (trade price)
+                   - size: int (number of shares)
+                   - exchange: str (optional, which exchange executed the trade)
+                   - trade_id: str (optional, unique trade identifier)
+
+        Returns:
+            int: Number of ticks successfully saved
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> ticks = [
+            ...     {'timestamp': '2024-01-01 09:30:00', 'price': 450.0, 'size': 100},
+            ...     {'timestamp': '2024-01-01 09:30:01', 'price': 450.1, 'size': 50}
+            ... ]
+            >>> count = storage.save_ticks('SPY', ticks)
+            >>> print(f"Saved {count} ticks")
+        """
+        if not ticks:
+            logger.debug(f"No ticks to save for {symbol}")
+            return 0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Prepare data for batch insert
+        # Convert list of dicts to list of tuples for SQL INSERT
+        insert_data = []
+        for tick in ticks:
+            # Convert datetime to ISO format string if needed
+            timestamp = tick['timestamp']
+            if isinstance(timestamp, datetime):
+                timestamp = timestamp.isoformat()
+
+            insert_data.append((
+                symbol,
+                timestamp,
+                tick['price'],
+                tick['size'],
+                tick.get('exchange'),  # Optional field
+                tick.get('trade_id')   # Optional field
+            ))
+
+        try:
+            # INSERT OR IGNORE: Skip ticks that already exist (based on UNIQUE constraint)
+            # This makes the operation idempotent - safe to run multiple times
+            cursor.executemany("""
+                INSERT OR IGNORE INTO ticks
+                (symbol, timestamp, price, size, exchange, trade_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, insert_data)
+
+            # Commit changes to disk (make them permanent)
+            conn.commit()
+
+            # rowcount tells us how many rows were actually inserted
+            # (may be less than len(ticks) if some were duplicates)
+            saved_count = cursor.rowcount
+
+            logger.info(f"Saved {saved_count}/{len(ticks)} ticks for {symbol}")
+            return saved_count
+
+        except sqlite3.Error as e:
+            # If something goes wrong, roll back the transaction
+            conn.rollback()
+            logger.error(f"Error saving ticks for {symbol}: {e}")
+            raise
+
+    def load_ticks(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit: Optional[int] = None
+    ) -> List[Tuple]:
+        """
+        Load ticks from database for a given symbol and time range.
+
+        This returns ticks in a simple format: list of (timestamp, price, size) tuples.
+        This format is efficient and works well with the bar generator.
+
+        Args:
+            symbol: Stock ticker
+            start: Start timestamp (ISO format string, e.g., "2024-01-01 09:30:00")
+            end: End timestamp (ISO format string)
+            limit: Maximum number of ticks to return (for testing with small samples)
+
+        Returns:
+            List of tuples: [(timestamp, price, size), ...]
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> ticks = storage.load_ticks('SPY', start='2024-01-01', end='2024-01-02')
+            >>> for timestamp, price, size in ticks[:5]:
+            ...     print(f"{timestamp}: ${price} x {size}")
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Build SQL query based on parameters
+        query = "SELECT timestamp, price, size FROM ticks WHERE symbol = ?"
+        params = [symbol]
+
+        if start:
+            query += " AND timestamp >= ?"
+            params.append(start)
+
+        if end:
+            query += " AND timestamp <= ?"
+            params.append(end)
+
+        query += " ORDER BY timestamp ASC"
+
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor.execute(query, params)
+
+        # Fetch all rows and convert to list of tuples
+        rows = cursor.fetchall()
+
+        logger.debug(f"Loaded {len(rows)} ticks for {symbol}")
+
+        return [(row['timestamp'], row['price'], row['size']) for row in rows]
+
+    def get_backfill_status(self, symbol: str) -> Optional[Dict]:
+        """
+        Check the backfill status for a symbol.
+
+        This tells you what data you already have, so you don't re-fetch it.
+
+        Args:
+            symbol: Stock ticker
+
+        Returns:
+            Dict with status info, or None if symbol hasn't been backfilled yet:
+            {
+                'symbol': 'SPY',
+                'earliest_timestamp': '2024-01-01 04:00:00',
+                'latest_timestamp': '2024-03-01 20:00:00',
+                'total_ticks': 5000000,
+                'last_updated': '2024-03-02 10:30:00'
+            }
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> status = storage.get_backfill_status('SPY')
+            >>> if status:
+            ...     print(f"Have {status['total_ticks']} ticks from {status['earliest_timestamp']}")
+            ... else:
+            ...     print("No data yet - run backfill")
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT * FROM backfill_status WHERE symbol = ?
+        """, (symbol,))
+
+        row = cursor.fetchone()
+
+        if row:
+            return dict(row)  # Convert sqlite3.Row to dict
+        return None
+
+    def update_backfill_status(
+        self,
+        symbol: str,
+        earliest: str,
+        latest: str,
+        count: int
+    ):
+        """
+        Update the backfill status for a symbol.
+
+        Call this after fetching new tick data to keep track of what you have.
+
+        Args:
+            symbol: Stock ticker
+            earliest: Earliest timestamp in the data
+            latest: Latest timestamp in the data
+            count: Total number of ticks stored
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> storage.update_backfill_status(
+            ...     'SPY',
+            ...     earliest='2024-01-01 04:00:00',
+            ...     latest='2024-03-01 20:00:00',
+            ...     count=5000000
+            ... )
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        # Get current timestamp
+        now = datetime.now().isoformat()
+
+        # INSERT OR REPLACE: Update if exists, insert if doesn't exist
+        cursor.execute("""
+            INSERT OR REPLACE INTO backfill_status
+            (symbol, earliest_timestamp, latest_timestamp, total_ticks, last_updated)
+            VALUES (?, ?, ?, ?, ?)
+        """, (symbol, earliest, latest, count, now))
+
+        conn.commit()
+
+        logger.info(
+            f"Updated backfill status for {symbol}: "
+            f"{count} ticks from {earliest} to {latest}"
+        )
+
+    def get_tick_count(self, symbol: str) -> int:
+        """
+        Get total number of ticks stored for a symbol.
+
+        This is useful for monitoring and validation.
+
+        Args:
+            symbol: Stock ticker
+
+        Returns:
+            int: Total tick count
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> count = storage.get_tick_count('SPY')
+            >>> print(f"SPY has {count:,} ticks stored")
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT COUNT(*) FROM ticks WHERE symbol = ?
+        """, (symbol,))
+
+        return cursor.fetchone()[0]
+
+    def get_date_range(self, symbol: str) -> Optional[Tuple[str, str]]:
+        """
+        Get the date range of ticks stored for a symbol.
+
+        Returns:
+            Tuple of (earliest, latest) timestamps, or None if no data
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> range = storage.get_date_range('SPY')
+            >>> if range:
+            ...     earliest, latest = range
+            ...     print(f"Data from {earliest} to {latest}")
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT MIN(timestamp), MAX(timestamp)
+            FROM ticks
+            WHERE symbol = ?
+        """, (symbol,))
+
+        row = cursor.fetchone()
+
+        if row[0] and row[1]:
+            return (row[0], row[1])
+        return None
+
+    def save_bars(self, symbol: str, bars: List[Dict]) -> int:
+        """
+        Save generated imbalance bars to database.
+
+        After generating bars from ticks, save them here for fast access.
+        This avoids regenerating bars every time you need them.
+
+        Args:
+            symbol: Stock ticker
+            bars: List of bar dictionaries with OHLCV data
+
+        Returns:
+            int: Number of bars saved
+
+        Example:
+            >>> bars = [
+            ...     {
+            ...         'bar_start': '2024-01-01 09:30:00',
+            ...         'bar_end': '2024-01-01 10:15:00',
+            ...         'open': 450.0, 'high': 451.0, 'low': 449.5, 'close': 450.5,
+            ...         'volume': 100000, 'tick_count': 500, 'imbalance': 0.15
+            ...     }
+            ... ]
+            >>> storage.save_bars('SPY', bars)
+        """
+        if not bars:
+            return 0
+
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        insert_data = [
+            (
+                symbol,
+                bar['bar_start'],
+                bar['bar_end'],
+                bar['open'],
+                bar['high'],
+                bar['low'],
+                bar['close'],
+                bar['volume'],
+                bar['tick_count'],
+                bar.get('imbalance', 0.0)
+            )
+            for bar in bars
+        ]
+
+        try:
+            cursor.executemany("""
+                INSERT OR REPLACE INTO imbalance_bars
+                (symbol, bar_start, bar_end, open, high, low, close, volume, tick_count, imbalance)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, insert_data)
+
+            conn.commit()
+            saved_count = cursor.rowcount
+
+            logger.info(f"Saved {saved_count} bars for {symbol}")
+            return saved_count
+
+        except sqlite3.Error as e:
+            conn.rollback()
+            logger.error(f"Error saving bars for {symbol}: {e}")
+            raise
+
+    def close(self):
+        """
+        Close the database connection.
+
+        Call this when you're completely done with the storage object.
+        In practice, Python will close it automatically when the object
+        is garbage collected, but explicit is better than implicit!
+
+        Example:
+            >>> storage = TickStorage(db_path)
+            >>> # ... do work ...
+            >>> storage.close()
+        """
+        if self._connection:
+            self._connection.close()
+            self._connection = None
+            logger.debug("Database connection closed")
+
+    def __del__(self):
+        """
+        Destructor - called when object is being destroyed.
+
+        This ensures the database connection is closed even if you forget
+        to call close() explicitly.
+
+        OOP Concept: __del__ is a "magic method" (also called "dunder method")
+        that Python calls automatically when an object is about to be deleted.
+        """
+        self.close()

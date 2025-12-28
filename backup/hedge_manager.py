@@ -24,8 +24,8 @@ from typing import Dict, List, Optional, Tuple
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from data.market_data import get_market_data_client, get_latest_price
-from config.settings import (
+from backup.market_data import get_market_data_client, get_latest_price
+from backup.settings import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET,
     ALPACA_PAPER,
@@ -295,7 +295,7 @@ class HedgeManager:
         try:
             import sqlite3
             from datetime import datetime, timedelta
-            from config.settings import DB_PATH
+            from backup.settings import DB_PATH
 
             # FIXED: Use context manager to prevent connection leaks
             with sqlite3.connect(DB_PATH) as conn:
@@ -405,7 +405,7 @@ class HedgeManager:
             from alpaca.data.timeframe import TimeFrame
             from datetime import datetime, timedelta
             import pandas as pd
-            from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET
+            from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET
 
             logger.info(f"Calculating real-time RSI for {symbol}...")
 
@@ -469,7 +469,7 @@ class HedgeManager:
 
             # UPDATE DATABASE with fresh RSI to prevent stale data on next check
             try:
-                from config.settings import DB_PATH
+                from backup.settings import DB_PATH
                 today = datetime.now().strftime('%Y-%m-%d')
 
                 with sqlite3.connect(DB_PATH) as conn:

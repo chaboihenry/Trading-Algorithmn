@@ -80,7 +80,7 @@ class ConnectionManager:
 
         try:
             # Import here to avoid circular imports
-            from data import market_data
+            from backup import market_data
 
             # Close TradingClient singleton
             if market_data._market_data_client is not None:
@@ -149,7 +149,7 @@ class ConnectionManager:
         if not self.broker:
             # No broker - check Alpaca API directly
             try:
-                from data.market_data import get_market_data_client
+                from backup.market_data import get_market_data_client
                 client = get_market_data_client()
                 cash = client.get_cash()
                 return cash is not None and cash >= 0

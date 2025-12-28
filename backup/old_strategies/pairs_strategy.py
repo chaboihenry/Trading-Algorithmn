@@ -34,7 +34,7 @@ class PairsStrategy(Strategy):
     """
 
     # FIXED (Problem 16): Strategy parameters now from centralized config
-    from config.settings import (
+    from backup.settings import (
         PAIRS_LOOKBACK_DAYS,
         PAIRS_ZSCORE_ENTRY,
         PAIRS_ZSCORE_EXIT,

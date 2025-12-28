@@ -14,6 +14,8 @@ This is the main strategy class that orchestrates all RiskLabAI components:
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+import sys
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,19 @@ from risklabai.sampling.cusum_filter import CUSUMEventFilter
 from risklabai.cross_validation.purged_kfold import PurgedCrossValidator
 from risklabai.features.feature_importance import FeatureImportanceAnalyzer
 from risklabai.portfolio.hrp import HRPPortfolio
+
+# Import tick data components
+project_root = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(project_root))
+
+try:
+    from config.tick_config import TICK_DB_PATH, INITIAL_IMBALANCE_THRESHOLD
+    from data.tick_storage import TickStorage
+    from data.tick_to_bars import generate_bars_from_ticks
+    TICK_DATA_AVAILABLE = True
+except ImportError:
+    TICK_DATA_AVAILABLE = False
+    logger.warning("Tick data components not available - train_from_ticks will not work")
 
 logger = logging.getLogger(__name__)
 
@@ -340,13 +355,20 @@ class RiskLabAIStrategy:
 
     def predict(
         self,
-        bars: pd.DataFrame
+        bars: pd.DataFrame,
+        prob_threshold: float = 0.015,
+        meta_threshold: float = 0.0001
     ) -> Tuple[int, float]:
         """
         Generate trading signal with bet size.
 
         Args:
             bars: Recent bar data for prediction
+            prob_threshold: Probability threshold for trading (0-1).
+                          Higher = more conservative, lower = more aggressive.
+                          Default 0.015 (1.5%) optimized for this model.
+            meta_threshold: Meta model probability threshold (0-1).
+                          Default 0.0001 (0.01%) optimized for this model.
 
         Returns:
             Tuple of (signal, bet_size):
@@ -366,15 +388,28 @@ class RiskLabAIStrategy:
         # Get latest feature row
         X = features.iloc[[-1]]
 
-        # Primary model: direction
-        direction = self.primary_model.predict(X)[0]
+        # Primary model: probability-based direction
+        # CRITICAL FIX: Use predict_proba instead of predict to avoid
+        # the model being too conservative (always predicting class 0)
+        probs = self.primary_model.predict_proba(X)[0]
+        # probs[0] = P(short=-1), probs[1] = P(no_trade=0), probs[2] = P(long=1)
+
+        if probs[2] > prob_threshold:
+            # Long signal if long probability exceeds threshold
+            direction = 1
+        elif probs[0] > prob_threshold:
+            # Short signal if short probability exceeds threshold
+            direction = -1
+        else:
+            # No trade if neither direction shows sufficient conviction
+            direction = 0
 
         # Meta model: should we trade? (probability)
         if self.meta_model is not None:
             trade_prob = self.meta_model.predict_proba(X)[0, 1]
 
             # Convert probability to bet size
-            if trade_prob < 0.5:
+            if trade_prob < meta_threshold:
                 # Don't trade if meta model says no
                 return 0, 0.0
             else:
@@ -431,3 +466,120 @@ class RiskLabAIStrategy:
         self.important_features = data['important_features']
 
         logger.info(f"Models loaded from {path}")
+
+    def train_from_ticks(
+        self,
+        symbol: str,
+        threshold: Optional[float] = None,
+        min_samples: int = 100
+    ) -> Dict:
+        """
+        Train models from tick data stored in database.
+
+        This method:
+        1. Loads tick data from the Vault database
+        2. Generates tick imbalance bars
+        3. Converts bars to DataFrame
+        4. Runs the full RiskLabAI training pipeline
+
+        Args:
+            symbol: Stock ticker (e.g., "SPY", "QQQ")
+            threshold: Imbalance threshold (uses config default if None)
+            min_samples: Minimum samples required for training
+
+        Returns:
+            Training results dictionary
+
+        Example:
+            >>> strategy = RiskLabAIStrategy()
+            >>> results = strategy.train_from_ticks('SPY')
+            >>> if results['success']:
+            ...     print(f"Trained on {results['n_samples']} samples")
+            ...     strategy.save_models('models/risklabai_models.pkl')
+        """
+        if not TICK_DATA_AVAILABLE:
+            raise ImportError(
+                "Tick data components not available. "
+                "Make sure tick data infrastructure is installed."
+            )
+
+        logger.info("=" * 80)
+        logger.info(f"TRAINING FROM TICK DATA: {symbol}")
+        logger.info("=" * 80)
+
+        # Use configured threshold if not specified
+        if threshold is None:
+            threshold = INITIAL_IMBALANCE_THRESHOLD
+            logger.info(f"Using threshold from config: {threshold:.2f}")
+
+        # Step 1: Load ticks from database
+        logger.info("Step 1: Loading ticks from database...")
+        storage = TickStorage(TICK_DB_PATH)
+
+        # Get available date range
+        date_range = storage.get_date_range(symbol)
+        if not date_range:
+            storage.close()
+            raise ValueError(
+                f"No tick data found for {symbol} in database. "
+                f"Run scripts/backfill_ticks.py first."
+            )
+
+        earliest, latest = date_range
+        logger.info(f"  Available data: {earliest} to {latest}")
+
+        # Load all ticks
+        ticks = storage.load_ticks(symbol)
+        storage.close()
+
+        if not ticks:
+            raise ValueError(f"No ticks loaded for {symbol}")
+
+        logger.info(f"  Loaded {len(ticks):,} ticks")
+
+        # Step 2: Generate tick imbalance bars
+        logger.info("Step 2: Generating tick imbalance bars...")
+        bars_list = generate_bars_from_ticks(ticks, threshold=threshold)
+
+        if not bars_list:
+            raise ValueError(f"No bars generated from {len(ticks)} ticks")
+
+        logger.info(f"  Generated {len(bars_list)} bars")
+        logger.info(f"  Bars per tick: {len(bars_list)/len(ticks):.4f}")
+
+        # Step 3: Convert to DataFrame for RiskLabAI
+        logger.info("Step 3: Converting bars to DataFrame...")
+
+        # Create DataFrame from bars
+        bars_df = pd.DataFrame(bars_list)
+
+        # Set datetime index (remove timezone to avoid issues with purged CV)
+        bars_df['bar_end'] = pd.to_datetime(bars_df['bar_end'])
+        if bars_df['bar_end'].dt.tz is not None:
+            bars_df['bar_end'] = bars_df['bar_end'].dt.tz_localize(None)
+        bars_df.set_index('bar_end', inplace=True)
+
+        # Ensure we have required OHLCV columns
+        required_cols = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in bars_df.columns for col in required_cols):
+            raise ValueError(f"Missing required columns: {required_cols}")
+
+        logger.info(f"  DataFrame shape: {bars_df.shape}")
+        logger.info(f"  Columns: {bars_df.columns.tolist()}")
+
+        # Step 4: Run RiskLabAI training pipeline
+        logger.info("Step 4: Running RiskLabAI training pipeline...")
+        results = self.train(bars_df, min_samples=min_samples)
+
+        if results['success']:
+            logger.info("=" * 80)
+            logger.info(f"✓ TRAINING SUCCESSFUL FROM TICK DATA")
+            logger.info("=" * 80)
+            logger.info(f"  Tick data: {len(ticks):,} ticks")
+            logger.info(f"  Bars generated: {len(bars_list)}")
+            logger.info(f"  Samples used: {results['n_samples']}")
+            logger.info(f"  Primary accuracy: {results['primary_accuracy']:.3f}")
+            logger.info(f"  Meta accuracy: {results['meta_accuracy']:.3f}")
+            logger.info("=" * 80)
+
+        return results

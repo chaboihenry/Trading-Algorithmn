@@ -10,7 +10,7 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import (
     OrderSide, OrderType, TimeInForce, QueryOrderStatus, OrderClass
 )
-from config.settings import (
+from backup.settings import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET,
     ALPACA_PAPER,
@@ -248,7 +248,7 @@ def ensure_all_positions_protected():
     """Protect all open positions with stop-loss and take-profit orders."""
     try:
         manager = StopLossManager()
-        from data.market_data import get_market_data_client
+        from backup.market_data import get_market_data_client
         market_data = get_market_data_client()
         positions = market_data.get_positions()
         protected, total = manager.protect_all_positions(positions)

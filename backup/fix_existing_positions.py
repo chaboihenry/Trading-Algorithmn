@@ -22,8 +22,8 @@ from alpaca.trading.requests import GetOrdersRequest, StopOrderRequest, LimitOrd
 from alpaca.trading.enums import (
     OrderSide, OrderType, TimeInForce, QueryOrderStatus
 )
-from data.market_data import get_market_data_client
-from config.settings import (
+from backup.market_data import get_market_data_client
+from backup.settings import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET,
     ALPACA_PAPER,

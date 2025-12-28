@@ -77,7 +77,7 @@ def retry_on_connection_error(max_retries=3, initial_delay=5, backoff_factor=2):
 class CombinedStrategy(Strategy):
     """Meta-learning ensemble combining sentiment and pairs trading signals."""
 
-    from config.settings import (
+    from backup.settings import (
         SLEEP_INTERVAL,
         RETRAIN_FREQUENCY_DAYS,
         MIN_TRAINING_SAMPLES,
@@ -95,7 +95,7 @@ class CombinedStrategy(Strategy):
         """Initialize strategy with meta-learner and sentiment analysis."""
         self.sleeptime = self.SLEEPTIME
 
-        from config.settings import (
+        from backup.settings import (
             DB_PATH,
             SENTIMENT_LOOKBACK_DAYS,
             TRADING_SYMBOLS,
@@ -145,7 +145,7 @@ class CombinedStrategy(Strategy):
 
         # Initialize direct Alpaca Trading Client for bracket orders
         # This bypasses Lumibot and gives us direct access to Alpaca's bracket order API
-        from config.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
+        from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
         self.alpaca_client = TradingClient(
             ALPACA_API_KEY,
             ALPACA_API_SECRET,
@@ -156,7 +156,7 @@ class CombinedStrategy(Strategy):
         # Initialize reliable MarketDataClient (fixes Lumibot's unreliable get_cash())
         # Lumibot's get_cash() sometimes returns None, causing crashes
         # Our MarketDataClient ALWAYS returns a value (0.0 on error, never None)
-        from data.market_data import get_market_data_client
+        from backup.market_data import get_market_data_client
         self.market_data = get_market_data_client()
         logger.info("✅ Reliable market data client initialized")
 
@@ -328,7 +328,7 @@ class CombinedStrategy(Strategy):
         Returns:
             Dict of sector -> 5-day return %
         """
-        from config.settings import SECTOR_ETFS, FEATURE_DEFAULTS
+        from backup.settings import SECTOR_ETFS, FEATURE_DEFAULTS
         sector_etfs = list(SECTOR_ETFS.keys())
         sector_returns = {}
 
@@ -373,7 +373,7 @@ class CombinedStrategy(Strategy):
             - vix_change: 5-day change in VIX
             - vix_percentile: VIX relative to 30-day range (0-100)
         """
-        from config.settings import FEATURE_DEFAULTS
+        from backup.settings import FEATURE_DEFAULTS
         vix_features = {
             'vix_level': FEATURE_DEFAULTS['vix_level'],
             'vix_change': FEATURE_DEFAULTS['vix_change'],
@@ -450,12 +450,12 @@ class CombinedStrategy(Strategy):
             if total > 0:
                 return advancing / total
             else:
-                from config.settings import FEATURE_DEFAULTS
+                from backup.settings import FEATURE_DEFAULTS
                 return FEATURE_DEFAULTS['breadth_ratio']  # Neutral if no data
 
         except Exception as e:
             logger.warning(f"Error getting market breadth: {e}")
-            from config.settings import FEATURE_DEFAULTS
+            from backup.settings import FEATURE_DEFAULTS
             return FEATURE_DEFAULTS['breadth_ratio']
 
     def _get_time_features(self) -> Dict[str, float]:
@@ -471,7 +471,7 @@ class CombinedStrategy(Strategy):
             - is_month_end: 1 if last 5 days of month, else 0
             - is_month_start: 1 if first 5 days of month, else 0
         """
-        from config.settings import TIME_FEATURES
+        from backup.settings import TIME_FEATURES
         now = datetime.now()
 
         # Day of week (0=Monday, 4=Friday)
@@ -527,7 +527,7 @@ class CombinedStrategy(Strategy):
             Feature vector ready for meta-model (26 features)
         """
         # FIXED (Problem 16): All defaults and normalization factors from config
-        from config.settings import (
+        from backup.settings import (
             FEATURE_DEFAULTS,
             NORMALIZATION_FACTORS,
             SECTOR_ETFS
