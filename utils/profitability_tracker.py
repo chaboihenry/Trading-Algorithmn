@@ -348,8 +348,16 @@ class ProfitabilityTracker:
         print("PROFITABILITY SUMMARY")
         print("=" * 80)
         print(f"\nCapital:")
-        print(f"  Initial: ${self.initial_capital:,.2f}")
-        print(f"  Current: ${self.current_capital:,.2f}")
+        if self.initial_capital is not None:
+            print(f"  Initial: ${self.initial_capital:,.2f}")
+        else:
+            print(f"  Initial: N/A (no portfolio snapshots recorded)")
+
+        if self.current_capital is not None:
+            print(f"  Current: ${self.current_capital:,.2f}")
+        else:
+            print(f"  Current: N/A")
+
         print(f"  Return:  ${metrics['total_return']:+,.2f} ({metrics['cumulative_return']:+.2f}%)")
 
         print(f"\nTrade Statistics:")

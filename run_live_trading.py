@@ -18,6 +18,14 @@ from lumibot.traders import Trader
 
 from core.risklabai_combined import RiskLabAICombined
 from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
+from config.tick_config import (
+    OPTIMAL_PROFIT_TARGET,
+    OPTIMAL_STOP_LOSS,
+    OPTIMAL_MAX_HOLDING_BARS,
+    OPTIMAL_META_THRESHOLD,
+    OPTIMAL_PROB_THRESHOLD,
+    OPTIMAL_FRACTIONAL_D
+)
 
 # Set up logging
 logging.basicConfig(
@@ -61,11 +69,16 @@ def main():
         # Trading symbols
         'symbols': ['SPY'],
 
-        # OPTIMIZED MODEL: Tighter targets for more frequent signals
+        # OPTIMAL PARAMETERS from parameter sweep (Sharpe 3.53, Win Rate 73.1%)
         'model_path': 'models/risklabai_tick_models_optimized.pkl',
-        'profit_taking': 0.5,  # 0.5% profit target (was 2.0%)
-        'stop_loss': 0.5,      # 0.5% stop loss (was 2.0%)
-        'max_holding': 20,     # 20 bars max (was 10)
+        'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% profit target
+        'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% stop loss
+        'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 20 bars max hold
+        'd': OPTIMAL_FRACTIONAL_D,               # 0.30 - Fractional differencing (preserves 70% memory)
+
+        # Signal thresholds
+        'meta_threshold': OPTIMAL_META_THRESHOLD,  # 0.001 (0.1%) - Meta model confidence
+        'prob_threshold': OPTIMAL_PROB_THRESHOLD,  # 0.015 (1.5%) - Primary model probability
 
         # Strategy settings
         'use_tick_bars': True,

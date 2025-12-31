@@ -24,6 +24,11 @@ from risklabai.strategy.risklabai_strategy import RiskLabAIStrategy
 # Import GARCH volatility filter
 from utils.garch_filter import GARCHVolatilityFilter
 
+# Import tick data infrastructure
+from data.tick_storage import TickStorage
+from data.tick_to_bars import generate_bars_from_ticks
+from config.tick_config import TICK_DB_PATH, INITIAL_IMBALANCE_THRESHOLD
+
 # Import existing infrastructure
 from backup.settings import (
     STOP_LOSS_PCT,
@@ -119,11 +124,13 @@ class RiskLabAICombined(Strategy):
         profit_taking = parameters.get('profit_taking', 0.5) if parameters else 0.5
         stop_loss = parameters.get('stop_loss', 0.5) if parameters else 0.5
         max_holding = parameters.get('max_holding', 20) if parameters else 20
+        d = parameters.get('d', 1.0) if parameters else 1.0  # Fractional differencing parameter
 
         self.risklabai = RiskLabAIStrategy(
             profit_taking=profit_taking,
             stop_loss=stop_loss,
             max_holding=max_holding,
+            d=d,  # Use optimal d for stationarity
             n_cv_splits=5
         )
 
@@ -141,6 +148,11 @@ class RiskLabAICombined(Strategy):
 
         # NEW: Tick bars support
         self.use_tick_bars = parameters.get('use_tick_bars', False) if parameters else False
+        self.imbalance_threshold = parameters.get('imbalance_threshold', INITIAL_IMBALANCE_THRESHOLD) if parameters else INITIAL_IMBALANCE_THRESHOLD
+
+        # Signal generation thresholds
+        self.meta_threshold = parameters.get('meta_threshold', 0.001) if parameters else 0.001
+        self.prob_threshold = parameters.get('prob_threshold', 0.015) if parameters else 0.015
 
         # Model storage path
         self.model_path = parameters.get('model_path', 'models/risklabai_models.pkl') if parameters else 'models/risklabai_models.pkl'
@@ -223,6 +235,11 @@ class RiskLabAICombined(Strategy):
         logger.info(f"Trading {len(self.symbols)} symbols: {self.symbols}")
         logger.info(f"Using tick bars: {self.use_tick_bars}")
         logger.info("=" * 80)
+
+        # Lumibot framework compatibility
+        # Some versions expect _backtesting_start attribute
+        if not hasattr(self, '_backtesting_start'):
+            self._backtesting_start = None
 
     def on_trading_iteration(self):
         """
@@ -428,15 +445,58 @@ class RiskLabAICombined(Strategy):
         """
         Fetch historical bar data for a symbol.
 
+        If use_tick_bars is True, fetches tick imbalance bars from database.
+        Otherwise, fetches regular OHLC bars from broker.
+
         Args:
             symbol: Stock symbol
             length: Number of bars to fetch
-            timeframe: Bar timeframe ("minute", "day", etc.)
+            timeframe: Bar timeframe ("minute", "day", etc.) - ignored if use_tick_bars=True
 
         Returns:
             DataFrame with OHLCV data
         """
         try:
+            # NEW: Fetch tick imbalance bars from database
+            if self.use_tick_bars:
+                logger.debug(f"{symbol}: Fetching tick imbalance bars from database")
+
+                # Load ticks from database
+                storage = TickStorage(TICK_DB_PATH)
+                ticks = storage.load_ticks(symbol)
+                storage.close()
+
+                if not ticks:
+                    logger.warning(f"{symbol}: No ticks found in database")
+                    return None
+
+                # Generate imbalance bars from ticks
+                bars = generate_bars_from_ticks(ticks, threshold=self.imbalance_threshold)
+
+                if not bars:
+                    logger.warning(f"{symbol}: No bars generated from ticks")
+                    return None
+
+                # Convert to DataFrame with proper datetime index
+                df = pd.DataFrame(bars)
+
+                # Set timestamp as index (required for fractional differencing)
+                if 'timestamp' in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'])
+                    df = df.set_index('timestamp')
+                elif 'bar_end' in df.columns:
+                    df['bar_end'] = pd.to_datetime(df['bar_end'])
+                    df = df.set_index('bar_end')
+
+                # Take most recent bars
+                if len(df) > length:
+                    df = df.tail(length)
+
+                logger.debug(f"{symbol}: Loaded {len(df)} tick imbalance bars with datetime index")
+
+                return df
+
+            # ORIGINAL: Fetch regular OHLC bars from broker
             bars = self.get_historical_prices(
                 symbol,
                 length,
@@ -486,14 +546,19 @@ class RiskLabAICombined(Strategy):
                 logger.info(f"{symbol}: ✓ GARCH filter passed - high volatility regime detected "
                           f"(vol={garch_info['forecasted_vol']:.4f}, threshold={garch_info['threshold']:.4f})")
 
-        # Get signal from RiskLabAI (only if GARCH says trade)
-        signal, bet_size = self.risklabai.predict(bars)
+        # Get signal from RiskLabAI with OPTIMAL THRESHOLDS (only if GARCH says trade)
+        signal, bet_size = self.risklabai.predict(
+            bars,
+            prob_threshold=self.prob_threshold,  # 0.015 (1.5%)
+            meta_threshold=self.meta_threshold   # 0.001 (0.1%)
+        )
 
         if signal == 0 or bet_size < 0.5:
             logger.debug(f"{symbol}: No signal (signal={signal}, bet_size={bet_size:.2f})")
             return
 
-        logger.info(f"{symbol}: Signal={signal}, Meta confidence={bet_size:.2f}")
+        logger.info(f"{symbol}: ✅ SIGNAL={signal}, Meta confidence={bet_size:.2f} "
+                   f"(thresholds: prob={self.prob_threshold}, meta={self.meta_threshold})")
 
         # Calculate Kelly position size
         portfolio_value = self.get_portfolio_value()
@@ -566,15 +631,22 @@ class RiskLabAICombined(Strategy):
 
             logger.info(f"LONG {symbol}: {quantity} shares @ ${price:.2f} (total: ${position_value:.2f})")
 
-            # Create bracket order with stop-loss and take-profit
+            # Create bracket order with OPTIMAL stop-loss and take-profit
+            # Using optimal parameters: 4% profit target, 2% stop loss
+            profit_target_pct = self.risklabai.labeler.profit_taking_mult  # 0.04 (4%)
+            stop_loss_pct = self.risklabai.labeler.stop_loss_mult          # 0.02 (2%)
+
             order = self.create_order(
                 symbol,
                 quantity,
                 "buy",
-                take_profit_price=price * (1 + TAKE_PROFIT_PCT),
-                stop_loss_price=price * (1 - STOP_LOSS_PCT)
+                take_profit_price=price * (1 + profit_target_pct),
+                stop_loss_price=price * (1 - stop_loss_pct)
             )
             self.submit_order(order)
+
+            logger.info(f"  📈 Take Profit: ${price * (1 + profit_target_pct):.2f} (+{profit_target_pct:.1%})")
+            logger.info(f"  📉 Stop Loss: ${price * (1 - stop_loss_pct):.2f} (-{stop_loss_pct:.1%})")
 
         except Exception as e:
             logger.error(f"Error entering long for {symbol}: {e}")

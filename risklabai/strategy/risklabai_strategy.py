@@ -89,6 +89,7 @@ class RiskLabAIStrategy:
         profit_taking: float = 2.0,
         stop_loss: float = 2.0,
         max_holding: int = 10,
+        d: float = None,
         n_cv_splits: int = 5
     ):
         """
@@ -98,11 +99,12 @@ class RiskLabAIStrategy:
             profit_taking: Take-profit multiplier (vs volatility)
             stop_loss: Stop-loss multiplier (vs volatility)
             max_holding: Max periods before timeout
+            d: Fractional differencing parameter (0-1, typically 0.3-0.6)
             n_cv_splits: Cross-validation folds
         """
         # Initialize components
         self.cusum_filter = CUSUMEventFilter()
-        self.frac_diff = FractionalDifferentiator()
+        self.frac_diff = FractionalDifferentiator(d=d)  # Pass d parameter
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=profit_taking,
             stop_loss_mult=stop_loss,

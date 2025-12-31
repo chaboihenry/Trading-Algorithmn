@@ -268,6 +268,44 @@ def get_tick_config_summary():
 
 
 # =============================================================================
+# OPTIMAL TRADING PARAMETERS (From Parameter Sweep)
+# =============================================================================
+
+# Best parameters identified by parameter sweep on 2025-12-30
+# Based on 48 configurations tested with Sharpe ratio optimization
+# Backtest performance: Sharpe 3.53, Win Rate 73.1%, 52 trades
+
+# Signal filtering
+OPTIMAL_META_THRESHOLD = 0.001   # 0.1% - Meta model confidence filter
+OPTIMAL_PROB_THRESHOLD = 0.015   # 1.5% - Primary model probability threshold
+
+# Exit parameters
+OPTIMAL_PROFIT_TARGET = 0.04     # 4.0% - Take profit level
+OPTIMAL_STOP_LOSS = 0.02         # 2.0% - Stop loss level
+OPTIMAL_MAX_HOLDING_BARS = 20    # bars - Maximum holding period
+
+# Risk management
+OPTIMAL_RISK_REWARD_RATIO = 2.0  # Risk $1 to make $2
+MAX_POSITION_SIZE_PCT = 0.10     # 10% - Maximum position size
+MAX_DAILY_DRAWDOWN_PCT = 0.15    # 15% - Daily drawdown alert threshold
+
+# Backtest metrics (for reference)
+BACKTEST_SHARPE_RATIO = 3.53
+BACKTEST_WIN_RATE = 0.731
+BACKTEST_NUM_TRADES = 52
+BACKTEST_MAX_DRAWDOWN = -0.0779
+
+# =============================================================================
+# FRACTIONAL DIFFERENCING PARAMETER
+# =============================================================================
+
+# Optimal d value for making time series stationary
+# Found by analyzing 7,286 tick imbalance bars (2020-2025)
+# d=0.30 achieves stationarity (p=0.0405) while preserving 70% of memory
+# Lower d = more memory = better predictions
+OPTIMAL_FRACTIONAL_D = 0.30
+
+# =============================================================================
 # AUTO-VALIDATION ON IMPORT
 # =============================================================================
 

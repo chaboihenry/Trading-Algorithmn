@@ -104,8 +104,10 @@ CURRENT_ENV_CONFIG = ENV_CONFIGS.get(TRADING_ENV, ENV_CONFIGS['paper'])
 # =============================================================================
 
 # Stop-loss and take-profit (applied to ALL positions via bracket orders)
-STOP_LOSS_PCT = 0.05      # Exit at -5% loss (server-side, always active)
-TAKE_PROFIT_PCT = 0.15    # Exit at +15% profit (server-side, always active)
+# NOTE: These are OLD backup parameters. Active bot uses OPTIMAL parameters from:
+#       config/tick_config.py (OPTIMAL_PROFIT_TARGET=4%, OPTIMAL_STOP_LOSS=2%)
+STOP_LOSS_PCT = 0.05      # Exit at -5% loss (server-side, always active) [BACKUP ONLY]
+TAKE_PROFIT_PCT = 0.15    # Exit at +15% profit (server-side, always active) [BACKUP ONLY]
 
 # Position sizing limits (environment-specific)
 MAX_POSITION_PCT = CURRENT_ENV_CONFIG['max_position_pct']
