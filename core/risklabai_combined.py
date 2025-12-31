@@ -120,19 +120,29 @@ class RiskLabAICombined(Strategy):
         if parameters is None and hasattr(self, 'parameters'):
             parameters = self.parameters
 
-        # Initialize RiskLabAI strategy with OPTIMIZED parameters
-        profit_taking = parameters.get('profit_taking', 0.5) if parameters else 0.5
-        stop_loss = parameters.get('stop_loss', 0.5) if parameters else 0.5
-        max_holding = parameters.get('max_holding', 20) if parameters else 20
-        d = parameters.get('d', 1.0) if parameters else 1.0  # Fractional differencing parameter
+        # Store RiskLabAI parameters for creating per-symbol strategies
+        self.risklabai_params = {
+            'profit_taking': parameters.get('profit_taking', 0.5) if parameters else 0.5,
+            'stop_loss': parameters.get('stop_loss', 0.5) if parameters else 0.5,
+            'max_holding': parameters.get('max_holding', 20) if parameters else 20,
+            'd': parameters.get('d', 1.0) if parameters else 1.0,
+            'force_directional': parameters.get('force_directional', False) if parameters else False,
+            'neutral_threshold': parameters.get('neutral_threshold', 0.00001) if parameters else 0.00001,
+        }
 
+        # Create a template RiskLabAI instance (for accessing labeler params)
         self.risklabai = RiskLabAIStrategy(
-            profit_taking=profit_taking,
-            stop_loss=stop_loss,
-            max_holding=max_holding,
-            d=d,  # Use optimal d for stationarity
-            n_cv_splits=5
+            profit_taking=self.risklabai_params['profit_taking'],
+            stop_loss=self.risklabai_params['stop_loss'],
+            max_holding=self.risklabai_params['max_holding'],
+            d=self.risklabai_params['d'],
+            n_cv_splits=5,
+            force_directional=self.risklabai_params['force_directional'],
+            neutral_threshold=self.risklabai_params['neutral_threshold']
         )
+
+        # NEW: Per-symbol model storage
+        self.symbol_models = {}  # Dict[symbol -> RiskLabAIStrategy instance]
 
         # Trading symbols
         if parameters and 'symbols' in parameters:
@@ -154,8 +164,8 @@ class RiskLabAICombined(Strategy):
         self.meta_threshold = parameters.get('meta_threshold', 0.001) if parameters else 0.001
         self.prob_threshold = parameters.get('prob_threshold', 0.015) if parameters else 0.015
 
-        # Model storage path
-        self.model_path = parameters.get('model_path', 'models/risklabai_models.pkl') if parameters else 'models/risklabai_models.pkl'
+        # Model storage directory (each symbol gets its own model file)
+        self.models_dir = 'models'
 
         # NEW: Profitability tracking
         self.enable_profitability_tracking = parameters.get('enable_profitability_tracking', False) if parameters else False
@@ -223,16 +233,52 @@ class RiskLabAICombined(Strategy):
         logger.info(f"  Kelly fraction: {self.kelly_fraction:.1%} (Half-Kelly)")
         logger.info("=" * 60)
 
-        # Try to load existing models
-        try:
-            self.risklabai.load_models(self.model_path)
-            self.models_trained = True
-            self.last_train_date = datetime.now()
-            logger.info(f"✓ Loaded tick-based models from {self.model_path}")
-        except Exception as e:
-            logger.info(f"No existing models found: {e}")
+        # Load per-symbol models
+        logger.info("=" * 60)
+        logger.info("LOADING PER-SYMBOL MODELS")
+        logger.info("=" * 60)
 
-        logger.info(f"Trading {len(self.symbols)} symbols: {self.symbols}")
+        models_loaded = 0
+        models_missing = []
+
+        for symbol in self.symbols:
+            model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
+            try:
+                # Create a new RiskLabAI instance for this symbol
+                symbol_strategy = RiskLabAIStrategy(
+                    profit_taking=self.risklabai_params['profit_taking'],
+                    stop_loss=self.risklabai_params['stop_loss'],
+                    max_holding=self.risklabai_params['max_holding'],
+                    d=self.risklabai_params['d'],
+                    n_cv_splits=5,
+                    force_directional=self.risklabai_params['force_directional'],
+                    neutral_threshold=self.risklabai_params['neutral_threshold']
+                )
+
+                # Load the trained model
+                symbol_strategy.load_models(model_path)
+                self.symbol_models[symbol] = symbol_strategy
+                models_loaded += 1
+                logger.info(f"  ✓ {symbol}: Loaded from {model_path}")
+
+            except Exception as e:
+                models_missing.append(symbol)
+                logger.warning(f"  ✗ {symbol}: No model found ({model_path})")
+
+        logger.info("=" * 60)
+        logger.info(f"Models loaded: {models_loaded}/{len(self.symbols)}")
+
+        if models_missing:
+            logger.warning(f"Missing models for: {', '.join(models_missing)}")
+            logger.warning(f"Run: python scripts/train_all_symbols.py --phase phase_X")
+            logger.warning(f"These symbols will be skipped during trading.")
+
+        self.models_trained = models_loaded > 0
+        if self.models_trained:
+            self.last_train_date = datetime.now()
+
+        logger.info("=" * 60)
+        logger.info(f"Trading {len(self.symbol_models)} symbols with trained models")
         logger.info(f"Using tick bars: {self.use_tick_bars}")
         logger.info("=" * 80)
 
@@ -348,8 +394,8 @@ class RiskLabAICombined(Strategy):
             logger.warning("Models not trained, skipping iteration")
             return
 
-        # Step 2: Generate signals for each symbol
-        for symbol in self.symbols:
+        # Step 2: Generate signals for each symbol with trained models
+        for symbol in self.symbol_models.keys():
             try:
                 self._process_symbol(symbol)
             except Exception as e:
@@ -421,10 +467,12 @@ class RiskLabAICombined(Strategy):
             self.models_trained = True
             self.last_train_date = datetime.now()
 
-            # Save models
+            # Save per-symbol models
             try:
-                self.risklabai.save_models(self.model_path)
-                logger.info(f"Models saved to {self.model_path}")
+                for symbol, strategy in self.symbol_models.items():
+                    model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
+                    strategy.save_models(model_path)
+                logger.info(f"Models saved for {len(self.symbol_models)} symbols")
             except Exception as e:
                 logger.warning(f"Failed to save models: {e}")
 
@@ -523,11 +571,16 @@ class RiskLabAICombined(Strategy):
 
     def _process_symbol(self, symbol: str):
         """Generate and execute signal for one symbol with Kelly Criterion sizing."""
+        # Check if we have a trained model for this symbol
+        if symbol not in self.symbol_models:
+            logger.debug(f"{symbol}: No trained model available, skipping")
+            return
+
         # Get recent bars (need enough for feature calculation)
         bars = self._get_historical_bars(symbol, 100)
 
         if bars is None or len(bars) < 50:
-            logger.debug(f"{symbol}: Insufficient data ({len(bars) if bars is not None else 0} bars)")
+            logger.info(f"{symbol}: Insufficient data ({len(bars) if bars is not None else 0} bars)")
             return
 
         # NEW: GARCH Volatility Filter - Check BEFORE calling RiskLabAI
@@ -535,26 +588,27 @@ class RiskLabAICombined(Strategy):
         if self.use_garch_filter and self.garch_filter is not None:
             should_trade, garch_info = self.garch_filter.should_trade(bars['close'])
 
-            logger.debug(f"{symbol}: GARCH check - Vol={garch_info['forecasted_vol']:.4f}, "
+            logger.info(f"{symbol}: GARCH check - Vol={garch_info['forecasted_vol']:.4f}, "
                         f"Threshold={garch_info['threshold']:.4f}, Trade={should_trade}")
 
             if not should_trade:
-                logger.debug(f"{symbol}: GARCH filter blocked - volatility too low "
+                logger.info(f"{symbol}: GARCH filter blocked - volatility too low "
                            f"({garch_info['forecasted_vol']:.4f} < {garch_info['threshold']:.4f})")
                 return
             else:
                 logger.info(f"{symbol}: ✓ GARCH filter passed - high volatility regime detected "
                           f"(vol={garch_info['forecasted_vol']:.4f}, threshold={garch_info['threshold']:.4f})")
 
-        # Get signal from RiskLabAI with OPTIMAL THRESHOLDS (only if GARCH says trade)
-        signal, bet_size = self.risklabai.predict(
+        # Get signal from symbol-specific RiskLabAI model with OPTIMAL THRESHOLDS
+        symbol_strategy = self.symbol_models[symbol]
+        signal, bet_size = symbol_strategy.predict(
             bars,
             prob_threshold=self.prob_threshold,  # 0.015 (1.5%)
             meta_threshold=self.meta_threshold   # 0.001 (0.1%)
         )
 
         if signal == 0 or bet_size < 0.5:
-            logger.debug(f"{symbol}: No signal (signal={signal}, bet_size={bet_size:.2f})")
+            logger.info(f"{symbol}: No signal (signal={signal}, bet_size={bet_size:.2f})")
             return
 
         logger.info(f"{symbol}: ✅ SIGNAL={signal}, Meta confidence={bet_size:.2f} "
@@ -590,8 +644,15 @@ class RiskLabAICombined(Strategy):
             position_value = portfolio_value * MAX_POSITION_PCT * bet_size
             logger.info(f"  💰 Fixed sizing: {MAX_POSITION_PCT:.2%} × {bet_size:.2f} = ${position_value:,.2f}")
 
-        # Get current position
+        # Get current position (with safeguard logging)
         current_position = self.get_position(symbol)
+
+        # Log what get_position actually returns for debugging
+        if current_position is not None:
+            logger.info(f"{symbol}: Current position detected - Symbol={getattr(current_position, 'symbol', 'N/A')}, "
+                       f"Quantity={getattr(current_position, 'quantity', 'N/A')}")
+        else:
+            logger.info(f"{symbol}: No current position")
 
         # Execute trade based on signal
         if signal == 1:
@@ -600,7 +661,7 @@ class RiskLabAICombined(Strategy):
                 self._enter_long(symbol, position_value)
                 self.trades_today += 1
             else:
-                logger.debug(f"{symbol}: Already long, no action")
+                logger.info(f"{symbol}: Already long, no action")
 
         elif signal == -1:
             # Short signal
@@ -612,7 +673,7 @@ class RiskLabAICombined(Strategy):
                 # For now, we'll just avoid going short
                 logger.info(f"{symbol}: Short signal but not implementing short selling")
             else:
-                logger.debug(f"{symbol}: Already short, no action")
+                logger.info(f"{symbol}: Already short, no action")
 
     def _enter_long(self, symbol: str, position_value: float):
         """Enter long position with risk management."""
@@ -626,7 +687,7 @@ class RiskLabAICombined(Strategy):
             quantity = int(position_value / price)
 
             if quantity <= 0:
-                logger.debug(f"{symbol}: Position value too small")
+                logger.info(f"{symbol}: Position value too small")
                 return
 
             logger.info(f"LONG {symbol}: {quantity} shares @ ${price:.2f} (total: ${position_value:.2f})")
@@ -678,8 +739,10 @@ class RiskLabAICombined(Strategy):
         # Save models if trained
         if self.models_trained:
             try:
-                self.risklabai.save_models(self.model_path)
-                logger.info(f"Models saved to {self.model_path}")
+                for symbol, strategy in self.symbol_models.items():
+                    model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
+                    strategy.save_models(model_path)
+                logger.info(f"Models saved for {len(self.symbol_models)} symbols on shutdown")
             except Exception as e:
                 logger.error(f"Failed to save models on shutdown: {e}")
 
@@ -694,14 +757,22 @@ class RiskLabAICombined(Strategy):
         # Get current portfolio value
         portfolio_value = self.get_portfolio_value()
 
-        # Get positions
+        # Get positions (filter out cash/USD - only count actual stock positions)
         positions = self.get_positions()
+
+        # Filter to only stock positions with non-zero quantity
+        stock_positions = []
+        if positions:
+            for position in positions:
+                # Filter out cash and positions with zero quantity
+                if hasattr(position, 'symbol') and position.symbol not in ['USD', 'CASH'] and hasattr(position, 'quantity') and position.quantity != 0:
+                    stock_positions.append(position)
 
         # Log stats
         row = {
             'datetime': datetime.now(),
             'portfolio_value': portfolio_value,
-            'num_positions': len(positions) if positions else 0,
+            'num_positions': len(stock_positions),
             'models_trained': self.models_trained,
             'last_train_date': self.last_train_date
         }

@@ -46,7 +46,9 @@ class TripleBarrierLabeler:
         profit_taking_mult: float = 2.0,
         stop_loss_mult: float = 2.0,
         max_holding_period: int = 10,
-        volatility_lookback: int = 20
+        volatility_lookback: int = 20,
+        force_directional: bool = False,
+        neutral_threshold: float = 0.00001
     ):
         """
         Initialize triple-barrier labeler.
@@ -56,14 +58,20 @@ class TripleBarrierLabeler:
             stop_loss_mult: Lower barrier = volatility * this value
             max_holding_period: Maximum periods before vertical barrier
             volatility_lookback: Days for volatility calculation
+            force_directional: If True, force directional labels based on price movement
+                             Only label as neutral if price is truly flat (within neutral_threshold)
+            neutral_threshold: Threshold for neutral labels (default 0.001% = 0.00001)
         """
         self.profit_taking_mult = profit_taking_mult
         self.stop_loss_mult = stop_loss_mult
         self.max_holding_period = max_holding_period
         self.volatility_lookback = volatility_lookback
+        self.force_directional = force_directional
+        self.neutral_threshold = neutral_threshold
 
         logger.info(f"TripleBarrierLabeler initialized: pt={profit_taking_mult}, "
-                   f"sl={stop_loss_mult}, max_hold={max_holding_period}")
+                   f"sl={stop_loss_mult}, max_hold={max_holding_period}, "
+                   f"force_directional={force_directional}, neutral_threshold={neutral_threshold:.5f}")
 
     def get_daily_volatility(self, close: pd.Series, span: Optional[int] = None) -> pd.Series:
         """
@@ -183,13 +191,50 @@ class TripleBarrierLabeler:
             labels['ret'] = 0.0
             labels['bin'] = 0
 
+            # Track statistics for force_directional debugging
+            barrier_stats = {
+                'profit': 0, 'loss': 0, 'timeout': 0,
+                'timeout_positive': 0, 'timeout_negative': 0, 'timeout_flat': 0,
+                'no_threshold': 0, 'missing_end_time': 0, 'end_time_not_in_close': 0,
+                'total_labels': len(labels)
+            }
+
             for idx in labels.index:
                 # Get start and end prices
                 start_price = close.loc[idx]
                 end_time = labels.loc[idx, 'End Time']
 
-                if pd.notna(end_time) and end_time in close.index:
-                    end_price = close.loc[end_time]
+                # Handle missing/invalid end times
+                actual_end_time = None
+                if pd.isna(end_time):
+                    barrier_stats['missing_end_time'] += 1
+                    # Calculate intended vertical barrier time (max_holding_period bars from event)
+                    future_bars = close.index[close.index > idx]
+                    if len(future_bars) >= self.max_holding_period:
+                        actual_end_time = future_bars[self.max_holding_period - 1]
+                    elif len(future_bars) > 0:
+                        # Less than max_holding_period bars available, use last available
+                        actual_end_time = future_bars[-1]
+                    else:
+                        # No future data, skip this label
+                        continue
+                elif end_time not in close.index:
+                    barrier_stats['end_time_not_in_close'] += 1
+                    # Find closest available bar BEFORE or AT the intended end_time
+                    # Don't go beyond max_holding_period from event start
+                    future_bars = close.index[close.index > idx]
+                    if len(future_bars) >= self.max_holding_period:
+                        actual_end_time = future_bars[self.max_holding_period - 1]
+                    elif len(future_bars) > 0:
+                        actual_end_time = future_bars[-1]
+                    else:
+                        continue
+                else:
+                    actual_end_time = end_time
+
+                # Now we have a valid end_time (either original or fallback)
+                if actual_end_time is not None and actual_end_time in close.index:
+                    end_price = close.loc[actual_end_time]
                     ret = (end_price / start_price) - 1
                     labels.loc[idx, 'ret'] = ret
 
@@ -201,9 +246,59 @@ class TripleBarrierLabeler:
 
                         if ret >= profit_barrier:
                             labels.loc[idx, 'bin'] = 1  # Profit taking
+                            barrier_stats['profit'] += 1
                         elif ret <= loss_barrier:
                             labels.loc[idx, 'bin'] = -1  # Stop loss
-                        # else: bin = 0 (vertical barrier / timeout)
+                            barrier_stats['loss'] += 1
+                        else:
+                            # Vertical barrier / timeout hit
+                            barrier_stats['timeout'] += 1
+                            if self.force_directional:
+                                # Force directional labels based on price movement
+                                # Only label as neutral if price is truly flat
+                                if abs(ret) <= self.neutral_threshold:
+                                    labels.loc[idx, 'bin'] = 0  # Truly flat
+                                    barrier_stats['timeout_flat'] += 1
+                                elif ret > 0:
+                                    labels.loc[idx, 'bin'] = 1  # Price moved up
+                                    barrier_stats['timeout_positive'] += 1
+                                else:
+                                    labels.loc[idx, 'bin'] = -1  # Price moved down
+                                    barrier_stats['timeout_negative'] += 1
+                            else:
+                                # Default behavior: timeout = neutral
+                                labels.loc[idx, 'bin'] = 0
+                    else:
+                        barrier_stats['no_threshold'] += 1
+
+            # Log force_directional statistics
+            if self.force_directional:
+                logger.info("=" * 60)
+                logger.info("FORCE_DIRECTIONAL DIAGNOSTIC:")
+                logger.info(f"  Total labels: {barrier_stats['total_labels']}")
+                logger.info(f"  Profit barrier hits: {barrier_stats['profit']}")
+                logger.info(f"  Loss barrier hits: {barrier_stats['loss']}")
+                logger.info(f"  Timeouts (total): {barrier_stats['timeout']}")
+                logger.info(f"    - Relabeled as Long: {barrier_stats['timeout_positive']}")
+                logger.info(f"    - Relabeled as Short: {barrier_stats['timeout_negative']}")
+                logger.info(f"    - Kept as Neutral (flat): {barrier_stats['timeout_flat']}")
+                logger.info(f"  No threshold (skipped): {barrier_stats['no_threshold']}")
+                logger.info(f"  Missing end_time (NaN): {barrier_stats['missing_end_time']}")
+                logger.info(f"  End_time not in close index: {barrier_stats['end_time_not_in_close']}")
+
+                # Calculate accounting
+                accounted = (barrier_stats['profit'] + barrier_stats['loss'] +
+                           barrier_stats['timeout'] + barrier_stats['no_threshold'] +
+                           barrier_stats['missing_end_time'] + barrier_stats['end_time_not_in_close'])
+                unaccounted = barrier_stats['total_labels'] - accounted
+                logger.info(f"  Accounted: {accounted}/{barrier_stats['total_labels']}")
+                if unaccounted > 0:
+                    logger.info(f"  ⚠️  UNACCOUNTED: {unaccounted} labels!")
+
+                if barrier_stats['timeout'] > 0:
+                    flat_pct = barrier_stats['timeout_flat'] / barrier_stats['timeout'] * 100
+                    logger.info(f"  Flat timeout percentage: {flat_pct:.1f}%")
+                logger.info("=" * 60)
 
             logger.info(f"Generated {len(labels)} labels")
             if 'bin' in labels.columns:

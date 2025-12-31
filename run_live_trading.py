@@ -26,7 +26,6 @@ from config.tick_config import (
     OPTIMAL_PROB_THRESHOLD,
     OPTIMAL_FRACTIONAL_D
 )
-
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
@@ -63,18 +62,42 @@ def main():
     # Create trader first
     trader = Trader()
 
+    # Choose which tier of US stocks to trade
+    # tier_1: Top 100 most liquid (AAPL, MSFT, etc.) - START HERE
+    # tier_2: Top 500 (S&P 500 level)
+    # tier_3: Top 1000 (Russell 1000)
+    # tier_4: Top 2000
+    # tier_5: ALL liquid US stocks (2000-5000 symbols)
+
+    try:
+        from config.all_symbols import get_symbols_by_tier
+        ACTIVE_SYMBOLS = get_symbols_by_tier('tier_1')  # Start with top 100
+    except ImportError:
+        logger.error("all_symbols.py not found!")
+        logger.error("Run: python scripts/fetch_all_symbols.py first")
+        return 1
+
+    logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from tier_1")
+    logger.info(f"First 10: {', '.join(ACTIVE_SYMBOLS[:10])}")
+
     # Initialize strategy with OPTIMIZED tick-based models
     # Set parameters as class attribute before creating instance
     RiskLabAICombined.parameters = {
-        # Trading symbols
-        'symbols': ['SPY'],
+        # Trading symbols - Multi-asset universe
+        # Each symbol will load its own model: models/risklabai_{symbol}_models.pkl
+        'symbols': ACTIVE_SYMBOLS,
 
         # OPTIMAL PARAMETERS from parameter sweep (Sharpe 3.53, Win Rate 73.1%)
-        'model_path': 'models/risklabai_tick_models_optimized.pkl',
-        'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% profit target
-        'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% stop loss
+        # Using AGGRESSIVE model with force_directional to fix 97% neutral bias
+        # Note: Each symbol loads its own model from models/risklabai_{symbol}_models.pkl
+        'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% (0.04) profit target
+        'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% (0.02) stop loss
         'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 20 bars max hold
         'd': OPTIMAL_FRACTIONAL_D,               # 0.30 - Fractional differencing (preserves 70% memory)
+
+        # AGGRESSIVE LABELING to fix 97% neutral predictions
+        'force_directional': True,                # Force directional labels (key fix!)
+        'neutral_threshold': 0.00001,            # Only neutral if |return| < 0.001%
 
         # Signal thresholds
         'meta_threshold': OPTIMAL_META_THRESHOLD,  # 0.001 (0.1%) - Meta model confidence

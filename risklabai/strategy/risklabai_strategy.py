@@ -90,7 +90,9 @@ class RiskLabAIStrategy:
         stop_loss: float = 2.0,
         max_holding: int = 10,
         d: float = None,
-        n_cv_splits: int = 5
+        n_cv_splits: int = 5,
+        force_directional: bool = False,
+        neutral_threshold: float = 0.00001
     ):
         """
         Initialize RiskLabAI strategy.
@@ -101,6 +103,8 @@ class RiskLabAIStrategy:
             max_holding: Max periods before timeout
             d: Fractional differencing parameter (0-1, typically 0.3-0.6)
             n_cv_splits: Cross-validation folds
+            force_directional: If True, force directional labels (reduce neutral class)
+            neutral_threshold: Threshold for neutral labels (default 0.001%)
         """
         # Initialize components
         self.cusum_filter = CUSUMEventFilter()
@@ -108,7 +112,9 @@ class RiskLabAIStrategy:
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=profit_taking,
             stop_loss_mult=stop_loss,
-            max_holding_period=max_holding
+            max_holding_period=max_holding,
+            force_directional=force_directional,
+            neutral_threshold=neutral_threshold
         )
         self.meta_labeler = MetaLabeler()
         self.cv = PurgedCrossValidator(n_splits=n_cv_splits)
@@ -239,7 +245,12 @@ class RiskLabAIStrategy:
         labels = labels.loc[labels.index.isin(features.index)]
         features = features.loc[features.index.isin(labels.index)]
 
-        logger.info(f"  Label distribution: {labels['bin'].value_counts().to_dict()}")
+        # Log detailed label distribution
+        label_counts = labels['bin'].value_counts().to_dict()
+        label_pcts = (labels['bin'].value_counts(normalize=True) * 100).to_dict()
+        logger.info(f"  Label distribution: {label_counts}")
+        logger.info(f"  Label percentages: Short={label_pcts.get(-1, 0):.2f}%, "
+                   f"Neutral={label_pcts.get(0, 0):.2f}%, Long={label_pcts.get(1, 0):.2f}%")
 
         # Step 4: Train primary model (direction)
         logger.info("Step 4: Training primary model...")
@@ -251,7 +262,8 @@ class RiskLabAIStrategy:
             max_depth=5,
             min_samples_leaf=10,
             n_jobs=-1,
-            random_state=42
+            random_state=42,
+            class_weight='balanced'  # Penalize majority class to fix imbalance
         )
 
         # Use purged CV for validation
@@ -325,7 +337,8 @@ class RiskLabAIStrategy:
                 max_depth=3,
                 min_samples_leaf=20,
                 n_jobs=-1,
-                random_state=42
+                random_state=42,
+                class_weight='balanced'  # Balance meta model as well
             )
 
             y_meta = meta_labels['bin']
@@ -396,19 +409,52 @@ class RiskLabAIStrategy:
         probs = self.primary_model.predict_proba(X)[0]
         # probs[0] = P(short=-1), probs[1] = P(no_trade=0), probs[2] = P(long=1)
 
-        if probs[2] > prob_threshold:
-            # Long signal if long probability exceeds threshold
-            direction = 1
-        elif probs[0] > prob_threshold:
-            # Short signal if short probability exceeds threshold
-            direction = -1
+        # Log primary model probabilities
+        logger.info(f"Primary model probabilities - Short: {probs[0]:.4f}, Neutral: {probs[1]:.4f}, Long: {probs[2]:.4f}")
+
+        # OPTION 2: Probability Margin Approach
+        # Only predict directional when there's a CLEAR winner
+        # This improves consistency by filtering low-conviction trades
+
+        prob_short = probs[0]
+        prob_neutral = probs[1]
+        prob_long = probs[2]
+
+        # Find the winning class and calculate margin vs runner-up
+        if prob_long > prob_short and prob_long > prob_neutral:
+            winner = 1  # Long
+            margin = prob_long - max(prob_short, prob_neutral)
+        elif prob_short > prob_long and prob_short > prob_neutral:
+            winner = -1  # Short
+            margin = prob_short - max(prob_long, prob_neutral)
         else:
-            # No trade if neither direction shows sufficient conviction
+            winner = 0  # Neutral
+            margin = 0
+
+        # Require BOTH conditions for directional prediction:
+        # 1. Winner probability > prob_threshold (keeps optimal param)
+        # 2. Margin between winner and runner-up > margin_threshold (new filter)
+        MARGIN_THRESHOLD = 0.03  # 3% margin required for medium-confidence trades
+                                  # Lower than 5% to allow more action for consistent monthly returns
+
+        if (winner != 0 and
+            margin >= MARGIN_THRESHOLD and
+            max(prob_long, prob_short) > prob_threshold):
+            direction = winner
+            logger.info(f"✓ Signal accepted: margin={margin:.2%} (>{MARGIN_THRESHOLD:.1%}), "
+                       f"prob={max(prob_long, prob_short):.2%} (>{prob_threshold:.2%})")
+        else:
             direction = 0
+            if winner != 0:
+                logger.info(f"✗ Signal filtered: margin={margin:.2%} (need >{MARGIN_THRESHOLD:.1%}), "
+                           f"predicting neutral instead of {winner}")
 
         # Meta model: should we trade? (probability)
         if self.meta_model is not None:
             trade_prob = self.meta_model.predict_proba(X)[0, 1]
+
+            # Log meta model probability
+            logger.info(f"Meta model trade probability: {trade_prob:.4f}")
 
             # Convert probability to bet size
             if trade_prob < meta_threshold:
