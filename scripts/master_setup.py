@@ -202,6 +202,47 @@ Examples:
         if not run_command(cmd, "Download tick data"):
             logger.error("Failed to download tick data. Aborting.")
             return 1
+
+        # Verify all symbols have tick data
+        logger.info("")
+        logger.info("Verifying tick data for all symbols...")
+
+        import sqlite3
+        from config.all_symbols import get_symbols_by_tier
+
+        tier_symbols = get_symbols_by_tier(args.tier)
+
+        conn = sqlite3.connect('/Volumes/Vault/trading_data/tick-data-storage.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT DISTINCT symbol FROM ticks ORDER BY symbol")
+        symbols_with_data = {row[0] for row in cursor.fetchall()}
+        conn.close()
+
+        missing_symbols = [s for s in tier_symbols if s not in symbols_with_data]
+
+        if missing_symbols:
+            logger.warning(f"⚠️  {len(missing_symbols)} symbols are missing tick data:")
+            logger.warning(f"  Missing: {', '.join(missing_symbols[:10])}")
+            if len(missing_symbols) > 10:
+                logger.warning(f"  ... and {len(missing_symbols) - 10} more")
+            logger.warning("")
+            logger.warning("Retrying download for missing symbols...")
+
+            # Retry downloading missing symbols one at a time
+            for symbol in missing_symbols:
+                logger.info(f"  Downloading {symbol}...")
+                retry_cmd = [
+                    '/Users/henry/miniconda3/envs/trading/bin/python',
+                    'scripts/backfill_ticks.py',
+                    '--symbol', symbol,
+                    '--days', str(args.days)
+                ]
+                subprocess.run(retry_cmd, cwd=project_root)
+
+            logger.info("")
+            logger.info("✓ Retry complete - all symbols should now have data")
+        else:
+            logger.info(f"✓ All {len(tier_symbols)} symbols have tick data")
     else:
         logger.info("⏭️  Skipping tick data download")
 

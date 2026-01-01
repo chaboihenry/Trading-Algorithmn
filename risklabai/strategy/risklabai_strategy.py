@@ -407,29 +407,53 @@ class RiskLabAIStrategy:
         # CRITICAL FIX: Use predict_proba instead of predict to avoid
         # the model being too conservative (always predicting class 0)
         probs = self.primary_model.predict_proba(X)[0]
-        # probs[0] = P(short=-1), probs[1] = P(no_trade=0), probs[2] = P(long=1)
 
-        # Log primary model probabilities
-        logger.info(f"Primary model probabilities - Short: {probs[0]:.4f}, Neutral: {probs[1]:.4f}, Long: {probs[2]:.4f}")
+        # Handle both 2-class (force_directional=True) and 3-class models
+        # For 2-class: probs[0] = P(short=-1), probs[1] = P(long=1)
+        # For 3-class: probs[0] = P(short=-1), probs[1] = P(neutral=0), probs[2] = P(long=1)
 
-        # OPTION 2: Probability Margin Approach
-        # Only predict directional when there's a CLEAR winner
-        # This improves consistency by filtering low-conviction trades
+        n_classes = len(probs)
 
-        prob_short = probs[0]
-        prob_neutral = probs[1]
-        prob_long = probs[2]
+        if n_classes == 2:
+            # 2-class model (force_directional=True)
+            # Class 0 = Short, Class 1 = Long
+            prob_short = probs[0]
+            prob_long = probs[1]
+            prob_neutral = 0.0  # No neutral class
 
-        # Find the winning class and calculate margin vs runner-up
-        if prob_long > prob_short and prob_long > prob_neutral:
-            winner = 1  # Long
-            margin = prob_long - max(prob_short, prob_neutral)
-        elif prob_short > prob_long and prob_short > prob_neutral:
-            winner = -1  # Short
-            margin = prob_short - max(prob_long, prob_neutral)
+            # Log primary model probabilities
+            logger.info(f"Primary model probabilities (2-class) - Short: {prob_short:.4f}, Long: {prob_long:.4f}")
+
+            # Find the winning class and calculate margin
+            if prob_long > prob_short:
+                winner = 1  # Long
+                margin = prob_long - prob_short
+            else:
+                winner = -1  # Short
+                margin = prob_short - prob_long
+
+        elif n_classes == 3:
+            # 3-class model (force_directional=False)
+            # Class 0 = Short, Class 1 = Neutral, Class 2 = Long
+            prob_short = probs[0]
+            prob_neutral = probs[1]
+            prob_long = probs[2]
+
+            # Log primary model probabilities
+            logger.info(f"Primary model probabilities (3-class) - Short: {prob_short:.4f}, Neutral: {prob_neutral:.4f}, Long: {prob_long:.4f}")
+
+            # Find the winning class and calculate margin vs runner-up
+            if prob_long > prob_short and prob_long > prob_neutral:
+                winner = 1  # Long
+                margin = prob_long - max(prob_short, prob_neutral)
+            elif prob_short > prob_long and prob_short > prob_neutral:
+                winner = -1  # Short
+                margin = prob_short - max(prob_long, prob_neutral)
+            else:
+                winner = 0  # Neutral
+                margin = 0
         else:
-            winner = 0  # Neutral
-            margin = 0
+            raise ValueError(f"Unexpected number of classes: {n_classes}")
 
         # Require BOTH conditions for directional prediction:
         # 1. Winner probability > prob_threshold (keeps optimal param)
