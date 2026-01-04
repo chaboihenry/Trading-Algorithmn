@@ -17,8 +17,10 @@ from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 
 from core.risklabai_combined import RiskLabAICombined
-from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET, ALPACA_PAPER
 from config.tick_config import (
+    ALPACA_API_KEY,
+    ALPACA_API_SECRET,
+    ALPACA_PAPER,
     OPTIMAL_PROFIT_TARGET,
     OPTIMAL_STOP_LOSS,
     OPTIMAL_MAX_HOLDING_BARS,

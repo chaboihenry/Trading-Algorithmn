@@ -72,6 +72,10 @@ if not ALPACA_API_KEY or not ALPACA_API_SECRET:
         "Set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file."
     )
 
+# Paper trading mode (True = paper, False = live)
+# ALWAYS start with paper trading before going live!
+ALPACA_PAPER = True
+
 # =============================================================================
 # TRADING SYMBOLS
 # =============================================================================
@@ -304,6 +308,15 @@ BACKTEST_MAX_DRAWDOWN = -0.0779
 # d=0.30 achieves stationarity (p=0.0405) while preserving 70% of memory
 # Lower d = more memory = better predictions
 OPTIMAL_FRACTIONAL_D = 0.30
+
+# =============================================================================
+# LEGACY ALIASES (for backward compatibility with old code)
+# =============================================================================
+
+TRADING_SYMBOLS = SYMBOLS
+STOP_LOSS_PCT = OPTIMAL_STOP_LOSS
+TAKE_PROFIT_PCT = OPTIMAL_PROFIT_TARGET
+MAX_POSITION_PCT = MAX_POSITION_SIZE_PCT
 
 # =============================================================================
 # AUTO-VALIDATION ON IMPORT

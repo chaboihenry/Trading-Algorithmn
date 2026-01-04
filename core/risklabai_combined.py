@@ -30,7 +30,7 @@ from data.tick_to_bars import generate_bars_from_ticks
 from config.tick_config import TICK_DB_PATH, INITIAL_IMBALANCE_THRESHOLD
 
 # Import existing infrastructure
-from backup.settings import (
+from config.tick_config import (
     STOP_LOSS_PCT,
     TAKE_PROFIT_PCT,
     MAX_POSITION_PCT,
