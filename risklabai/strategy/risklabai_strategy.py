@@ -90,9 +90,7 @@ class RiskLabAIStrategy:
         stop_loss: float = 2.0,
         max_holding: int = 10,
         d: float = None,
-        n_cv_splits: int = 5,
-        force_directional: bool = False,
-        neutral_threshold: float = 0.00001
+        n_cv_splits: int = 5
     ):
         """
         Initialize RiskLabAI strategy.
@@ -103,8 +101,6 @@ class RiskLabAIStrategy:
             max_holding: Max periods before timeout
             d: Fractional differencing parameter (0-1, typically 0.3-0.6)
             n_cv_splits: Cross-validation folds
-            force_directional: If True, force directional labels (reduce neutral class)
-            neutral_threshold: Threshold for neutral labels (default 0.001%)
         """
         # Initialize components
         self.cusum_filter = CUSUMEventFilter()
@@ -112,9 +108,7 @@ class RiskLabAIStrategy:
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=profit_taking,
             stop_loss_mult=stop_loss,
-            max_holding_period=max_holding,
-            force_directional=force_directional,
-            neutral_threshold=neutral_threshold
+            max_holding_period=max_holding
         )
         self.meta_labeler = MetaLabeler()
         self.cv = PurgedCrossValidator(n_splits=n_cv_splits)
@@ -408,23 +402,21 @@ class RiskLabAIStrategy:
         # the model being too conservative (always predicting class 0)
         probs = self.primary_model.predict_proba(X)[0]
 
-        # Handle both 2-class (force_directional=True) and 3-class models
-        # For 2-class: probs[0] = P(short=-1), probs[1] = P(long=1)
-        # For 3-class: probs[0] = P(short=-1), probs[1] = P(neutral=0), probs[2] = P(long=1)
+        # Handle both 2-class and 3-class models
+        # 2-class: probs[0] = P(short=-1), probs[1] = P(long=1)
+        # 3-class: probs[0] = P(short=-1), probs[1] = P(neutral=0), probs[2] = P(long=1)
 
         n_classes = len(probs)
 
         if n_classes == 2:
-            # 2-class model (force_directional=True)
-            # Class 0 = Short, Class 1 = Long
+            # 2-class model (no neutral class - insufficient timeout labels during training)
             prob_short = probs[0]
+            prob_neutral = 0.0
             prob_long = probs[1]
-            prob_neutral = 0.0  # No neutral class
 
-            # Log primary model probabilities
             logger.info(f"Primary model probabilities (2-class) - Short: {prob_short:.4f}, Long: {prob_long:.4f}")
 
-            # Find the winning class and calculate margin
+            # Winner is whichever has higher probability
             if prob_long > prob_short:
                 winner = 1  # Long
                 margin = prob_long - prob_short
@@ -433,13 +425,11 @@ class RiskLabAIStrategy:
                 margin = prob_short - prob_long
 
         elif n_classes == 3:
-            # 3-class model (force_directional=False)
-            # Class 0 = Short, Class 1 = Neutral, Class 2 = Long
+            # 3-class model (has neutral class from timeout labels)
             prob_short = probs[0]
             prob_neutral = probs[1]
             prob_long = probs[2]
 
-            # Log primary model probabilities
             logger.info(f"Primary model probabilities (3-class) - Short: {prob_short:.4f}, Neutral: {prob_neutral:.4f}, Long: {prob_long:.4f}")
 
             # Find the winning class and calculate margin vs runner-up
@@ -450,10 +440,10 @@ class RiskLabAIStrategy:
                 winner = -1  # Short
                 margin = prob_short - max(prob_long, prob_neutral)
             else:
-                winner = 0  # Neutral
-                margin = 0
+                winner = 0  # Neutral (timeout signal)
+                margin = prob_neutral - max(prob_short, prob_long)
         else:
-            raise ValueError(f"Unexpected number of classes: {n_classes}")
+            raise ValueError(f"Unexpected number of classes: {n_classes}. Expected 2 or 3.")
 
         # Require BOTH conditions for directional prediction:
         # 1. Winner probability > prob_threshold (keeps optimal param)

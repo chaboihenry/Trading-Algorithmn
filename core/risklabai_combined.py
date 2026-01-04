@@ -126,8 +126,6 @@ class RiskLabAICombined(Strategy):
             'stop_loss': parameters.get('stop_loss', 0.5) if parameters else 0.5,
             'max_holding': parameters.get('max_holding', 20) if parameters else 20,
             'd': parameters.get('d', 1.0) if parameters else 1.0,
-            'force_directional': parameters.get('force_directional', False) if parameters else False,
-            'neutral_threshold': parameters.get('neutral_threshold', 0.00001) if parameters else 0.00001,
         }
 
         # Create a template RiskLabAI instance (for accessing labeler params)
@@ -136,9 +134,7 @@ class RiskLabAICombined(Strategy):
             stop_loss=self.risklabai_params['stop_loss'],
             max_holding=self.risklabai_params['max_holding'],
             d=self.risklabai_params['d'],
-            n_cv_splits=5,
-            force_directional=self.risklabai_params['force_directional'],
-            neutral_threshold=self.risklabai_params['neutral_threshold']
+            n_cv_splits=5
         )
 
         # NEW: Per-symbol model storage
@@ -250,9 +246,7 @@ class RiskLabAICombined(Strategy):
                     stop_loss=self.risklabai_params['stop_loss'],
                     max_holding=self.risklabai_params['max_holding'],
                     d=self.risklabai_params['d'],
-                    n_cv_splits=5,
-                    force_directional=self.risklabai_params['force_directional'],
-                    neutral_threshold=self.risklabai_params['neutral_threshold']
+                    n_cv_splits=5
                 )
 
                 # Load the trained model

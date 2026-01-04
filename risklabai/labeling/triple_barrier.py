@@ -46,9 +46,7 @@ class TripleBarrierLabeler:
         profit_taking_mult: float = 2.0,
         stop_loss_mult: float = 2.0,
         max_holding_period: int = 10,
-        volatility_lookback: int = 20,
-        force_directional: bool = False,
-        neutral_threshold: float = 0.00001
+        volatility_lookback: int = 20
     ):
         """
         Initialize triple-barrier labeler.
@@ -58,20 +56,14 @@ class TripleBarrierLabeler:
             stop_loss_mult: Lower barrier = volatility * this value
             max_holding_period: Maximum periods before vertical barrier
             volatility_lookback: Days for volatility calculation
-            force_directional: If True, force directional labels based on price movement
-                             Only label as neutral if price is truly flat (within neutral_threshold)
-            neutral_threshold: Threshold for neutral labels (default 0.001% = 0.00001)
         """
         self.profit_taking_mult = profit_taking_mult
         self.stop_loss_mult = stop_loss_mult
         self.max_holding_period = max_holding_period
         self.volatility_lookback = volatility_lookback
-        self.force_directional = force_directional
-        self.neutral_threshold = neutral_threshold
 
         logger.info(f"TripleBarrierLabeler initialized: pt={profit_taking_mult}, "
-                   f"sl={stop_loss_mult}, max_hold={max_holding_period}, "
-                   f"force_directional={force_directional}, neutral_threshold={neutral_threshold:.5f}")
+                   f"sl={stop_loss_mult}, max_hold={max_holding_period}")
 
     def get_daily_volatility(self, close: pd.Series, span: Optional[int] = None) -> pd.Series:
         """
@@ -251,56 +243,18 @@ class TripleBarrierLabeler:
                             labels.loc[idx, 'bin'] = -1  # Stop loss
                             barrier_stats['loss'] += 1
                         else:
-                            # Vertical barrier / timeout hit
+                            # Vertical barrier / timeout hit - label as neutral (0)
+                            # Neutral represents timeout and can be used as trading signal
                             barrier_stats['timeout'] += 1
-                            if self.force_directional:
-                                # Force directional labels based on price movement
-                                # Only label as neutral if price is truly flat
-                                if abs(ret) <= self.neutral_threshold:
-                                    labels.loc[idx, 'bin'] = 0  # Truly flat
-                                    barrier_stats['timeout_flat'] += 1
-                                elif ret > 0:
-                                    labels.loc[idx, 'bin'] = 1  # Price moved up
-                                    barrier_stats['timeout_positive'] += 1
-                                else:
-                                    labels.loc[idx, 'bin'] = -1  # Price moved down
-                                    barrier_stats['timeout_negative'] += 1
-                            else:
-                                # Default behavior: timeout = neutral
-                                labels.loc[idx, 'bin'] = 0
+                            labels.loc[idx, 'bin'] = 0
                     else:
                         barrier_stats['no_threshold'] += 1
 
-            # Log force_directional statistics
-            if self.force_directional:
-                logger.info("=" * 60)
-                logger.info("FORCE_DIRECTIONAL DIAGNOSTIC:")
-                logger.info(f"  Total labels: {barrier_stats['total_labels']}")
-                logger.info(f"  Profit barrier hits: {barrier_stats['profit']}")
-                logger.info(f"  Loss barrier hits: {barrier_stats['loss']}")
-                logger.info(f"  Timeouts (total): {barrier_stats['timeout']}")
-                logger.info(f"    - Relabeled as Long: {barrier_stats['timeout_positive']}")
-                logger.info(f"    - Relabeled as Short: {barrier_stats['timeout_negative']}")
-                logger.info(f"    - Kept as Neutral (flat): {barrier_stats['timeout_flat']}")
-                logger.info(f"  No threshold (skipped): {barrier_stats['no_threshold']}")
-                logger.info(f"  Missing end_time (NaN): {barrier_stats['missing_end_time']}")
-                logger.info(f"  End_time not in close index: {barrier_stats['end_time_not_in_close']}")
-
-                # Calculate accounting
-                accounted = (barrier_stats['profit'] + barrier_stats['loss'] +
-                           barrier_stats['timeout'] + barrier_stats['no_threshold'] +
-                           barrier_stats['missing_end_time'] + barrier_stats['end_time_not_in_close'])
-                unaccounted = barrier_stats['total_labels'] - accounted
-                logger.info(f"  Accounted: {accounted}/{barrier_stats['total_labels']}")
-                if unaccounted > 0:
-                    logger.info(f"  ⚠️  UNACCOUNTED: {unaccounted} labels!")
-
-                if barrier_stats['timeout'] > 0:
-                    flat_pct = barrier_stats['timeout_flat'] / barrier_stats['timeout'] * 100
-                    logger.info(f"  Flat timeout percentage: {flat_pct:.1f}%")
-                logger.info("=" * 60)
-
-            logger.info(f"Generated {len(labels)} labels")
+            # Log labeling statistics
+            logger.info(f"Triple-barrier labeling complete: {len(labels)} labels generated")
+            logger.info(f"  Profit hits: {barrier_stats['profit']}")
+            logger.info(f"  Loss hits: {barrier_stats['loss']}")
+            logger.info(f"  Timeouts (neutral): {barrier_stats['timeout']}")
             if 'bin' in labels.columns:
                 logger.info(f"Label distribution: {labels['bin'].value_counts().to_dict()}")
 

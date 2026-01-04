@@ -88,16 +88,11 @@ def main():
         'symbols': ACTIVE_SYMBOLS,
 
         # OPTIMAL PARAMETERS from parameter sweep (Sharpe 3.53, Win Rate 73.1%)
-        # Using AGGRESSIVE model with force_directional to fix 97% neutral bias
         # Note: Each symbol loads its own model from models/risklabai_{symbol}_models.pkl
         'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% (0.04) profit target
         'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% (0.02) stop loss
         'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 20 bars max hold
         'd': OPTIMAL_FRACTIONAL_D,               # 0.30 - Fractional differencing (preserves 70% memory)
-
-        # AGGRESSIVE LABELING to fix 97% neutral predictions
-        'force_directional': True,                # Force directional labels (key fix!)
-        'neutral_threshold': 0.00001,            # Only neutral if |return| < 0.001%
 
         # Signal thresholds
         'meta_threshold': OPTIMAL_META_THRESHOLD,  # 0.001 (0.1%) - Meta model confidence

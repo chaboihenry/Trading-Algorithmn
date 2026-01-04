@@ -220,9 +220,7 @@ class MultiSymbolBacktest:
                     stop_loss=OPTIMAL_STOP_LOSS,
                     max_holding=OPTIMAL_MAX_HOLDING_BARS,
                     d=OPTIMAL_FRACTIONAL_D,
-                    n_cv_splits=5,
-                    force_directional=True,
-                    neutral_threshold=0.00001
+                    n_cv_splits=5
                 )
                 strategy.load_models(str(model_path))
                 self.models[symbol] = strategy
@@ -283,8 +281,17 @@ class MultiSymbolBacktest:
                     bars_df['bar_end'] = bars_df['bar_end'].dt.tz_localize(None)
                 bars_df.set_index('bar_end', inplace=True)
 
-                # Store last N bars
-                self.symbol_bars[symbol] = bars_df.iloc[-self.bars_to_simulate:].copy()
+                # CRITICAL: Use only TEST SET (last 30%) to prevent data leakage
+                # Models were trained on first 70%, we test on last 30%
+                train_size = int(len(bars_df) * 0.7)
+                test_bars = bars_df.iloc[train_size:].copy()
+
+                logger.info(f"  Test set: {len(test_bars)} bars (last 30% - unseen during training)")
+                logger.info(f"  Test period: {test_bars.index[0]} to {test_bars.index[-1]}")
+
+                # Use min of bars_to_simulate and test set size
+                bars_to_use = min(self.bars_to_simulate, len(test_bars))
+                self.symbol_bars[symbol] = test_bars.iloc[-bars_to_use:].copy()
                 logger.info(f"  ✓ Using {len(self.symbol_bars[symbol])} bars for backtest")
 
             except Exception as e:
@@ -326,6 +333,9 @@ class MultiSymbolBacktest:
         # Initialize bar counters for each symbol
         bar_counts = {symbol: 50 for symbol in self.symbol_bars.keys()}  # Start at bar 50
 
+        # Store pending orders (executed on next bar's open)
+        pending_orders = {}  # symbol -> {'signal': int, 'bet_size': float, 'timestamp': datetime}
+
         while True:
             # Get current timestamp (earliest timestamp across all symbols at current bar)
             current_times = {}
@@ -349,7 +359,55 @@ class MultiSymbolBacktest:
             # Record equity
             self.portfolio.record_equity(current_time, current_prices)
 
-            # Check each symbol for trading signals
+            # STEP 1: Execute pending orders from previous bar using current bar's OPEN
+            for symbol in list(pending_orders.keys()):
+                if symbol not in self.symbol_bars or symbol not in current_prices:
+                    continue
+
+                idx = bar_counts[symbol]
+                if idx >= len(self.symbol_bars[symbol]):
+                    continue
+
+                # Get current bar's OPEN price (this is realistic - you execute on next bar open)
+                execution_price = self.symbol_bars[symbol]['open'].iloc[idx]
+
+                pending = pending_orders[symbol]
+                signal = pending['signal']
+                bet_size = pending['bet_size']
+
+                current_position = self.portfolio.get_position(symbol)
+                portfolio_value = self.portfolio.get_portfolio_value(current_prices)
+
+                if signal == 1:  # Long
+                    if not current_position:
+                        # Enter long using NEXT bar's open
+                        position_value = portfolio_value * self.kelly_fraction * bet_size
+                        quantity = int(position_value / execution_price)
+
+                        if quantity > 0:
+                            success = self.portfolio.execute_trade(
+                                symbol, quantity, execution_price,
+                                current_time, 'BUY', signal
+                            )
+                            if success:
+                                logger.info(f"{current_time} | {symbol}: BUY {quantity} @ ${execution_price:.2f} (bet_size={bet_size:.2f}) [NEXT BAR OPEN]")
+
+                elif signal == -1:  # Exit long
+                    if current_position:
+                        # Close position using NEXT bar's open
+                        quantity = current_position['quantity']
+                        success = self.portfolio.execute_trade(
+                            symbol, quantity, execution_price,
+                            current_time, 'SELL', signal
+                        )
+                        if success:
+                            last_trade = self.portfolio.trades[-1]
+                            logger.info(f"{current_time} | {symbol}: SELL {quantity} @ ${execution_price:.2f} | P&L: ${last_trade['pnl']:.2f} ({last_trade['pnl_pct']:.1f}%) [NEXT BAR OPEN]")
+
+                # Remove executed order
+                del pending_orders[symbol]
+
+            # STEP 2: Generate new signals (will be executed on NEXT bar's open)
             for symbol in list(self.symbol_bars.keys()):
                 if symbol not in self.models:
                     continue
@@ -370,7 +428,7 @@ class MultiSymbolBacktest:
                     continue
 
                 try:
-                    # Get prediction
+                    # Get prediction based on data UP TO current bar
                     signal, bet_size = self.models[symbol].predict(
                         bars_up_to_now,
                         prob_threshold=OPTIMAL_PROB_THRESHOLD,
@@ -381,36 +439,14 @@ class MultiSymbolBacktest:
                     if bet_size < 0.5:
                         signal = 0
 
-                    # Execute based on signal
-                    current_price = current_prices[symbol]
-                    current_position = self.portfolio.get_position(symbol)
-                    portfolio_value = self.portfolio.get_portfolio_value(current_prices)
-
-                    if signal == 1:  # Long
-                        if not current_position:
-                            # Enter long
-                            position_value = portfolio_value * self.kelly_fraction * bet_size
-                            quantity = int(position_value / current_price)
-
-                            if quantity > 0:
-                                success = self.portfolio.execute_trade(
-                                    symbol, quantity, current_price,
-                                    current_time, 'BUY', signal
-                                )
-                                if success:
-                                    logger.info(f"{current_time} | {symbol}: BUY {quantity} @ ${current_price:.2f} (bet_size={bet_size:.2f})")
-
-                    elif signal == -1:  # Exit long (or short signal)
-                        if current_position:
-                            # Close position
-                            quantity = current_position['quantity']
-                            success = self.portfolio.execute_trade(
-                                symbol, quantity, current_price,
-                                current_time, 'SELL', signal
-                            )
-                            if success:
-                                last_trade = self.portfolio.trades[-1]
-                                logger.info(f"{current_time} | {symbol}: SELL {quantity} @ ${current_price:.2f} | P&L: ${last_trade['pnl']:.2f} ({last_trade['pnl_pct']:.1f}%)")
+                    # Store signal as PENDING ORDER (will execute on NEXT bar's open)
+                    if signal != 0:
+                        pending_orders[symbol] = {
+                            'signal': signal,
+                            'bet_size': bet_size,
+                            'timestamp': current_time
+                        }
+                        logger.debug(f"{current_time} | {symbol}: Signal generated: {signal} (bet_size={bet_size:.2f}) - will execute on NEXT bar's open")
 
                 except Exception as e:
                     logger.error(f"{symbol}: Prediction error: {e}")

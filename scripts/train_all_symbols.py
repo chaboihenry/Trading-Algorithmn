@@ -124,6 +124,19 @@ def train_symbol(symbol: str) -> dict:
             bars_df['bar_end'] = bars_df['bar_end'].dt.tz_localize(None)
         bars_df.set_index('bar_end', inplace=True)
 
+        # CRITICAL: Train/Test Split to prevent data leakage
+        # Use first 70% for training, last 30% reserved for backtesting
+        train_size = int(len(bars_df) * 0.7)
+        train_bars = bars_df.iloc[:train_size].copy()
+        test_bars = bars_df.iloc[train_size:].copy()
+
+        logger.info(f"[{symbol}] Train/Test Split: {len(train_bars)} train bars, {len(test_bars)} test bars (held out)")
+        logger.info(f"[{symbol}] Training period: {train_bars.index[0]} to {train_bars.index[-1]}")
+        logger.info(f"[{symbol}] Testing period: {test_bars.index[0]} to {test_bars.index[-1]} (RESERVED for backtest)")
+
+        # Use only training data for model training
+        bars_df = train_bars
+
         # Step 3: Initialize strategy
         logger.info(f"[{symbol}] Step 3: Initializing RiskLabAI strategy...")
         strategy = RiskLabAIStrategy(
@@ -131,9 +144,7 @@ def train_symbol(symbol: str) -> dict:
             stop_loss=OPTIMAL_STOP_LOSS,
             max_holding=OPTIMAL_MAX_HOLDING_BARS,
             d=OPTIMAL_FRACTIONAL_D,
-            n_cv_splits=5,
-            force_directional=True,  # Force directional labels
-            neutral_threshold=0.00001
+            n_cv_splits=5
         )
 
         # Step 4: Train model
@@ -142,7 +153,6 @@ def train_symbol(symbol: str) -> dict:
         logger.info(f"[{symbol}]   - Stop loss: {OPTIMAL_STOP_LOSS:.2%}")
         logger.info(f"[{symbol}]   - Max holding: {OPTIMAL_MAX_HOLDING_BARS} bars")
         logger.info(f"[{symbol}]   - Fractional d: {OPTIMAL_FRACTIONAL_D}")
-        logger.info(f"[{symbol}]   - Force directional: True")
 
         # Train the model
         strategy.train(bars_df)
