@@ -310,15 +310,6 @@ BACKTEST_MAX_DRAWDOWN = -0.0779
 OPTIMAL_FRACTIONAL_D = 0.30
 
 # =============================================================================
-# LEGACY ALIASES (for backward compatibility with old code)
-# =============================================================================
-
-TRADING_SYMBOLS = SYMBOLS
-STOP_LOSS_PCT = OPTIMAL_STOP_LOSS
-TAKE_PROFIT_PCT = OPTIMAL_PROFIT_TARGET
-MAX_POSITION_PCT = MAX_POSITION_SIZE_PCT
-
-# =============================================================================
 # AUTO-VALIDATION ON IMPORT
 # =============================================================================
 

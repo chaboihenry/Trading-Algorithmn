@@ -147,15 +147,8 @@ class ConnectionManager:
             True if all connections are healthy
         """
         if not self.broker:
-            # No broker - check Alpaca API directly
-            try:
-                from backup.market_data import get_market_data_client
-                client = get_market_data_client()
-                cash = client.get_cash()
-                return cash is not None and cash >= 0
-            except Exception as e:
-                logger.warning(f"Alpaca API health check failed: {e}")
-                return False
+            logger.warning("No broker configured - cannot perform health check")
+            return False
 
         try:
             # Try to get account info from broker

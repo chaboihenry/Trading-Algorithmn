@@ -27,14 +27,13 @@ from utils.garch_filter import GARCHVolatilityFilter
 # Import tick data infrastructure
 from data.tick_storage import TickStorage
 from data.tick_to_bars import generate_bars_from_ticks
-from config.tick_config import TICK_DB_PATH, INITIAL_IMBALANCE_THRESHOLD
-
-# Import existing infrastructure
 from config.tick_config import (
-    STOP_LOSS_PCT,
-    TAKE_PROFIT_PCT,
-    MAX_POSITION_PCT,
-    TRADING_SYMBOLS
+    TICK_DB_PATH,
+    INITIAL_IMBALANCE_THRESHOLD,
+    OPTIMAL_PROFIT_TARGET,
+    OPTIMAL_STOP_LOSS,
+    MAX_POSITION_SIZE_PCT,
+    SYMBOLS
 )
 
 logger = logging.getLogger(__name__)
@@ -144,7 +143,7 @@ class RiskLabAICombined(Strategy):
         if parameters and 'symbols' in parameters:
             self.symbols = parameters['symbols']
         else:
-            self.symbols = TRADING_SYMBOLS
+            self.symbols = SYMBOLS
 
         # Track state
         self.last_train_date = None
@@ -635,8 +634,8 @@ class RiskLabAICombined(Strategy):
             logger.info(f"  💰 Kelly sizing: {kelly_fraction:.2%} of ${portfolio_value:,.2f} × {bet_size:.2f} confidence = ${position_value:,.2f}")
         else:
             # Fallback to original sizing
-            position_value = portfolio_value * MAX_POSITION_PCT * bet_size
-            logger.info(f"  💰 Fixed sizing: {MAX_POSITION_PCT:.2%} × {bet_size:.2f} = ${position_value:,.2f}")
+            position_value = portfolio_value * MAX_POSITION_SIZE_PCT * bet_size
+            logger.info(f"  💰 Fixed sizing: {MAX_POSITION_SIZE_PCT:.2%} × {bet_size:.2f} = ${position_value:,.2f}")
 
         # Get current position (with safeguard logging)
         current_position = self.get_position(symbol)

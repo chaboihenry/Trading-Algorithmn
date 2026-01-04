@@ -34,7 +34,7 @@ from alpaca.data.timeframe import TimeFrame
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import GetAssetsRequest
 from alpaca.trading.enums import AssetClass, AssetStatus
-from backup.settings import ALPACA_API_KEY, ALPACA_API_SECRET
+from config.tick_config import ALPACA_API_KEY, ALPACA_API_SECRET
 from datetime import datetime, timedelta
 
 # Configure logging
