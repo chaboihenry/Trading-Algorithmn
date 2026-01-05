@@ -1,399 +1,562 @@
-# 🚀 RiskLabAI-Powered Trading Bot
+# 🤖 RiskLabAI Algorithmic Trading System
 
-**State-of-the-art algorithmic trading system** implementing cutting-edge financial machine learning techniques from Marcos López de Prado's research.
+> **Production-grade quantitative trading bot** implementing institutional-level machine learning techniques from cutting-edge financial research.
 
-[![Tests](https://img.shields.io/badge/tests-6%2F6%20passing-brightgreen)](test_risklabai.py)
-[![Python](https://img.shields.io/badge/python-3.11-blue)](requirements.txt)
-[![License](https://img.shields.io/badge/license-MIT-green)]()
+[![Python](https://img.shields.io/badge/python-3.11-blue)](https://www.python.org/)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+[![Code Quality](https://img.shields.io/badge/code%20quality-production-brightgreen)]()
+[![ML Framework](https://img.shields.io/badge/ML-RiskLabAI-orange)](https://github.com/risklabai/RiskLabAI)
+
+---
+
+## 📊 Project Overview
+
+A sophisticated algorithmic trading system that combines **institutional-grade financial machine learning** with **real-time market microstructure analysis**. Built on research from Marcos López de Prado's *Advances in Financial Machine Learning*, this system implements techniques used by quantitative hedge funds to generate alpha.
+
+### Key Achievements
+
+- **🎯 Realistic Backtesting**: Achieved 1.83% returns with proper train/test split and zero look-ahead bias
+- **📈 Multi-Symbol Trading**: Supports 99+ liquid US equities with per-symbol ML models
+- **⚡ Tick-Level Data**: Processes real-time tick data into information-driven bars for optimal signal extraction
+- **🔬 Rigorous Validation**: Purged K-fold cross-validation prevents data leakage in time-series forecasting
+- **🛡️ Risk Management**: Kelly Criterion position sizing with dynamic stop-loss and take-profit levels
+
+---
 
 ## 🎯 What Makes This Different
 
-This isn't your typical moving-average-crossover bot. This trading system implements **institutional-grade** financial machine learning techniques that hedge funds and quant shops use:
+This isn't your typical moving-average bot. This system implements **institutional-grade techniques** that distinguish professional quantitative trading:
 
-### The RiskLabAI Advantage
+### Technical Differentiation
 
-| Traditional Approach | RiskLabAI Approach | Why It Matters |
-|---------------------|-------------------|----------------|
-| Time-based bars | Information-driven bars (dollar, volume, imbalance) | Better statistical properties, adapts to market activity |
-| Fixed returns labels | Triple-barrier with volatility adaptation | Labels match real trading mechanics |
-| Single model | Primary + Meta models (direction + sizing) | Separates concerns, reduces overfitting |
-| Standard features | Fractionally differentiated features | Stationary while preserving memory |
-| All data | CUSUM event filtering | Focus on significant moves only |
-| Regular K-fold | Purged K-fold cross-validation | Prevents information leakage |
-| Mean-variance optimization | Hierarchical Risk Parity (HRP) | Stable portfolios without matrix inversion |
+| Traditional Approach | This Implementation | Impact |
+|---------------------|---------------------|--------|
+| Time-based bars (1min, 5min) | **Tick imbalance bars** | Adapts to market activity, better statistical properties |
+| Fixed returns labels | **Triple-barrier labeling** with volatility scaling | Labels match real trading mechanics |
+| Single model | **Primary + Meta models** (direction + confidence) | Separates prediction from bet sizing |
+| Raw price features | **Fractionally differentiated** features | Achieves stationarity while preserving memory |
+| All data points | **CUSUM event filtering** | Focuses on statistically significant moves |
+| Standard K-fold CV | **Purged K-fold** with embargo | Eliminates look-ahead bias in time series |
+| Train on all data | **70/30 train/test split** | Validates on truly unseen data |
 
-## 📊 Performance Features
+---
 
-- **Event-Driven**: Only trades on meaningful price movements detected by CUSUM filter
-- **Volatility-Adaptive**: Profit targets and stop losses scale with market volatility
-- **Intelligent Sizing**: Meta-labeling determines **how much** to bet, not just direction
-- **Leak-Free Validation**: Purged K-fold ensures realistic performance estimates
-- **Weekly Retraining**: Models adapt to changing market conditions
-- **Multi-Symbol**: Trade SPY, QQQ, IWM, or custom symbol lists
-
-## 🏗️ Architecture
+## 🏗️ System Architecture
 
 ```
-📦 RiskLabAI Trading System
- ┣ 📂 risklabai/                  # Core RiskLabAI components
- ┃ ┣ 📂 data_structures/          # Information-driven bars
- ┃ ┣ 📂 labeling/                 # Triple-barrier & meta-labeling
- ┃ ┣ 📂 features/                 # Fractional diff & importance
- ┃ ┣ 📂 sampling/                 # CUSUM event filtering
- ┃ ┣ 📂 cross_validation/         # Purged K-fold
- ┃ ┣ 📂 portfolio/                # HRP optimization
- ┃ ┗ 📂 strategy/                 # Main strategy orchestration
- ┃
- ┣ 📂 core/                       # Live trading infrastructure
- ┃ ┣ 📜 risklabai_combined.py    # Lumibot wrapper for RiskLabAI
- ┃ ┗ 📜 live_trader.py            # Live/paper trading entry point
- ┃
- ┣ 📂 config/                     # Configuration settings
- ┣ 📂 utils/                      # Connection manager, helpers
- ┣ 📂 data/                       # Market data utilities
- ┣ 📂 logs/                       # Trading logs
- ┣ 📂 models/                     # Saved ML models
- ┣ 📂 backup/                     # Old strategies (deprecated)
- ┃
- ┣ 📜 test_risklabai.py           # Comprehensive test suite
- ┗ 📜 requirements.txt            # All dependencies
+┌─────────────────────────────────────────────────────────────────┐
+│                     LIVE TRADING SYSTEM                         │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐    │
+│  │   Alpaca     │───▶│  Tick Data   │───▶│  Imbalance   │    │
+│  │   Market     │    │   Storage    │    │   Bars       │    │
+│  │   Feed       │    │   (SQLite)   │    │  Generator   │    │
+│  └──────────────┘    └──────────────┘    └──────────────┘    │
+│         │                                         │            │
+│         │                                         ▼            │
+│         │                              ┌──────────────────┐   │
+│         │                              │   RiskLabAI      │   │
+│         │                              │   Strategy       │   │
+│         │                              │                  │   │
+│         │                              │  • CUSUM Filter  │   │
+│         │                              │  • Frac. Diff    │   │
+│         │                              │  • Triple Label  │   │
+│         │                              │  • Primary Model │   │
+│         │                              │  • Meta Model    │   │
+│         │                              └──────────────────┘   │
+│         │                                         │            │
+│         │                                         ▼            │
+│         │                              ┌──────────────────┐   │
+│         └─────────────────────────────▶│   Position       │   │
+│                                        │   Sizer          │   │
+│                                        │  (Kelly Criter.) │   │
+│                                        └──────────────────┘   │
+│                                                 │              │
+│                                                 ▼              │
+│                                        ┌──────────────────┐   │
+│                                        │   Lumibot        │   │
+│                                        │   Broker         │   │
+│                                        │   (Alpaca API)   │   │
+│                                        └──────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-## 🚀 Quick Start
-
-### 1. Installation
-
-```bash
-# Clone the repository
-git clone https://github.com/chaboihenry/Trading-Algorithmn.git
-cd "Integrated Trading Agent"
-
-# Create conda environment (recommended)
-conda create -n trading python=3.11
-conda activate trading
-
-# Install all dependencies
-pip install -r requirements.txt
-```
-
-### 2. Configure Alpaca API
-
-```bash
-# Set your Alpaca credentials
-export ALPACA_API_KEY="your_api_key_here"
-export ALPACA_API_SECRET="your_secret_here"
-```
-
-Get free Alpaca paper trading credentials at [alpaca.markets](https://alpaca.markets)
-
-### 3. Test the System
-
-```bash
-# Run comprehensive test suite (should show 6/6 passing)
-python test_risklabai.py
-```
-
-Expected output:
-```
-✓ PASS - Imports
-✓ PASS - CUSUM Filter
-✓ PASS - Fractional Differentiation
-✓ PASS - Triple-Barrier Labeling
-✓ PASS - HRP Portfolio
-✓ PASS - Full Strategy
-
-🎉 All tests passed! RiskLabAI integration is ready.
-```
-
-### 4. Start Paper Trading
-
-```bash
-# Paper trading (SAFE - no real money)
-python core/live_trader.py --paper
-
-# Check account status without trading
-python core/live_trader.py --check-only
-```
-
-## 📖 Usage Examples
-
-### Paper Trading (Recommended First)
-
-```bash
-# Default symbols (SPY, QQQ, IWM)
-python core/live_trader.py --paper
-
-# Custom symbols
-python core/live_trader.py --paper --symbols AAPL MSFT GOOGL AMZN
-
-# Check logs
-tail -f logs/risklabai_live_*.log
-```
-
-### Live Trading (Real Money)
-
-⚠️ **WARNING**: Only after thorough testing in paper mode!
-
-```bash
-python core/live_trader.py --live --symbols SPY QQQ
-# Will require typing 'CONFIRM' to proceed
-```
-
-## 🧪 How It Works
-
-### The Trading Pipeline
+### Directory Structure
 
 ```
-1. Data Collection
-   ├─> Fetch OHLCV bars from Alpaca
-   └─> Need 500+ bars for initial training
-
-2. Event Sampling (CUSUM Filter)
-   ├─> Detect significant price movements
-   ├─> Ignore noise and low-activity periods
-   └─> ~95% of prices flagged as events
-
-3. Feature Engineering
-   ├─> Fractional differentiation (d ≈ 0.4)
-   ├─> Returns at multiple horizons
-   ├─> Volatility measures
-   └─> Volume features
-
-4. Triple-Barrier Labeling
-   ├─> Profit target: +2σ × volatility
-   ├─> Stop loss: -2σ × volatility
-   ├─> Timeout: 10 days
-   └─> Labels: -1 (loss), 0 (timeout), +1 (profit)
-
-5. Primary Model Training
-   ├─> RandomForest classifier
-   ├─> Predicts direction (long/short)
-   ├─> Cross-validated accuracy: ~47%
-   └─> Uses purged K-fold (5 splits)
-
-6. Meta-Labeling
-   ├─> Creates labels for bet sizing
-   ├─> Based on primary model correctness
-   └─> Meta accuracy: ~63%
-
-7. Meta Model Training
-   ├─> RandomForest classifier
-   ├─> Predicts probability of success
-   └─> Bet size = probability
-
-8. Signal Generation
-   ├─> Primary: Direction (+1/-1/0)
-   ├─> Meta: Bet size (0 to 1)
-   └─> Only trade if bet_size > 0.5
-
-9. Position Sizing
-   ├─> Portfolio value × MAX_POSITION_PCT × bet_size
-   └─> Respects risk management limits
-
-10. Trade Execution
-    ├─> Bracket orders with stop-loss & take-profit
-    ├─> Lumibot handles order management
-    └─> Alpaca executes trades
-```
-
-### Model Retraining
-
-- **Frequency**: Weekly (configurable via `retrain_days`)
-- **Trigger**: Automatic on first iteration each week
-- **Data**: 500+ bars of OHLCV data
-- **Storage**: Models saved to `models/risklabai_models.pkl`
-- **Persistence**: Models reload on restart
-
-## ⚙️ Configuration
-
-### Strategy Parameters
-
-Edit in [core/risklabai_combined.py](core/risklabai_combined.py:66-71):
-
-```python
-RiskLabAIStrategy(
-    profit_taking=2.0,    # Take-profit barrier (× volatility)
-    stop_loss=2.0,        # Stop-loss barrier (× volatility)
-    max_holding=10,       # Maximum days to hold position
-    n_cv_splits=5         # Cross-validation folds
-)
-```
-
-### Risk Management
-
-Edit in [config/settings.py](config/settings.py):
-
-```python
-STOP_LOSS_PCT = 0.02      # 2% stop loss
-TAKE_PROFIT_PCT = 0.05    # 5% take profit
-MAX_POSITION_PCT = 0.20   # Max 20% of portfolio per position
-TRADING_SYMBOLS = ['SPY', 'QQQ', 'IWM']
-```
-
-### Trading Symbols
-
-Pass via command line:
-```bash
-python core/live_trader.py --paper --symbols SPY QQQ IWM AAPL MSFT
-```
-
-Or set default in [config/settings.py](config/settings.py)
-
-## 📈 Expected Performance
-
-Based on academic research and backtesting:
-
-| Metric | Target | Notes |
-|--------|--------|-------|
-| Sharpe Ratio | 1.0 - 2.0 | Risk-adjusted returns |
-| Win Rate | 52% - 58% | Higher than random (50%) |
-| Max Drawdown | -15% to -20% | Worst peak-to-trough decline |
-| Primary Accuracy | 45% - 50% | Direction prediction |
-| Meta Accuracy | 60% - 65% | Bet sizing |
-
-**Note**: Actual results depend on market conditions, symbols traded, and parameter tuning.
-
-## 🛠️ Troubleshooting
-
-### Import Errors
-
-```bash
-# Make sure you're in the trading environment
-conda activate trading
-
-# Reinstall dependencies
-pip install -r requirements.txt
-```
-
-### "Insufficient samples for training"
-
-- Need at least 500 historical bars
-- Use daily timeframe or longer lookback
-- Check symbol data availability on Alpaca
-
-### Models not improving
-
-1. Check feature importance logs
-2. Verify data quality (no missing values)
-3. Ensure sufficient training data
-4. Review label distribution (should be balanced)
-5. Try different symbols or timeframes
-
-### WebSocket/Connection Issues
-
-- Connection manager handles cleanup automatically
-- Logs show connection status
-- Restart bot if connections seem stuck
-
-## 📚 Research Background
-
-This system implements techniques from:
-
-### Books
-
-1. **Advances in Financial Machine Learning** - Marcos López de Prado
-   - Chapter 2: Financial Data Structures
-   - Chapter 3: Labeling
-   - Chapter 5: Fractional Differentiation
-   - Chapter 7: Cross-Validation
-   - Chapter 10: Bet Sizing
-
-2. **Machine Learning for Asset Managers** - Marcos López de Prado
-   - Chapter 4: Optimal Clustering (HRP)
-
-### Papers
-
-- "The 7 Reasons Most Machine Learning Funds Fail" - López de Prado (2018)
-- "Building Diversified Portfolios that Outperform Out of Sample" - López de Prado, Bailey (2012)
-
-### Library
-
-- [RiskLabAI](https://github.com/risklabai/RiskLabAI) - Official implementation of López de Prado's techniques
-
-## 🔐 Security & Risk
-
-### Paper Trading First
-
-- **ALWAYS** test with `--paper` flag first
-- Paper trading uses fake money on real data
-- Validate strategy works before risking real capital
-
-### Risk Limits
-
-- Position size limits (MAX_POSITION_PCT)
-- Stop-loss protection on every trade
-- No leverage by default
-- Weekly model retraining to adapt
-
-### API Keys
-
-- Never commit API keys to git
-- Use environment variables only
-- Alpaca paper trading keys are free
-
-## 🤝 Contributing
-
-This is a personal trading bot, but suggestions welcome:
-
-1. Open an issue describing the enhancement
-2. Provide research/academic backing for ML suggestions
-3. Include backtesting results if possible
-
-## 📝 License
-
-MIT License - Trade at your own risk!
-
-## ⚠️ Disclaimer
-
-**This software is for educational purposes.**
-
-- Trading involves substantial risk of loss
-- Past performance doesn't guarantee future results
-- The author is not responsible for financial losses
-- Consult a financial advisor before trading
-- Never trade with money you can't afford to lose
-- Always test thoroughly in paper mode first
-
-## 📊 System Status
-
-```
-✅ RiskLabAI installed and configured
-✅ All 8 wrapper modules implemented
-✅ Test suite: 6/6 tests passing
-✅ Lumibot integration complete
-✅ Live trader ready for paper trading
-⏳ Paper trading validation (your next step)
-⬜ Live deployment (after thorough testing)
-```
-
-## 🎓 Learning Resources
-
-Want to understand the techniques better?
-
-1. **Start Here**: Read [RISKLABAI_IMPLEMENTATION_SUMMARY.md](RISKLABAI_IMPLEMENTATION_SUMMARY.md)
-2. **Deep Dive**: Read [risklabai/README.md](risklabai/README.md)
-3. **Books**: Get López de Prado's books (see Research Background)
-4. **RiskLabAI**: Explore the [library documentation](https://github.com/risklabai/RiskLabAI)
-
-## 🚀 Ready to Trade?
-
-```bash
-# 1. Make sure tests pass
-python test_risklabai.py
-
-# 2. Start paper trading
-python core/live_trader.py --paper
-
-# 3. Monitor the logs
-tail -f logs/risklabai_live_*.log
-
-# 4. Watch your portfolio grow! 📈
+📦 Integrated Trading Agent/
+├── 📂 risklabai/                    # Core ML framework
+│   ├── labeling/                    # Triple-barrier & meta-labeling
+│   ├── features/                    # Fractional differentiation
+│   ├── sampling/                    # CUSUM event filtering
+│   ├── cross_validation/            # Purged K-fold
+│   └── strategy/                    # Strategy orchestration
+│
+├── 📂 core/                         # Trading infrastructure
+│   └── risklabai_combined.py        # Lumibot integration
+│
+├── 📂 data/                         # Market data pipeline
+│   ├── tick_storage.py              # SQLite tick database
+│   ├── tick_to_bars.py              # Imbalance bar generator
+│   └── alpaca_tick_client.py        # Real-time data fetching
+│
+├── 📂 config/                       # Configuration
+│   ├── tick_config.py               # Optimal parameters
+│   └── all_symbols.py               # Symbol universe (tier_1-5)
+│
+├── 📂 scripts/                      # Utilities
+│   ├── train_all_symbols.py         # Multi-symbol model training
+│   └── fetch_all_symbols.py         # Symbol universe builder
+│
+├── 📂 test_suite/                   # Validation & backtesting
+│   ├── backtest_multi_symbol.py     # Comprehensive backtest
+│   └── test_prediction_logic.py     # Unit tests
+│
+├── 📂 models/                       # Trained ML models (99 symbols)
+└── 📜 run_live_trading.py           # Main entry point
 ```
 
 ---
 
-**Built with**: RiskLabAI, Lumibot, Alpaca API, scikit-learn, pandas, numpy
+## 🚀 Quick Start
 
-**Inspired by**: Marcos López de Prado's quantitative research
+### Prerequisites
 
-**Ready to maximize cumulative returns**: Yes! 🚀
+- Python 3.11+
+- Alpaca trading account ([free paper trading](https://alpaca.markets))
+- ~2GB disk space for tick data
+
+### Installation
+
+```bash
+# Clone repository
+git clone https://github.com/chaboihenry/Trading-Algorithmn.git
+cd "Integrated Trading Agent"
+
+# Create conda environment
+conda create -n trading python=3.11
+conda activate trading
+
+# Install dependencies
+pip install -r requirements.txt
+```
+
+### Configuration
+
+Create a `.env` file with your Alpaca credentials:
+
+```env
+ALPACA_API_KEY=your_key_here
+ALPACA_API_SECRET=your_secret_here
+```
+
+### Training Models
+
+Train models on historical tick data:
+
+```bash
+# Train all tier_1 symbols (99 models, ~20-30 minutes)
+python scripts/train_all_symbols.py --tier tier_1
+
+# Train specific symbols
+python scripts/train_all_symbols.py --symbols AAPL MSFT GOOGL
+```
+
+**Training Output:**
+```
+[AAPL] ✓ 2,218 bars generated from 2.4M ticks
+[AAPL] Train/Test Split: 1,552 train bars, 666 test bars
+[AAPL] Primary model CV accuracy: 0.514 ± 0.028
+[AAPL] Meta model CV accuracy: 0.507 ± 0.037
+[AAPL] ✓ Model saved to models/risklabai_AAPL_models.pkl
+```
+
+### Backtesting
+
+Validate strategy performance on unseen test data:
+
+```bash
+# Backtest tier_1 symbols (uses held-out 30% test data)
+python test_suite/backtest_multi_symbol.py --tier tier_1
+
+# Custom parameters
+python test_suite/backtest_multi_symbol.py --tier tier_1 \
+    --capital 100000 \
+    --bars 1000 \
+    --kelly 0.1
+```
+
+**Backtest Results:**
+```
+================================================================================
+BACKTEST RESULTS (70/30 Split - Unseen Test Data)
+================================================================================
+
+PORTFOLIO PERFORMANCE:
+  Starting Capital:    $100,000.00
+  Final Value:         $101,832.47
+  Total P&L:           $1,832.47
+  Total Return:        1.83%
+  Sharpe Ratio:        0.54
+  Max Drawdown:        -1.98%
+
+TRADE STATISTICS:
+  Total Trades:        68
+  Win Rate:            55.9%
+  Average Win:         $184.21
+  Average Loss:        $157.86
+  Profit Factor:       1.48
+  Avg Hold Time:       654.5 hours
+
+TOP PERFORMERS:
+  GOOGL: +$1,191 (2 trades)
+  AMAT:  +$1,054 (5 trades)
+  LLY:   +$506 (2 trades)
+```
+
+### Live Trading
+
+```bash
+# Paper trading (RECOMMENDED - no real money)
+python run_live_trading.py
+
+# Monitor logs
+tail -f logs/live_trading_*.log
+```
+
+---
+
+## 🔬 Technical Deep Dive
+
+### 1. Tick-Based Market Microstructure
+
+Traditional time-based bars (1min, 5min) **miss important market information**. This system uses **tick imbalance bars** that form when buy-sell imbalance exceeds a threshold:
+
+```python
+# Adaptive bar formation based on order flow
+if abs(cumulative_imbalance) >= threshold:
+    # Create new bar - market has shown directional conviction
+    bars.append(current_bar)
+    cumulative_imbalance = 0
+```
+
+**Benefits:**
+- Bars form more frequently during high activity (earnings, news)
+- Fewer bars during quiet periods (overnight, holidays)
+- Better statistical properties (closer to IID assumption)
+
+### 2. Triple-Barrier Labeling
+
+Labels match how traders actually think:
+
+```
+Price Path:
+    │     ┌─── Hit profit target → Label: +1 (winner)
+    │    ╱
+    ├───●
+    │    ╲
+    │     └─── Hit stop loss → Label: -1 (loser)
+    │
+    └─────────► Timeout (20 bars) → Label: 0 (neutral)
+```
+
+**Parameters** (from parameter sweep):
+- Profit target: **4.0%**
+- Stop loss: **2.0%**
+- Max holding: **20 bars**
+
+**Result**: Realistic labels that reflect actual trade outcomes.
+
+### 3. Fractional Differentiation
+
+Achieves **stationarity** (required for ML) while **preserving memory**:
+
+```python
+# d = 0.30 preserves 70% of memory
+stationary_returns = fractional_diff(prices, d=0.30)
+```
+
+Traditional differencing (`prices[t] - prices[t-1]`) loses all memory. Fractional differentiation finds the **minimum differencing** needed for stationarity.
+
+### 4. Meta-Labeling (Bet Sizing)
+
+Two-stage ML approach:
+
+**Stage 1 - Primary Model**: Predicts direction (long/short)
+```
+Accuracy: 51.4% (slightly better than random)
+```
+
+**Stage 2 - Meta Model**: Predicts "Will primary model be correct?"
+```
+Accuracy: 50.7%
+Bet Size: probability_of_correctness
+```
+
+**Why this works**: Even 51% accuracy × proper sizing = positive expectancy
+
+### 5. Purged K-Fold Cross-Validation
+
+Standard K-fold **leaks information** in time series:
+
+```
+Standard K-Fold (❌ WRONG):
+Train: [████──────]  Test: [──████────]  ← Test data influenced by train
+                                          (overlapping time periods)
+
+Purged K-Fold (✅ CORRECT):
+Train: [████──────]  Embargo: [──]  Test: [────████──]
+                      ↑ 1% gap prevents leakage
+```
+
+### 6. Look-Ahead Bias Prevention
+
+**The Problem**: Traditional backtests execute trades at prices **you already know**:
+
+```python
+# ❌ WRONG - Look-ahead bias
+signal = model.predict(data[:current_bar+1])  # Includes current close
+price = data['close'][current_bar]  # Already know this!
+execute_trade(price)  # Unrealistic
+```
+
+**The Solution**: Execute on **next bar's open**:
+
+```python
+# ✅ CORRECT - Realistic execution
+signal = model.predict(data[:current_bar])  # Don't peek
+pending_orders[symbol] = signal  # Store signal
+# ... next iteration ...
+price = data['open'][current_bar+1]  # Next bar's open (realistic)
+execute_trade(price)  # Can actually get this price
+```
+
+### 7. Train/Test Split
+
+**70/30 chronological split**:
+- First 70% → Training (with purged K-fold CV)
+- Last 30% → **Never seen by models** (held-out test set)
+
+```
+Timeline: [════════════════════════════════════════════]
+          [████████████████ TRAIN ████][═══ TEST ═══]
+                   70%                        30%
+```
+
+This ensures backtest results reflect **true out-of-sample performance**.
+
+---
+
+## 📈 Performance Metrics
+
+### Backtest Results (Tier 1 - 99 Symbols)
+
+| Metric | Value | Industry Standard | Status |
+|--------|-------|-------------------|--------|
+| **Total Return** | 1.83% | 5-15% annual | ⚠️ Needs improvement |
+| **Sharpe Ratio** | 0.54 | >1.0 target | ⚠️ Risk-adjusted returns low |
+| **Max Drawdown** | -1.98% | <-10% acceptable | ✅ Excellent risk control |
+| **Win Rate** | 55.9% | >50% target | ✅ Above random |
+| **Profit Factor** | 1.48 | >1.5 target | ⚠️ Close to target |
+| **Avg Hold Time** | 27 days | Varies | ℹ️ Medium-term strategy |
+
+### Model Performance (Cross-Validation)
+
+| Model | Accuracy | Precision | Recall | F1 Score |
+|-------|----------|-----------|--------|----------|
+| Primary (Direction) | 51.4% ± 2.8% | 0.52 | 0.51 | 0.51 |
+| Meta (Confidence) | 50.7% ± 3.7% | 0.51 | 0.50 | 0.50 |
+
+**Interpretation**: Models show **slight edge over random** (50%), which combined with proper risk management and position sizing, creates positive expectancy.
+
+### Strategy Analysis
+
+✅ **Strengths:**
+- Excellent risk control (low drawdown)
+- Consistent win rate >50%
+- Positive profit factor
+- Zero look-ahead bias
+- Properly validated on unseen data
+
+⚠️ **Areas for Improvement:**
+- Sharpe ratio needs improvement (target: >1.0)
+- Returns could be higher
+- Some symbols underperform (ORCL, PANW, APH)
+
+### Next Steps for Optimization:
+
+1. **Remove losing symbols** (ORCL: -$1,498, PANW: -$677)
+2. **Adjust margin threshold** (3% → 2% for more trades)
+3. **Tune barrier parameters** (profit target, stop loss)
+4. **Focus on top performers** (GOOGL, AMAT, LLY)
+
+---
+
+## 🛠️ Technology Stack
+
+### Core Frameworks
+- **Python 3.11** - Modern async/await support
+- **RiskLabAI** - Financial ML implementations
+- **Lumibot** - Trading framework & broker integration
+- **scikit-learn** - Machine learning models
+- **pandas/numpy** - Data manipulation
+
+### Data & Storage
+- **Alpaca API** - Market data & trade execution
+- **SQLite** - Tick data storage (~1M ticks/day/symbol)
+- **polars** - High-performance data processing
+
+### Deployment & Monitoring
+- **APScheduler** - Scheduled strategy execution
+- **logging** - Comprehensive error tracking
+- **pytest** - Unit & integration testing
+
+---
+
+## 🧪 Testing & Validation
+
+### Test Suite
+
+```bash
+# Run all tests
+python test_suite/test_prediction_logic.py
+```
+
+**Tests:**
+- ✅ Probability margin filtering (3% threshold)
+- ✅ Model loading & initialization
+- ✅ Feature generation pipeline
+- ✅ Signal mapping (2-class & 3-class models)
+- ✅ Position sizing calculations
+
+### Comprehensive Backtest
+
+```bash
+python test_suite/backtest_multi_symbol.py --tier tier_1
+```
+
+**Validates:**
+- Multi-symbol portfolio simulation
+- Realistic order execution (next bar's open)
+- Kelly Criterion position sizing
+- Stop-loss & take-profit mechanics
+- Train/test split integrity
+
+---
+
+## 🔐 Risk Management
+
+### Position Sizing
+- **Kelly Criterion**: Optimal bet size based on win probability and odds
+- **Kelly Fraction**: 0.1 (10% of suggested Kelly - conservative)
+- **Max Position**: 10% of portfolio per symbol
+
+### Trade Protection
+- **Stop-Loss**: 2.0% automatic exit on losses
+- **Take-Profit**: 4.0% automatic profit capture
+- **Max Holding**: 20 bars timeout (prevents dead capital)
+
+### Portfolio Limits
+- **Daily Loss Limit**: 3% max per day
+- **Max Drawdown**: 10% hard stop
+- **Consecutive Losses**: Pause after 3 losses
+- **Max Trades/Day**: 15 (prevents overtrading)
+
+---
+
+## 📚 Research Background
+
+This implementation is based on cutting-edge quantitative finance research:
+
+### Primary Source
+**Advances in Financial Machine Learning** (2018)
+*Marcos López de Prado*
+
+Chapters implemented:
+- Ch 2: Financial Data Structures (tick bars)
+- Ch 3: Labeling (triple-barrier method)
+- Ch 5: Fractional Differentiation
+- Ch 7: Cross-Validation (purged K-fold)
+- Ch 10: Bet Sizing (meta-labeling)
+
+### Supporting Research
+- "The 7 Reasons Most Machine Learning Funds Fail" - López de Prado
+- "Building Diversified Portfolios that Outperform Out of Sample" - López de Prado & Bailey
+- Machine Learning for Asset Managers - López de Prado
+
+### Why This Matters
+
+Most ML trading bots fail because they:
+1. ❌ Use time-based bars (poor statistical properties)
+2. ❌ Have look-ahead bias (unrealistic backtests)
+3. ❌ Overfit on training data (no proper CV)
+4. ❌ Don't consider bet sizing (only direction)
+5. ❌ Ignore market microstructure
+
+This implementation addresses **all** these failure modes.
+
+---
+
+## 📊 Project Highlights
+
+### For Recruiters
+
+This project demonstrates:
+
+**Machine Learning Engineering:**
+- ✅ Production ML pipeline (data → features → training → prediction)
+- ✅ Cross-validation with time-series data
+- ✅ Model persistence & versioning
+- ✅ Batch training infrastructure (99 models)
+
+**Software Engineering:**
+- ✅ Clean architecture (separation of concerns)
+- ✅ Error handling & logging
+- ✅ Database design (tick storage)
+- ✅ API integration (Alpaca)
+- ✅ Async/event-driven programming
+
+**Financial Domain Knowledge:**
+- ✅ Market microstructure understanding
+- ✅ Risk management implementation
+- ✅ Backtesting methodology
+- ✅ Position sizing algorithms
+
+**Data Engineering:**
+- ✅ Real-time data pipelines
+- ✅ Large dataset handling (2M+ ticks/day)
+- ✅ Feature engineering
+- ✅ Data validation & cleaning
+
+---
+
+## ⚠️ Disclaimer
+
+**This software is for educational and demonstration purposes.**
+
+- Trading involves substantial risk of loss
+- Past performance does not guarantee future results
+- The author is not responsible for financial losses
+- Always test thoroughly in paper trading before risking capital
+- Consult a financial advisor before making investment decisions
+
+---
+
+## 📫 Contact
+
+**Built by:** Henry (Portfolio Project)
+**LinkedIn:** [Your LinkedIn]
+**GitHub:** [@chaboihenry](https://github.com/chaboihenry)
+
+---
+
+## 📝 License
+
+MIT License - See [LICENSE](LICENSE) for details
+
+---
+
+**⭐ If you found this project interesting, please star the repository!**
+
+*Built with RiskLabAI • Lumibot • Alpaca API • Python 3.11*
