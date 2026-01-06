@@ -546,7 +546,7 @@ This project demonstrates:
 ## 📫 Contact
 
 **Built by:** Henry (Portfolio Project)
-**LinkedIn:** [Your LinkedIn]
+**LinkedIn:** https://www.linkedin.com/in/henry-vianna-258266230/
 **GitHub:** [@chaboihenry](https://github.com/chaboihenry)
 
 ---

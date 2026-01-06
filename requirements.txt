@@ -44,6 +44,5 @@ coloredlogs>=15.0
 #Technical Indicators (Optional: requires binary installation)
 ta-lib>=0.4.0
 
-# Optional: For better performance on M1 Macs
-tensorflow-macos>=2.13.0
-tensorflow-metal>=1.0.0
+holidays
+
