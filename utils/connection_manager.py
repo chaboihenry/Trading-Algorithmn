@@ -74,35 +74,8 @@ class ConnectionManager:
         except Exception as e:
             logger.error(f"Error closing broker: {e}")
 
-    def cleanup_alpaca_clients(self):
-        """Clean up singleton Alpaca API clients."""
-        logger.info("Closing Alpaca API clients...")
-
-        try:
-            # Import here to avoid circular imports
-            from backup import market_data
-
-            # Close TradingClient singleton
-            if market_data._market_data_client is not None:
-                client = market_data._market_data_client.client
-                if hasattr(client, '_session') and client._session:
-                    client._session.close()
-                    logger.info("✅ TradingClient session closed")
-                market_data._market_data_client = None
-
-            # Close StockHistoricalDataClient singleton
-            if market_data._stock_data_client is not None:
-                client = market_data._stock_data_client
-                if hasattr(client, '_session') and client._session:
-                    client._session.close()
-                    logger.info("✅ StockHistoricalDataClient session closed")
-                market_data._stock_data_client = None
-
-        except Exception as e:
-            logger.error(f"Error closing Alpaca clients: {e}")
-
     def cleanup_all(self):
-        """Clean up ALL connections (broker + Alpaca clients)."""
+        """Clean up all connections (broker + API clients via Lumibot)."""
         if not self.active:
             return
 
@@ -111,8 +84,8 @@ class ConnectionManager:
         logger.info("=" * 60)
 
         try:
+            # Lumibot handles all connection cleanup internally
             self.cleanup_broker()
-            self.cleanup_alpaca_clients()
 
             self.active = False
             logger.info("=" * 60)

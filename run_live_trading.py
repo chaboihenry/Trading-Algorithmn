@@ -116,14 +116,7 @@ def main():
         'max_drawdown_pct': 0.10,      # 10% max drawdown (hard stop)
         'drawdown_warning_pct': 0.05,  # 5% drawdown warning level
         'max_consecutive_losses': 3,    # Pause after 3 losses
-        'max_trades_per_day': 15,      # Prevent overtrading
-
-        # GARCH VOLATILITY FILTER (Prediction Activation)
-        # Complements CUSUM (training) with GARCH (prediction)
-        # Only activate RiskLabAI during high-volatility regimes
-        'use_garch_filter': True,
-        'garch_lookback': 100,         # Lookback period for volatility estimation
-        'garch_percentile': 0.60       # Activate when vol > 60th percentile
+        'max_trades_per_day': 15       # Prevent overtrading
     }
 
     strategy = RiskLabAICombined(broker=broker)

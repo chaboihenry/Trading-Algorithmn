@@ -16,7 +16,9 @@ env/
 .env.*
 *.env
 
-data/
+data/*.db
+data/*.sqlite
+data/*.csv
 models/
 logs/
 *.db

@@ -25,4 +25,6 @@ RUN pip install --upgrade pip && \
 
 COPY . .
 
+RUN mkdir -p /app/logs /app/models /app/data
+
 CMD ["python", "run_live_trading.py"]

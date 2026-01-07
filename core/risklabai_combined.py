@@ -1,14 +1,20 @@
 """
-Lumibot Strategy Wrapper for RiskLabAI
+RiskLabAI Trading Strategy - Lumibot Integration
 
-This file connects RiskLabAI's signal generation to Lumibot's
-trade execution and broker integration.
+Production-grade quantitative trading strategy implementing institutional-level
+financial machine learning techniques from Marcos López de Prado's research.
 
-Keeps all existing infrastructure:
-- Alpaca broker connection
-- Stop-loss/take-profit management
-- Connection manager for sockets
-- Risk management
+Core RiskLabAI Components:
+- Tick imbalance bars (market microstructure)
+- CUSUM event filtering (significant moves only)
+- Triple-barrier labeling (realistic trade outcomes)
+- Fractional differentiation (stationarity with memory preservation)
+- Purged K-fold cross-validation (no look-ahead bias)
+- Meta-labeling for bet sizing (Kelly Criterion)
+
+Broker Integration:
+- Alpaca API for market data and execution
+- Lumibot framework for strategy orchestration
 """
 
 import logging
@@ -20,9 +26,6 @@ from typing import Dict, Tuple, Optional
 
 # Import our RiskLabAI strategy
 from risklabai.strategy.risklabai_strategy import RiskLabAIStrategy
-
-# Import GARCH volatility filter
-from utils.garch_filter import GARCHVolatilityFilter
 
 # Import tick data infrastructure
 from data.tick_storage import TickStorage
@@ -87,18 +90,20 @@ class KellyCriterion:
 
 class RiskLabAICombined(Strategy):
     """
-    Lumibot strategy using RiskLabAI for signal generation.
+    Production RiskLabAI quantitative trading strategy.
 
-    This class:
-    1. Uses RiskLabAI for sophisticated signal generation
-    2. Leverages existing Lumibot infrastructure for execution
-    3. Preserves all risk management from original bot
+    Implements institutional-grade financial ML:
+    1. RiskLabAI signal generation (López de Prado methodology)
+    2. Tick imbalance bars for market microstructure
+    3. Triple-barrier labeling with Kelly Criterion position sizing
+    4. Industry-standard risk management (stop-loss, take-profit, drawdown limits)
+    5. Per-symbol ML models with purged K-fold validation
 
     Attributes:
-        risklabai: RiskLabAI strategy instance
-        symbols: Trading symbols
-        models_trained: Flag indicating if models are ready
-        last_train_date: Last model training date
+        symbol_models: Dictionary of per-symbol RiskLabAI strategy instances
+        symbols: Trading symbols with trained models
+        use_tick_bars: Whether to use tick imbalance bars (default: True)
+        kelly_fraction: Kelly Criterion fraction for position sizing (default: 0.1)
     """
 
     # Check for signals every hour
@@ -192,29 +197,6 @@ class RiskLabAICombined(Strategy):
         self.trades_today = 0
         self.last_trade_result = None
         self.risk_halt_reason = None
-
-        # NEW: GARCH Volatility Filter
-        # Complements CUSUM (training filter) with GARCH (prediction filter)
-        # - CUSUM: Prevents overfitting during training
-        # - GARCH: Identifies high-volatility trading opportunities
-        self.use_garch_filter = parameters.get('use_garch_filter', True) if parameters else True
-        if self.use_garch_filter:
-            garch_lookback = parameters.get('garch_lookback', 100) if parameters else 100
-            garch_percentile = parameters.get('garch_percentile', 0.60) if parameters else 0.60
-            self.garch_filter = GARCHVolatilityFilter(
-                lookback_period=garch_lookback,
-                volatility_percentile=garch_percentile,
-                min_observations=50
-            )
-            logger.info("=" * 60)
-            logger.info("GARCH VOLATILITY FILTER ENABLED")
-            logger.info("=" * 60)
-            logger.info(f"  Lookback: {garch_lookback} bars")
-            logger.info(f"  Activation threshold: {garch_percentile:.0%}th percentile")
-            logger.info(f"  Purpose: Activate RiskLabAI only in high-volatility regimes")
-            logger.info("=" * 60)
-        else:
-            self.garch_filter = None
 
         logger.info("=" * 60)
         logger.info("RISK MANAGEMENT ENABLED")
@@ -576,23 +558,7 @@ class RiskLabAICombined(Strategy):
             logger.info(f"{symbol}: Insufficient data ({len(bars) if bars is not None else 0} bars)")
             return
 
-        # NEW: GARCH Volatility Filter - Check BEFORE calling RiskLabAI
-        # Only activate RiskLabAI during high-volatility regimes
-        if self.use_garch_filter and self.garch_filter is not None:
-            should_trade, garch_info = self.garch_filter.should_trade(bars['close'])
-
-            logger.info(f"{symbol}: GARCH check - Vol={garch_info['forecasted_vol']:.4f}, "
-                        f"Threshold={garch_info['threshold']:.4f}, Trade={should_trade}")
-
-            if not should_trade:
-                logger.info(f"{symbol}: GARCH filter blocked - volatility too low "
-                           f"({garch_info['forecasted_vol']:.4f} < {garch_info['threshold']:.4f})")
-                return
-            else:
-                logger.info(f"{symbol}: ✓ GARCH filter passed - high volatility regime detected "
-                          f"(vol={garch_info['forecasted_vol']:.4f}, threshold={garch_info['threshold']:.4f})")
-
-        # Get signal from symbol-specific RiskLabAI model with OPTIMAL THRESHOLDS
+        # Get signal from RiskLabAI model (includes CUSUM filtering for event detection)
         symbol_strategy = self.symbol_models[symbol]
         signal, bet_size = symbol_strategy.predict(
             bars,
