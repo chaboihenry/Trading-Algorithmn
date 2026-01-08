@@ -23,6 +23,7 @@ import logging
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
+from config.tick_config import TICK_DB_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,7 @@ class TickStorage:
         _connection (Optional[sqlite3.Connection]): Database connection (created on demand)
 
     Example usage:
-        >>> storage = TickStorage("/Volumes/Vault/trading_data/tick-data-storage.db")
+        >>> storage = TickStorage(str(TICK_DB_PATH))
         >>> ticks = [
         ...     {'symbol': 'SPY', 'timestamp': '2024-01-01 09:30:00', 'price': 450.0, 'size': 100},
         ...     {'symbol': 'SPY', 'timestamp': '2024-01-01 09:30:01', 'price': 450.1, 'size': 50}
@@ -60,7 +61,7 @@ class TickStorage:
 
         Args:
             db_path: Full path to SQLite database file
-                     Example: "/Volumes/Vault/trading_data/tick-data-storage.db"
+                     Uses TICK_DB_PATH from config (configurable via DATA_PATH env var)
 
         Note:
             This doesn't open a database connection yet. The connection

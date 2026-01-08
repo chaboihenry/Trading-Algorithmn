@@ -36,6 +36,7 @@ import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
+from config.tick_config import TICK_DB_PATH
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -212,7 +213,7 @@ Examples:
 
         tier_symbols = get_symbols_by_tier(args.tier)
 
-        conn = sqlite3.connect('/Volumes/Vault/trading_data/tick-data-storage.db')
+        conn = sqlite3.connect(str(TICK_DB_PATH))
         cursor = conn.cursor()
         cursor.execute("SELECT DISTINCT symbol FROM ticks ORDER BY symbol")
         symbols_with_data = {row[0] for row in cursor.fetchall()}

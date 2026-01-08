@@ -15,6 +15,7 @@ import logging
 from datetime import datetime
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
+from utils.model_downloader import download_models
 
 from core.risklabai_combined import RiskLabAICombined
 from config.tick_config import (
@@ -26,7 +27,8 @@ from config.tick_config import (
     OPTIMAL_MAX_HOLDING_BARS,
     OPTIMAL_META_THRESHOLD,
     OPTIMAL_PROB_THRESHOLD,
-    OPTIMAL_FRACTIONAL_D
+    OPTIMAL_FRACTIONAL_D,
+    should_use_tick_bars  # Auto-detect tick database for portability
 )
 # Set up logging
 logging.basicConfig(
@@ -48,6 +50,9 @@ def main():
     print("=" * 80)
     print("RISKLABAI LIVE TRADING BOT")
     print("=" * 80)
+
+    download_models()
+
     print(f"Mode: {'PAPER TRADING' if ALPACA_PAPER else 'LIVE TRADING'}")
     print(f"Started: {datetime.now()}")
     print("=" * 80)
@@ -82,6 +87,12 @@ def main():
     logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from tier_1")
     logger.info(f"First 10: {', '.join(ACTIVE_SYMBOLS[:10])}")
 
+    # AUTO-DETECT: Use tick bars if database exists, otherwise use Alpaca API
+    USE_TICK_BARS = should_use_tick_bars()
+    logger.info("=" * 80)
+    logger.info(f"DATA SOURCE: {'Tick Imbalance Bars (Database)' if USE_TICK_BARS else 'Alpaca API Real-Time Bars'}")
+    logger.info("=" * 80)
+
     # Initialize strategy with OPTIMIZED tick-based models
     # Set parameters as class attribute before creating instance
     RiskLabAICombined.parameters = {
@@ -100,8 +111,8 @@ def main():
         'meta_threshold': OPTIMAL_META_THRESHOLD,  # 0.001 (0.1%) - Meta model confidence
         'prob_threshold': OPTIMAL_PROB_THRESHOLD,  # 0.015 (1.5%) - Primary model probability
 
-        # Strategy settings
-        'use_tick_bars': True,
+        # Strategy settings - AUTO-DETECTED for portability
+        'use_tick_bars': USE_TICK_BARS,  # Auto-detect: True if DB exists, False otherwise
         'enable_profitability_tracking': True,
         'min_training_bars': 100,
         'retrain_days': 30,

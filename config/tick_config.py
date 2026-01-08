@@ -39,24 +39,25 @@ USE_SIP = False  # Set True after purchasing Algo Trader Plus subscription
 # DataFeed.IEX: Investors Exchange - ~10% market coverage (free)
 DATA_FEED = DataFeed.SIP if USE_SIP else DataFeed.IEX
 
-# Human-readable name for logging
+# Readable name for logging
 FEED_NAME = "SIP (Algo Trader Plus)" if USE_SIP else "IEX (Free)"
 
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
+# Get data path from environment variable, with default for Docker
+DATA_BASE_PATH = Path(os.environ.get("DATA_PATH", "/app/data"))
 
-# Path to existing SQLite database on external SSD
-# Database already exists but has no tables yet (will be created by init script)
-TICK_DB_PATH = "/Volumes/Vault/trading_data/tick-data-storage.db"
+# Create base directory if it doesn't exist
+DATA_BASE_PATH.mkdir(parents=True, exist_ok=True)
 
-# Verify the Vault is mounted before proceeding
-VAULT_PATH = Path("/Volumes/Vault")
-if not VAULT_PATH.exists():
-    raise RuntimeError(
-        f"External SSD not mounted at {VAULT_PATH}! "
-        f"Please connect the Vault drive before running tick data operations."
-    )
+# Database path
+TICK_DB_PATH = DATA_BASE_PATH / "trading_data" / "tick-data-storage.db"
+
+# Create parent directories for the database
+TICK_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print(f"✓ Tick configuration loaded successfully (Data path: {DATA_BASE_PATH})")
 
 # =============================================================================
 # ALPACA API CREDENTIALS
@@ -308,6 +309,42 @@ BACKTEST_MAX_DRAWDOWN = -0.0779
 # d=0.30 achieves stationarity (p=0.0405) while preserving 70% of memory
 # Lower d = more memory = better predictions
 OPTIMAL_FRACTIONAL_D = 0.30
+
+# =============================================================================
+# PORTABILITY HELPER
+# =============================================================================
+
+def should_use_tick_bars() -> bool:
+    """
+    Auto-detect whether to use tick bars based on database existence.
+
+    This makes the bot portable - it will automatically use tick bars if
+    the database exists, otherwise fall back to Alpaca API bars.
+
+    Returns:
+        bool: True if tick database exists and is accessible, False otherwise
+    """
+    try:
+        # Check if database file exists
+        if not TICK_DB_PATH.exists():
+            print(f"ℹ️  Tick database not found at {TICK_DB_PATH}")
+            print(f"ℹ️  Will use Alpaca API for real-time bars")
+            return False
+
+        # Check if database is readable (has content)
+        if TICK_DB_PATH.stat().st_size == 0:
+            print(f"⚠️  Tick database exists but is empty: {TICK_DB_PATH}")
+            print(f"ℹ️  Will use Alpaca API for real-time bars")
+            return False
+
+        print(f"✓ Tick database found: {TICK_DB_PATH} ({TICK_DB_PATH.stat().st_size / 1024 / 1024:.1f} MB)")
+        print(f"✓ Will use tick imbalance bars from database")
+        return True
+
+    except Exception as e:
+        print(f"⚠️  Error checking tick database: {e}")
+        print(f"ℹ️  Will use Alpaca API for real-time bars")
+        return False
 
 # =============================================================================
 # AUTO-VALIDATION ON IMPORT

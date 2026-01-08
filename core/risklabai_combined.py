@@ -198,6 +198,11 @@ class RiskLabAICombined(Strategy):
         self.last_trade_result = None
         self.risk_halt_reason = None
 
+        # NEW: Position tracking for exit management
+        self.position_entry_times = {}    # symbol -> datetime
+        self.position_entry_prices = {}   # symbol -> entry price
+        self.position_highest_prices = {}  # symbol -> highest price seen (for trailing stops)
+
         logger.info("=" * 60)
         logger.info("RISK MANAGEMENT ENABLED")
         logger.info("=" * 60)
@@ -360,7 +365,14 @@ class RiskLabAICombined(Strategy):
         logger.info(f"💰 Portfolio: ${current_value:,.2f} (Daily: {daily_pnl_pct:+.2%}, DD: {drawdown:.2%})")
         logger.info(f"📊 Risk Status: {self.consecutive_losses} losses, {self.trades_today}/{self.max_trades_per_day} trades")
 
-        # Step 1: Check if we need to retrain (weekly)
+        # Step 1: CHECK EXISTING POSITIONS FIRST (before generating new signals)
+        # This ensures we capture profits and cut losses immediately
+        logger.info("\n" + "=" * 80)
+        logger.info("STEP 1: CHECKING EXISTING POSITIONS FOR EXIT TRIGGERS")
+        logger.info("=" * 80)
+        self._check_existing_positions()
+
+        # Step 2: Check if we need to retrain (weekly)
         if self._should_retrain():
             logger.info("Retraining models...")
             self._train_models()
@@ -369,7 +381,10 @@ class RiskLabAICombined(Strategy):
             logger.warning("Models not trained, skipping iteration")
             return
 
-        # Step 2: Generate signals for each symbol with trained models
+        # Step 3: Generate signals for each symbol with trained models
+        logger.info("\n" + "=" * 80)
+        logger.info("STEP 2: GENERATING SIGNALS FOR NEW ENTRIES")
+        logger.info("=" * 80)
         for symbol in self.symbol_models.keys():
             try:
                 self._process_symbol(symbol)
@@ -544,6 +559,169 @@ class RiskLabAICombined(Strategy):
             logger.error(f"Error fetching bars for {symbol}: {e}")
             return None
 
+    def _check_existing_positions(self):
+        """
+        Check all existing positions and execute exits based on profit/loss thresholds.
+
+        This runs at the START of every trading iteration to actively manage positions.
+        Independently issues SELL orders when thresholds are hit (no reliance on bracket orders).
+        """
+        try:
+            # Get all current positions
+            positions = self.get_positions()
+
+            if not positions:
+                logger.debug("No open positions to check")
+                return
+
+            # Filter to actual stock positions (exclude cash)
+            stock_positions = [
+                p for p in positions
+                if hasattr(p, 'symbol') and p.symbol not in ['USD', 'CASH']
+                and hasattr(p, 'quantity') and p.quantity != 0
+            ]
+
+            if not stock_positions:
+                logger.debug("No stock positions to check")
+                return
+
+            logger.info("=" * 80)
+            logger.info(f"📊 CHECKING {len(stock_positions)} OPEN POSITIONS")
+            logger.info("=" * 80)
+
+            for position in stock_positions:
+                symbol = position.symbol
+                quantity = position.quantity
+
+                # Get current price
+                current_price = self.get_last_price(symbol)
+                if current_price is None or current_price <= 0:
+                    logger.warning(f"{symbol}: Cannot get current price, skipping")
+                    continue
+
+                # Get entry price (if we have it tracked)
+                entry_price = self.position_entry_prices.get(symbol)
+
+                if entry_price is None:
+                    # Bot restarted or position opened before tracking started
+                    # Use position's average entry price if available
+                    if hasattr(position, 'avg_entry_price') and position.avg_entry_price:
+                        entry_price = float(position.avg_entry_price)
+                        # Track it for next iteration
+                        self.position_entry_prices[symbol] = entry_price
+                        self.position_entry_times[symbol] = datetime.now()
+                        self.position_highest_prices[symbol] = current_price
+                        logger.info(f"{symbol}: Recovered entry price ${entry_price:.2f} from position data")
+                    else:
+                        logger.warning(f"{symbol}: No entry price available, skipping exit check")
+                        continue
+
+                # Calculate profit/loss
+                pnl_dollars = (current_price - entry_price) * quantity
+                pnl_pct = (current_price - entry_price) / entry_price
+
+                # Get thresholds
+                profit_target_pct = self.risklabai.labeler.profit_taking_mult  # 0.04 (4%)
+                stop_loss_pct = self.risklabai.labeler.stop_loss_mult          # 0.02 (2%)
+
+                # Update highest price for trailing stop
+                if symbol not in self.position_highest_prices:
+                    self.position_highest_prices[symbol] = current_price
+                else:
+                    self.position_highest_prices[symbol] = max(
+                        self.position_highest_prices[symbol],
+                        current_price
+                    )
+
+                highest_price = self.position_highest_prices[symbol]
+                drawdown_from_peak = (current_price - highest_price) / highest_price
+
+                # TRAILING STOP: If we've had significant gains, protect them
+                # If price went up 5%+, set stop at 3% gain (lock in 60% of gains)
+                trailing_stop_triggered = False
+                if highest_price > entry_price * 1.05:  # Price went up 5%+
+                    trailing_stop_price = entry_price * 1.03  # Protect 3% gain
+                    if current_price < trailing_stop_price:
+                        trailing_stop_triggered = True
+
+                logger.info("-" * 80)
+                logger.info(f"{symbol}: {quantity} shares")
+                logger.info(f"  Entry: ${entry_price:.2f}")
+                logger.info(f"  Current: ${current_price:.2f}")
+                logger.info(f"  Highest: ${highest_price:.2f}")
+                logger.info(f"  P&L: ${pnl_dollars:+,.2f} ({pnl_pct:+.2%})")
+                logger.info(f"  Drawdown from peak: {drawdown_from_peak:.2%}")
+
+                # CHECK EXIT CONDITIONS
+                exit_reason = None
+
+                # 1. PROFIT TARGET HIT
+                if pnl_pct >= profit_target_pct:
+                    exit_reason = f"PROFIT TARGET HIT: {pnl_pct:+.2%} >= {profit_target_pct:.2%}"
+
+                # 2. STOP LOSS HIT
+                elif pnl_pct <= -stop_loss_pct:
+                    exit_reason = f"STOP LOSS HIT: {pnl_pct:+.2%} <= {-stop_loss_pct:.2%}"
+
+                # 3. TRAILING STOP HIT
+                elif trailing_stop_triggered:
+                    locked_in_gain = (current_price - entry_price) / entry_price
+                    exit_reason = f"TRAILING STOP HIT: Locking in {locked_in_gain:+.2%} gain (peaked at {(highest_price-entry_price)/entry_price:+.2%})"
+
+                # EXECUTE EXIT IF THRESHOLD HIT
+                if exit_reason:
+                    logger.info("=" * 80)
+                    logger.info(f"🔴 EXITING POSITION: {symbol}")
+                    logger.info("=" * 80)
+                    logger.info(f"  Reason: {exit_reason}")
+                    logger.info(f"  Realized P&L: ${pnl_dollars:+,.2f} ({pnl_pct:+.2%})")
+                    logger.info("=" * 80)
+
+                    # Issue independent SELL order
+                    self._exit_position(symbol, exit_reason)
+                else:
+                    logger.info(f"  ✓ Holding (Target: {profit_target_pct:.1%}, Stop: {-stop_loss_pct:.1%})")
+
+            logger.info("=" * 80)
+
+        except Exception as e:
+            logger.error(f"Error checking existing positions: {e}")
+
+    def _exit_position(self, symbol: str, reason: str):
+        """
+        Exit a position by issuing an independent SELL order.
+
+        Args:
+            symbol: Stock symbol to exit
+            reason: Human-readable reason for exit (for logging)
+        """
+        try:
+            position = self.get_position(symbol)
+
+            if position is None or position.quantity <= 0:
+                logger.warning(f"{symbol}: No position to exit")
+                return
+
+            quantity = abs(position.quantity)
+
+            # Issue simple SELL order (bot manages independently)
+            order = self.create_order(symbol, quantity, "sell")
+            self.submit_order(order)
+
+            logger.info(f"✅ SELL ORDER SUBMITTED: {quantity} shares of {symbol}")
+            logger.info(f"   Exit reason: {reason}")
+
+            # Clean up tracking
+            if symbol in self.position_entry_prices:
+                del self.position_entry_prices[symbol]
+            if symbol in self.position_entry_times:
+                del self.position_entry_times[symbol]
+            if symbol in self.position_highest_prices:
+                del self.position_highest_prices[symbol]
+
+        except Exception as e:
+            logger.error(f"Error exiting position for {symbol}: {e}")
+
     def _process_symbol(self, symbol: str):
         """Generate and execute signal for one symbol with Kelly Criterion sizing."""
         # Check if we have a trained model for this symbol
@@ -627,7 +805,7 @@ class RiskLabAICombined(Strategy):
             if current_position is None or current_position.quantity >= 0:
                 # Close long position first if exists
                 if current_position is not None and current_position.quantity > 0:
-                    self._close_position(symbol)
+                    self._exit_position(symbol, "SHORT SIGNAL - Closing long first")
                 # Note: Short selling requires margin account
                 # For now, we'll just avoid going short
                 logger.info(f"{symbol}: Short signal but not implementing short selling")
@@ -635,7 +813,7 @@ class RiskLabAICombined(Strategy):
                 logger.info(f"{symbol}: Already short, no action")
 
     def _enter_long(self, symbol: str, position_value: float):
-        """Enter long position with risk management."""
+        """Enter long position with simple BUY order (bot manages exits independently)."""
         try:
             price = self.get_last_price(symbol)
 
@@ -649,47 +827,31 @@ class RiskLabAICombined(Strategy):
                 logger.info(f"{symbol}: Position value too small")
                 return
 
-            logger.info(f"LONG {symbol}: {quantity} shares @ ${price:.2f} (total: ${position_value:.2f})")
+            # Simple BUY order - no bracket orders (bot manages exits)
+            order = self.create_order(symbol, quantity, "buy")
+            self.submit_order(order)
 
-            # Create bracket order with OPTIMAL stop-loss and take-profit
-            # Using optimal parameters: 4% profit target, 2% stop loss
+            # Track entry price and time for exit management
+            self.position_entry_prices[symbol] = price
+            self.position_entry_times[symbol] = datetime.now()
+            self.position_highest_prices[symbol] = price  # Start trailing stop tracking
+
+            # Log entry with target thresholds
             profit_target_pct = self.risklabai.labeler.profit_taking_mult  # 0.04 (4%)
             stop_loss_pct = self.risklabai.labeler.stop_loss_mult          # 0.02 (2%)
 
-            order = self.create_order(
-                symbol,
-                quantity,
-                "buy",
-                take_profit_price=price * (1 + profit_target_pct),
-                stop_loss_price=price * (1 - stop_loss_pct)
-            )
-            self.submit_order(order)
-
-            logger.info(f"  📈 Take Profit: ${price * (1 + profit_target_pct):.2f} (+{profit_target_pct:.1%})")
+            logger.info("=" * 80)
+            logger.info(f"🔵 ENTERED LONG: {symbol}")
+            logger.info("=" * 80)
+            logger.info(f"  Quantity: {quantity} shares @ ${price:.2f}")
+            logger.info(f"  Total: ${position_value:.2f}")
+            logger.info(f"  📈 Profit Target: ${price * (1 + profit_target_pct):.2f} (+{profit_target_pct:.1%})")
             logger.info(f"  📉 Stop Loss: ${price * (1 - stop_loss_pct):.2f} (-{stop_loss_pct:.1%})")
+            logger.info(f"  Entry Time: {self.position_entry_times[symbol]}")
+            logger.info("=" * 80)
 
         except Exception as e:
             logger.error(f"Error entering long for {symbol}: {e}")
-
-    def _close_position(self, symbol: str):
-        """Close existing position."""
-        try:
-            position = self.get_position(symbol)
-
-            if position is None:
-                return
-
-            logger.info(f"CLOSING {symbol}: {abs(position.quantity)} shares")
-
-            order = self.create_order(
-                symbol,
-                abs(position.quantity),
-                "sell" if position.quantity > 0 else "buy"
-            )
-            self.submit_order(order)
-
-        except Exception as e:
-            logger.error(f"Error closing position for {symbol}: {e}")
 
     def on_abrupt_closing(self):
         """Handle strategy shutdown."""
