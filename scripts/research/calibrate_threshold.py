@@ -91,7 +91,7 @@ def calibrate_threshold(
 
     if not date_range:
         logger.error(f"❌ No tick data found for {symbol}")
-        logger.error("Run scripts/backfill_ticks.py first to fetch historical data")
+        logger.error("Run scripts/setup/backfill_ticks.py first to fetch historical data")
         storage.close()
         return None
 
@@ -259,7 +259,7 @@ def main():
     else:
         print("\n❌ Calibration failed")
         print("Make sure you have tick data in the database:")
-        print("  python scripts/backfill_ticks.py --symbol", args.symbol)
+        print("  python scripts/setup/backfill_ticks.py --symbol", args.symbol)
         sys.exit(1)
 
 

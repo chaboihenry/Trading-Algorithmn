@@ -6,7 +6,7 @@ Downloads historical tick data for ALL US stocks.
 Runs backfill_ticks.py for each symbol in parallel for efficiency.
 
 Usage:
-    python scripts/backfill_all_symbols.py [--tier TIER] [--parallel N]
+    python scripts/setup/backfill_all_symbols.py [--tier TIER] [--parallel N]
 
 Arguments:
     --tier: Which tier to backfill (tier_1, tier_2, tier_3, tier_4, tier_5)
@@ -55,8 +55,8 @@ def backfill_symbol(symbol: str, days: int = 365) -> dict:
     try:
         # Run backfill_ticks.py with symbol argument
         cmd = [
-            '/Users/henry/miniconda3/envs/trading/bin/python',
-            'scripts/backfill_ticks.py',
+            sys.executable,
+            'scripts/setup/backfill_ticks.py',
             '--symbol', symbol,
             '--days', str(days)
         ]
@@ -119,7 +119,7 @@ def main():
         symbols = get_symbols_by_tier(args.tier)
     except ImportError:
         logger.error("all_symbols.py not found!")
-        logger.error("Run: python scripts/fetch_all_symbols.py first")
+        logger.error("Run: python scripts/setup/fetch_all_symbols.py first")
         return 1
 
     logger.info("=" * 80)

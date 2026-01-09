@@ -116,7 +116,7 @@ def main():
         ACTIVE_SYMBOLS = get_symbols_by_tier('tier_1')  # Start with top 100
     except ImportError:
         logger.error("all_symbols.py not found!")
-        logger.error("Run: python scripts/fetch_all_symbols.py first")
+        logger.error("Run: python scripts/setup/fetch_all_symbols.py first")
         return 1
 
     logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from tier_1")

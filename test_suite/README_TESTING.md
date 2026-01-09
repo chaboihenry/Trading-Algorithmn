@@ -255,7 +255,7 @@ Profit Factor:    <1.2
 
 **1. Train models for tier_1:**
 ```bash
-python scripts/train_all_symbols.py --tier tier_1
+python scripts/setup/train_all_symbols.py --tier tier_1
 ```
 
 **2. Run comprehensive backtest:**

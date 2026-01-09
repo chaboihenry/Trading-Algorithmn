@@ -6,7 +6,7 @@ Trains RiskLabAI models for ALL US stocks.
 Each symbol gets its own dedicated model stored as models/risklabai_{symbol}_models.pkl
 
 Usage:
-    python scripts/train_all_symbols.py [--tier TIER] [--parallel N]
+    python scripts/setup/train_all_symbols.py [--tier TIER] [--parallel N]
 
 Arguments:
     --tier: Which tier to train (tier_1, tier_2, tier_3, tier_4, tier_5)
@@ -224,7 +224,7 @@ def main():
         symbols = get_symbols_by_tier(args.tier)
     except ImportError:
         logger.error("all_symbols.py not found!")
-        logger.error("Run: python scripts/fetch_all_symbols.py first")
+        logger.error("Run: python scripts/setup/fetch_all_symbols.py first")
         return 1
 
     logger.info("=" * 80)

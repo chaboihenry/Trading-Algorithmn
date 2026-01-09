@@ -185,7 +185,7 @@ def create_tables():
     conn.close()
 
     print("\n✓ Ready for tick data operations!")
-    print("  Next step: Run scripts/backfill_ticks.py to fetch historical data")
+    print("  Next step: Run scripts/setup/backfill_ticks.py to fetch historical data")
 
 
 def verify_tables():

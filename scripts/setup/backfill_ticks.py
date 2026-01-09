@@ -18,16 +18,16 @@ OOP Concepts:
 
 Usage:
     # Backfill all configured symbols:
-    python scripts/backfill_ticks.py
+    python scripts/setup/backfill_ticks.py
 
     # Backfill specific symbol:
-    python scripts/backfill_ticks.py --symbol SPY
+    python scripts/setup/backfill_ticks.py --symbol SPY
 
     # Backfill last 30 days:
-    python scripts/backfill_ticks.py --days 30
+    python scripts/setup/backfill_ticks.py --days 30
 
     # Force re-fetch (ignore existing data):
-    python scripts/backfill_ticks.py --force
+    python scripts/setup/backfill_ticks.py --force
 """
 
 import sys

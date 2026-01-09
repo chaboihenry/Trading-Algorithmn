@@ -10,7 +10,7 @@ This script automates the complete pipeline to trade ALL US stocks:
 5. Run the bot!
 
 Usage:
-    python scripts/master_setup.py [--tier TIER] [--skip-fetch] [--skip-backfill] [--skip-train]
+    python scripts/setup/master_setup.py [--tier TIER] [--skip-fetch] [--skip-backfill] [--skip-train]
 
 Arguments:
     --tier: Which tier to set up (tier_1, tier_2, tier_3, tier_4, tier_5)
@@ -98,16 +98,16 @@ def main():
         epilog="""
 Examples:
   # Set up Tier 1 (100 symbols) - RECOMMENDED START
-  python scripts/master_setup.py --tier tier_1
+  python scripts/setup/master_setup.py --tier tier_1
 
   # Set up Tier 2 (500 symbols) with 16 parallel jobs
-  python scripts/master_setup.py --tier tier_2 --parallel 16
+  python scripts/setup/master_setup.py --tier tier_2 --parallel 16
 
   # Set up and run bot automatically
-  python scripts/master_setup.py --tier tier_1 --run-bot
+  python scripts/setup/master_setup.py --tier tier_1 --run-bot
 
   # Skip steps you already did
-  python scripts/master_setup.py --tier tier_1 --skip-fetch --skip-backfill
+  python scripts/setup/master_setup.py --tier tier_1 --skip-fetch --skip-backfill
         """
     )
 
@@ -166,7 +166,7 @@ Examples:
 
         cmd = [
             sys.executable,
-            'scripts/fetch_all_symbols.py'
+            'scripts/setup/fetch_all_symbols.py'
         ]
 
         if not run_command(cmd, "Fetch symbols from Alpaca"):
@@ -187,7 +187,7 @@ Examples:
 
         cmd = [
             sys.executable,
-            'scripts/backfill_all_symbols.py',
+            'scripts/setup/backfill_all_symbols.py',
             '--tier', args.tier,
             '--parallel', str(args.parallel),
             '--days', str(args.days)
@@ -234,7 +234,7 @@ Examples:
                 logger.info(f"  Downloading {symbol}...")
                 retry_cmd = [
                     sys.executable,
-                    'scripts/backfill_ticks.py',
+                    'scripts/setup/backfill_ticks.py',
                     '--symbol', symbol,
                     '--days', str(args.days)
                 ]
@@ -253,7 +253,7 @@ Examples:
 
         cmd = [
             sys.executable,
-            'scripts/train_all_symbols.py',
+            'scripts/setup/train_all_symbols.py',
             '--tier', args.tier,
             '--parallel', '1'  # Keep at 1 to avoid memory issues
         ]
@@ -313,7 +313,7 @@ Examples:
     logger.info("  python run_live_trading.py")
     logger.info("")
     logger.info("To expand to more symbols:")
-    logger.info("  python scripts/master_setup.py --tier tier_2")
+    logger.info("  python scripts/setup/master_setup.py --tier tier_2")
     logger.info("")
     logger.info("To monitor models:")
     logger.info("  ls -lh models/risklabai_*_models.pkl | wc -l")

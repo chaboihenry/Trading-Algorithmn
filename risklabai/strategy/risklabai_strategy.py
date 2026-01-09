@@ -584,7 +584,7 @@ class RiskLabAIStrategy:
             storage.close()
             raise ValueError(
                 f"No tick data found for {symbol} in database. "
-                f"Run scripts/backfill_ticks.py first."
+                f"Run scripts/setup/backfill_ticks.py first."
             )
 
         earliest, latest = date_range

@@ -8,7 +8,7 @@ and filters them by liquidity and quality criteria.
 This creates a comprehensive trading universe of all profitable trading opportunities.
 
 Usage:
-    python scripts/fetch_all_symbols.py [--min-volume MIN] [--min-price MIN] [--max-price MAX]
+    python scripts/setup/fetch_all_symbols.py [--min-volume MIN] [--min-price MIN] [--max-price MAX]
 
 Arguments:
     --min-volume: Minimum average daily volume in shares (default: 1000000 = 1M)
@@ -466,8 +466,8 @@ def main():
     logger.info("")
     logger.info("Next steps:")
     logger.info("  1. Review symbols: python config/all_symbols.py")
-    logger.info("  2. Download tick data: python scripts/backfill_all_symbols.py --tier tier_1")
-    logger.info("  3. Train models: python scripts/train_all_symbols.py --tier tier_1")
+    logger.info("  2. Download tick data: python scripts/setup/backfill_all_symbols.py --tier tier_1")
+    logger.info("  3. Train models: python scripts/setup/train_all_symbols.py --tier tier_1")
     logger.info("  4. Run bot: python run_live_trading.py")
     logger.info("=" * 80)
 

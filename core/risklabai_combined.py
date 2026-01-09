@@ -249,7 +249,7 @@ class RiskLabAICombined(Strategy):
 
         if models_missing:
             logger.warning(f"Missing models for: {', '.join(models_missing)}")
-            logger.warning(f"Run: python scripts/train_all_symbols.py --phase phase_X")
+            logger.warning(f"Run: python scripts/setup/train_all_symbols.py --phase phase_X")
             logger.warning(f"These symbols will be skipped during trading.")
 
         self.models_trained = models_loaded > 0
