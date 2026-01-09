@@ -121,9 +121,18 @@ This isn't your typical moving-average bot. This system implements **institution
 │   ├── tick_config.py               # Optimal parameters
 │   └── all_symbols.py               # Symbol universe (tier_1-5)
 │
-├── 📂 scripts/                      # Utilities
-│   ├── train_all_symbols.py         # Multi-symbol model training
-│   └── fetch_all_symbols.py         # Symbol universe builder
+├── 📂 scripts/                      # Setup & Research Tools
+│   ├── setup/                       # Production setup scripts
+│   │   ├── master_setup.py          # End-to-end orchestration
+│   │   ├── fetch_all_symbols.py     # Symbol universe builder
+│   │   ├── backfill_ticks.py        # Historical data downloader
+│   │   ├── train_all_symbols.py     # Multi-symbol model training
+│   │   └── init_tick_tables.py      # Database initialization
+│   └── research/                    # Optimization & calibration
+│       ├── find_optimal_d.py        # Fractional differencing calibration
+│       ├── calibrate_threshold.py   # Tick bar threshold tuning
+│       ├── parameter_sweep_parallel.py  # Grid search optimization
+│       └── apply_optimal_params.py  # Best parameter results
 │
 ├── 📂 test_suite/                   # Validation & backtesting
 │   ├── backtest_multi_symbol.py     # Comprehensive backtest
@@ -206,10 +215,10 @@ Train models on historical tick data:
 
 ```bash
 # Train all tier_1 symbols (99 models, ~20-30 minutes)
-python scripts/train_all_symbols.py --tier tier_1
+python scripts/setup/train_all_symbols.py --tier tier_1
 
 # Train specific symbols
-python scripts/train_all_symbols.py --symbols AAPL MSFT GOOGL
+python scripts/setup/train_all_symbols.py --symbols AAPL MSFT GOOGL
 ```
 
 **Training Output:**
