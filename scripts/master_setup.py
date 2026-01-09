@@ -165,7 +165,7 @@ Examples:
         print_banner("STEP 1/4: FETCHING ALL US SYMBOLS FROM ALPACA")
 
         cmd = [
-            '/Users/henry/miniconda3/envs/trading/bin/python',
+            sys.executable,
             'scripts/fetch_all_symbols.py'
         ]
 
@@ -186,7 +186,7 @@ Examples:
         print_banner(f"STEP 2/4: DOWNLOADING TICK DATA FOR {tier_name.upper()}")
 
         cmd = [
-            '/Users/henry/miniconda3/envs/trading/bin/python',
+            sys.executable,
             'scripts/backfill_all_symbols.py',
             '--tier', args.tier,
             '--parallel', str(args.parallel),
@@ -233,7 +233,7 @@ Examples:
             for symbol in missing_symbols:
                 logger.info(f"  Downloading {symbol}...")
                 retry_cmd = [
-                    '/Users/henry/miniconda3/envs/trading/bin/python',
+                    sys.executable,
                     'scripts/backfill_ticks.py',
                     '--symbol', symbol,
                     '--days', str(args.days)
@@ -252,7 +252,7 @@ Examples:
         print_banner(f"STEP 3/4: TRAINING MODELS FOR {tier_name.upper()}")
 
         cmd = [
-            '/Users/henry/miniconda3/envs/trading/bin/python',
+            sys.executable,
             'scripts/train_all_symbols.py',
             '--tier', args.tier,
             '--parallel', '1'  # Keep at 1 to avoid memory issues
@@ -326,7 +326,7 @@ Examples:
         print_banner("STARTING TRADING BOT")
 
         cmd = [
-            '/Users/henry/miniconda3/envs/trading/bin/python',
+            sys.executable,
             'run_live_trading.py'
         ]
 

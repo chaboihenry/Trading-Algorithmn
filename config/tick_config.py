@@ -169,7 +169,7 @@ def validate_tick_config():
 
     Raises:
         ValueError: If any configuration is invalid
-        RuntimeError: If external dependencies (like Vault drive) are missing
+        RuntimeError: If external dependencies are missing
     """
     errors = []
 
@@ -178,7 +178,7 @@ def validate_tick_config():
     if not db_path.parent.exists():
         errors.append(
             f"Database directory does not exist: {db_path.parent}. "
-            f"Ensure Vault drive is mounted."
+            f"Ensure DATA_PATH is correctly set in environment."
         )
 
     # 2. Check API credentials

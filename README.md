@@ -31,6 +31,8 @@ This isn't your typical moving-average bot. This system implements **institution
 
 | Traditional Approach | This Implementation | Impact |
 |---------------------|---------------------|--------|
+| Manual P&L calculations | **Direct Alpaca API integration** | Eliminates calculation errors, single source of truth |
+| Hard-coded local paths | **Fully portable via Docker** | Runs anywhere, reproducible environments |
 | Time-based bars (1min, 5min) | **Tick imbalance bars** | Adapts to market activity, better statistical properties |
 | Fixed returns labels | **Triple-barrier labeling** with volatility scaling | Labels match real trading mechanics |
 | Single model | **Primary + Meta models** (direction + confidence) | Separates prediction from bet sizing |
@@ -38,6 +40,20 @@ This isn't your typical moving-average bot. This system implements **institution
 | All data points | **CUSUM event filtering** | Focuses on statistically significant moves |
 | Standard K-fold CV | **Purged K-fold** with embargo | Eliminates look-ahead bias in time series |
 | Train on all data | **70/30 train/test split** | Validates on truly unseen data |
+
+### 🔗 Production-Grade Architecture
+
+**Zero Manual Calculations** - All position data comes directly from Alpaca's API:
+- `position.unrealized_plpc` → Profit/Loss percentage
+- `position.unrealized_pl` → Dollar P&L
+- `position.avg_entry_price` → Average entry price
+- `position.current_price` → Real-time market price
+
+**Fully Portable** - No hard-coded paths or local dependencies:
+- ✅ Works with or without tick database (auto-detects availability)
+- ✅ Docker-ready for any environment
+- ✅ Environment variables for all configuration
+- ✅ Models download automatically from GitHub releases
 
 ---
 
@@ -123,11 +139,43 @@ This isn't your typical moving-average bot. This system implements **institution
 
 ### Prerequisites
 
-- Python 3.11+
+- **Docker** (recommended) OR Python 3.11+
 - Alpaca trading account ([free paper trading](https://alpaca.markets))
-- ~2GB disk space for tick data
+- ~2GB disk space for tick data (optional - bot works without it)
 
-### Installation
+### 🐳 Docker Deployment (Recommended)
+
+**Fully portable, reproducible environment - runs anywhere Docker runs.**
+
+```bash
+# 1. Clone repository
+git clone https://github.com/chaboihenry/Trading-Algorithmn.git
+cd "Integrated Trading Agent"
+
+# 2. Configure credentials
+cp .env.test .env
+# Edit .env with your Alpaca API keys
+
+# 3. Run with Docker Compose
+docker-compose up -d
+
+# 4. View logs
+docker-compose logs -f trading-bot
+
+# 5. Stop bot
+docker-compose down
+```
+
+**What Docker gives you:**
+- ✅ No Python environment setup
+- ✅ Consistent behavior across any machine
+- ✅ Isolated from system dependencies
+- ✅ Pre-configured with all models
+- ✅ Easy scaling and deployment
+
+### 💻 Manual Installation (Alternative)
+
+If you prefer not to use Docker:
 
 ```bash
 # Clone repository
@@ -149,6 +197,7 @@ Create a `.env` file with your Alpaca credentials:
 ```env
 ALPACA_API_KEY=your_key_here
 ALPACA_API_SECRET=your_secret_here
+DATA_PATH=./data  # Optional: for tick data storage
 ```
 
 ### Training Models

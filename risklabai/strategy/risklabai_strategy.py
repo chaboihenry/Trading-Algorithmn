@@ -539,7 +539,7 @@ class RiskLabAIStrategy:
         Train models from tick data stored in database.
 
         This method:
-        1. Loads tick data from the Vault database
+        1. Loads tick data from the SQLite database
         2. Generates tick imbalance bars
         3. Converts bars to DataFrame
         4. Runs the full RiskLabAI training pipeline

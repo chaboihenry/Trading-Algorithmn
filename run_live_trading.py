@@ -12,6 +12,8 @@ Usage:
 """
 
 import logging
+import signal
+import sys
 from datetime import datetime
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
@@ -41,6 +43,39 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+force_exit = False
+
+
+def signal_handler(sig, frame):
+    """
+    Handle Ctrl+C (SIGINT) gracefully.
+
+    First Ctrl+C: Initiates graceful shutdown (saves models, logs, etc.)
+    Second Ctrl+C: Forces immediate exit without cleanup
+    """
+    global shutdown_requested, force_exit
+
+    if force_exit:
+        # Third Ctrl+C or already force exiting
+        logger.warning("\n⚠️  Force exit already in progress...")
+        return
+
+    if shutdown_requested:
+        # Second Ctrl+C - force immediate exit
+        logger.warning("\n🚨 FORCE EXIT: Second Ctrl+C detected!")
+        logger.warning("⏭️  Skipping cleanup and exiting immediately...")
+        force_exit = True
+        sys.exit(1)
+    else:
+        # First Ctrl+C - graceful shutdown
+        logger.info("\n🛑 Shutdown requested (Ctrl+C)")
+        logger.info("⏳ Cleaning up... (Press Ctrl+C again to force quit)")
+        shutdown_requested = True
+        # Let the exception propagate to trigger cleanup
+        raise KeyboardInterrupt()
 
 
 def main():
@@ -133,23 +168,38 @@ def main():
     strategy = RiskLabAICombined(broker=broker)
     trader.add_strategy(strategy)
 
+    # Register signal handler for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)  # Docker stop signal
+
     # Run trading bot
     logger.info("Starting trading bot...")
     logger.info("Profitability logs: logs/profitability_logs/")
-    logger.info("Press Ctrl+C to stop")
+    logger.info("Press Ctrl+C once to stop gracefully")
+    logger.info("Press Ctrl+C twice to force quit immediately")
 
     try:
         trader.run_all()
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        if not shutdown_requested:
+            logger.info("🛑 Shutdown initiated by user")
     except Exception as e:
         logger.error(f"Bot crashed: {e}")
         raise
     finally:
-        # Print final profitability summary
-        if hasattr(strategy, 'profitability_tracker'):
-            strategy.profitability_tracker.save_summary()
-            strategy.profitability_tracker.print_summary()
+        # Only do cleanup if not force exiting
+        if not force_exit:
+            try:
+                # Print final profitability summary
+                if hasattr(strategy, 'profitability_tracker'):
+                    logger.info("📊 Generating profitability summary...")
+                    strategy.profitability_tracker.save_summary()
+                    strategy.profitability_tracker.print_summary()
+                logger.info("✅ Cleanup complete")
+            except Exception as e:
+                logger.error(f"Error during cleanup: {e}")
+        else:
+            logger.warning("⏭️  Cleanup skipped (force exit)")
 
 
 if __name__ == "__main__":
