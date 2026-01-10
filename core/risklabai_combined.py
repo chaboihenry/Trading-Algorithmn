@@ -202,6 +202,10 @@ class RiskLabAICombined(Strategy):
         # Buy signal check frequency tracking
         self.last_buy_signal_check = None  # Track when we last checked for buy signals
 
+        # Stop loss cooldown tracking - prevent re-buying after stop loss
+        self.stop_loss_cooldowns = {}  # {symbol: datetime_of_stop_loss}
+        self.stop_loss_cooldown_days = 7  # Don't re-buy for 7 days after stop loss
+
         logger.info("=" * 60)
         logger.info("RISK MANAGEMENT ENABLED")
         logger.info("=" * 60)
@@ -212,6 +216,7 @@ class RiskLabAICombined(Strategy):
         logger.info(f"  Max trades/day: {self.max_trades_per_day}")
         logger.info(f"  Kelly sizing: {'Enabled' if self.use_kelly_sizing else 'Disabled'}")
         logger.info(f"  Kelly fraction: {self.kelly_fraction:.1%} (Half-Kelly)")
+        logger.info(f"  Stop loss cooldown: {self.stop_loss_cooldown_days} days (prevents re-buying after stop)")
         logger.info("=" * 60)
 
         # Load per-symbol models
@@ -375,6 +380,14 @@ class RiskLabAICombined(Strategy):
         # Risk checks passed - log status
         logger.info(f"💰 Portfolio: ${current_value:,.2f} (Daily: {daily_pnl_pct:+.2%}, DD: {drawdown:.2%})")
         logger.info(f"📊 Risk Status: {self.consecutive_losses} losses, {self.trades_today}/{self.max_trades_per_day} trades")
+
+        # Display stop loss cooldown status
+        if self.stop_loss_cooldowns:
+            logger.info(f"🚫 Stop Loss Cooldowns: {len(self.stop_loss_cooldowns)} symbols blacklisted")
+            for sym, stop_date in sorted(self.stop_loss_cooldowns.items()):
+                days_remaining = self.stop_loss_cooldown_days - (datetime.now() - stop_date).days
+                if days_remaining > 0:
+                    logger.info(f"   {sym}: {days_remaining} days remaining (until {(stop_date + timedelta(days=self.stop_loss_cooldown_days)).strftime('%m/%d')})")
 
         # Step 1: CHECK EXISTING POSITIONS FIRST (before generating new signals)
         # This ensures we capture profits and cut losses immediately
@@ -696,6 +709,12 @@ class RiskLabAICombined(Strategy):
             logger.info(f"✅ SELL ORDER SUBMITTED: {quantity} shares of {symbol}")
             logger.info(f"   Exit reason: {reason}")
 
+            # If this is a stop loss exit, add to cooldown to prevent immediate re-entry
+            if "STOP LOSS" in reason.upper():
+                self.stop_loss_cooldowns[symbol] = datetime.now()
+                logger.warning(f"🚫 {symbol} added to stop loss cooldown for {self.stop_loss_cooldown_days} days")
+                logger.warning(f"   Will not re-buy until {(datetime.now() + timedelta(days=self.stop_loss_cooldown_days)).strftime('%Y-%m-%d')}")
+
         except Exception as e:
             logger.error(f"Error exiting position for {symbol}: {e}")
 
@@ -705,6 +724,20 @@ class RiskLabAICombined(Strategy):
         if symbol not in self.symbol_models:
             logger.debug(f"{symbol}: No trained model available, skipping")
             return
+
+        # Check if symbol is in stop loss cooldown
+        if symbol in self.stop_loss_cooldowns:
+            stop_loss_date = self.stop_loss_cooldowns[symbol]
+            days_since_stop = (datetime.now() - stop_loss_date).days
+            days_remaining = self.stop_loss_cooldown_days - days_since_stop
+
+            if days_remaining > 0:
+                logger.debug(f"{symbol}: In stop loss cooldown ({days_remaining} days remaining)")
+                return
+            else:
+                # Cooldown expired, remove from dict
+                logger.info(f"{symbol}: Stop loss cooldown expired, removing from blacklist")
+                del self.stop_loss_cooldowns[symbol]
 
         # Get recent bars (need enough for feature calculation)
         bars = self._get_historical_bars(symbol, 100)
