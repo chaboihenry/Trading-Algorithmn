@@ -22,6 +22,7 @@ import time
 import logging
 from typing import List, Dict, Optional
 from datetime import datetime, timedelta
+from functools import wraps
 import pytz
 
 from alpaca.data.historical import StockHistoricalDataClient
@@ -45,6 +46,60 @@ from config.tick_config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def retry_with_backoff(max_retries=3, base_delay=1.0, exceptions=(Exception,)):
+    """
+    Decorator that retries a function with exponential backoff.
+
+    This handles transient failures (network issues, rate limits, temporary API errors)
+    by automatically retrying the function with increasing delays between attempts.
+
+    Backoff Strategy:
+    - Attempt 1: immediate
+    - Attempt 2: wait base_delay seconds (default 1s)
+    - Attempt 3: wait base_delay * 2 seconds (default 2s)
+    - Attempt 4: wait base_delay * 4 seconds (default 4s)
+    - etc.
+
+    Args:
+        max_retries: Maximum number of retry attempts (default 3)
+        base_delay: Base delay in seconds for exponential backoff (default 1.0)
+        exceptions: Tuple of exception types to catch and retry (default all exceptions)
+
+    Returns:
+        Decorated function that retries on failure
+
+    Example:
+        @retry_with_backoff(max_retries=5, base_delay=2.0)
+        def fetch_data():
+            return api.get_data()  # Will retry up to 5 times on failure
+    """
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == max_retries:
+                        # Final attempt failed - raise the exception
+                        logger.error(f"{func.__name__} failed after {max_retries} retries: {e}")
+                        raise
+
+                    # Calculate exponential backoff delay
+                    delay = base_delay * (2 ** attempt)
+                    logger.warning(
+                        f"{func.__name__} attempt {attempt + 1}/{max_retries + 1} failed: {e}. "
+                        f"Retrying in {delay:.1f}s..."
+                    )
+                    time.sleep(delay)
+
+            # Should never reach here, but just in case
+            return func(*args, **kwargs)
+
+        return wrapper
+    return decorator
 
 
 class AlpacaTickClient:
@@ -91,6 +146,7 @@ class AlpacaTickClient:
 
         logger.info(f"✓ Client initialized (rate limit delay: {self.rate_limit_delay}s)")
 
+    @retry_with_backoff(max_retries=3, base_delay=2.0, exceptions=(Exception,))
     def fetch_day_ticks(
         self,
         symbol: str,
@@ -228,7 +284,31 @@ class AlpacaTickClient:
                 else:
                     raise
 
-        logger.info(f"✓ Fetched {len(all_ticks):,} ticks for {symbol} on {date.date()}")
+        # Pagination verification and enhanced logging
+        tick_count = len(all_ticks)
+
+        # Log warning for zero ticks (possible data issue)
+        if tick_count == 0:
+            logger.warning(
+                f"⚠️  Zero ticks fetched for {symbol} on {date.date()}. "
+                f"This could indicate: (1) market holiday, (2) symbol not traded that day, "
+                f"or (3) API data unavailable."
+            )
+        # Log info for high-volume days
+        elif tick_count > 1_000_000:
+            logger.info(
+                f"📊 High-volume day for {symbol} on {date.date()}: "
+                f"{tick_count:,} ticks across {page_num} pages"
+            )
+
+        # Pagination verification
+        if page_num > 1:
+            logger.debug(
+                f"Pagination complete: {page_num} pages fetched, "
+                f"avg {tick_count // page_num:,} ticks/page"
+            )
+
+        logger.info(f"✓ Fetched {tick_count:,} ticks for {symbol} on {date.date()}")
         return all_ticks
 
     def fetch_ticks_range(
@@ -296,6 +376,7 @@ class AlpacaTickClient:
 
         return all_ticks
 
+    @retry_with_backoff(max_retries=3, base_delay=1.0, exceptions=(Exception,))
     def test_connection(self) -> bool:
         """
         Test API connection and feed access.

@@ -1,17 +1,18 @@
 """
 Fractional Differentiation for Stationary Features
 
-Uses RiskLabAI's fractional differentiation implementation.
+Uses RiskLabAI's fractional differentiation implementation with robust
+optimal d finding using ADF tests.
 
 d=0: Original price (non-stationary, full memory)
 d=1: Returns (stationary, almost no memory)
-d≈0.4: Sweet spot (stationary, retains memory)
+d≈0.2-0.8: Sweet spot (stationary, retains memory) - varies by symbol
+
+The optimal d is found by testing values from 0.0 to 1.0 in steps of 0.05,
+selecting the minimum d that achieves stationarity (ADF p-value < 0.05).
 """
 
-from RiskLabAI.data.differentiation import (
-    fractional_difference_fixed,
-    find_optimal_ffd_simple
-)
+from RiskLabAI.data.differentiation import fractional_difference_fixed
 import pandas as pd
 import numpy as np
 from typing import Optional
@@ -43,53 +44,77 @@ class FractionalDifferentiator:
 
         logger.info(f"FractionalDifferentiator initialized: d={d}, threshold={threshold}")
 
-    def find_optimal_d(
-        self,
-        series: pd.Series,
-        max_d: float = 1.0,
-        p_value: float = 0.05
-    ) -> float:
+    def _apply_frac_diff(self, series: pd.Series, d: float) -> pd.Series:
         """
-        Find minimum d that achieves stationarity.
+        Apply fractional differentiation for a given d value.
+
+        Args:
+            series: Price series
+            d: Differentiation order
+
+        Returns:
+            Fractionally differentiated series
+        """
+        try:
+            df = pd.DataFrame(series)
+            result_df = fractional_difference_fixed(
+                series=df,
+                degree=d,
+                threshold=self.threshold
+            )
+            result = result_df.iloc[:, 0]
+            result.index = series.index[:len(result)]
+            return result
+        except Exception as e:
+            logger.debug(f"Error applying frac diff with d={d}: {e}")
+            return pd.Series()
+
+    def find_optimal_d(self, series: pd.Series, d_range=(0.0, 1.0), step=0.05) -> float:
+        """
+        Find minimum d for stationarity using ADF test.
 
         Args:
             series: Price series to analyze
-            max_d: Maximum d to test
-            p_value: Significance level for ADF test
+            d_range: Range of d values to test (min, max)
+            step: Step size for testing d values
 
         Returns:
             Optimal d value
         """
+        from statsmodels.tsa.stattools import adfuller
+
+        series = series.dropna()
+
+        if len(series) < 100:
+            logger.warning(f"Series too short ({len(series)} < 100), defaulting to d=1.0")
+            self._optimal_d = 1.0
+            return 1.0
+
         logger.info(f"Finding optimal d for series of length {len(series)}")
 
-        try:
-            # Convert to DataFrame (RiskLabAI expects DataFrame)
-            df = pd.DataFrame(series)
+        for d in np.arange(d_range[0], d_range[1] + step, step):
+            try:
+                diff_series = self._apply_frac_diff(series, d)
+                diff_clean = diff_series.dropna()
 
-            result_df = find_optimal_ffd_simple(
-                input_series=df,
-                p_value_threshold=p_value
-            )
+                if len(diff_clean) < 50:
+                    continue
 
-            # Extract the optimal d value from the result
-            # find_optimal_ffd_simple returns a DataFrame with the optimal d column
-            if 'd_value' in result_df.columns:
-                self._optimal_d = result_df['d_value'].iloc[0]
-            elif 'Optimal d' in result_df.columns:
-                self._optimal_d = result_df['Optimal d'].iloc[0]
-            else:
-                # If we can't find the d value, use default
-                self._optimal_d = 0.4
-                logger.warning(f"Could not extract d value, using default {self._optimal_d}")
+                adf_result = adfuller(diff_clean, maxlag=12, autolag='AIC')
+                adf_stat, pvalue = adf_result[0], adf_result[1]
 
-            logger.info(f"Optimal d found: {self._optimal_d:.3f}")
-            return self._optimal_d
+                if pvalue < 0.05:  # Stationary at 5% significance
+                    self._optimal_d = round(d, 2)
+                    logger.info(f"✓ Optimal d={d:.2f} (ADF p-value={pvalue:.4f}, stat={adf_stat:.4f})")
+                    return self._optimal_d
 
-        except Exception as e:
-            logger.error(f"Error finding optimal d: {e}")
-            self._optimal_d = 0.4
-            logger.warning(f"Using default d={self._optimal_d}")
-            return self._optimal_d
+            except Exception as e:
+                logger.debug(f"ADF test failed for d={d}: {e}")
+                continue
+
+        logger.warning("No d achieved stationarity, using d=1.0 (standard returns)")
+        self._optimal_d = 1.0
+        return 1.0
 
     def transform(self, series: pd.Series) -> pd.Series:
         """
@@ -107,7 +132,7 @@ class FractionalDifferentiator:
             logger.info("No d specified, finding optimal d...")
             d = self.find_optimal_d(series)
 
-        logger.debug(f"Transforming series with d={d:.3f}")
+        logger.debug(f"Applying fractional differentiation with d={d:.3f}")
 
         try:
             # Convert to DataFrame (RiskLabAI expects DataFrame)

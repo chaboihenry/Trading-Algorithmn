@@ -16,10 +16,6 @@ xgboost>=2.0.0
 tensorflow>=2.15.0
 statsmodels>=0.14.0
 
-# Sentiment Analysis (FinBERT)
-transformers>=4.30.0
-torch>=2.0.0
-
 # Market Data
 yfinance>=0.2.28
 

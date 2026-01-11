@@ -29,10 +29,29 @@ class CUSUMEventFilter:
 
         Args:
             threshold: Event trigger threshold.
-                      If None, uses daily volatility.
+                      If None, uses daily volatility * 2.5.
         """
         self.threshold = threshold
         logger.info(f"CUSUMEventFilter initialized: threshold={threshold}")
+
+    def _calculate_threshold(self, prices: pd.Series) -> float:
+        """
+        Calculate CUSUM threshold to filter ~35% of events.
+
+        Args:
+            prices: Price series
+
+        Returns:
+            Threshold value (volatility * 2.5)
+        """
+        daily_returns = prices.pct_change().dropna()
+        daily_vol = daily_returns.std()
+
+        # Multiply by 2.5 to get ~35% filter rate (was ~1.0)
+        threshold = daily_vol * 2.5
+
+        logger.info(f"CUSUM threshold: {threshold:.6f} (vol={daily_vol:.6f})")
+        return threshold
 
     def get_events(
         self,
@@ -51,13 +70,13 @@ class CUSUMEventFilter:
         """
         h = threshold or self.threshold
 
-        # If no threshold, use daily volatility
+        # If no threshold, use daily volatility * 2.5
         if h is None:
-            daily_returns = close.pct_change().dropna()
-            h = daily_returns.rolling(20).std()
-            logger.info(f"Auto-calculated dynamic threshold from volatility")
-        elif isinstance(h, (int, float)):
-            # Convert scalar to Series
+            h = self._calculate_threshold(close)
+            logger.info(f"Auto-calculated threshold from volatility")
+
+        # Convert scalar to Series if needed
+        if isinstance(h, (int, float)):
             h = pd.Series(h, index=close.index)
 
         logger.info(f"Filtering events with CUSUM")
@@ -68,7 +87,15 @@ class CUSUMEventFilter:
                 threshold=h
             )
 
-            logger.info(f"Found {len(events)} CUSUM events from {len(close)} prices")
+            # Log filter rate with warnings
+            filter_rate = len(events) / len(close)
+            logger.info(f"CUSUM filter rate: {filter_rate*100:.1f}% ({len(events)}/{len(close)})")
+
+            if filter_rate > 0.50:
+                logger.warning(f"⚠️ Filter rate {filter_rate:.1%} too high - increase threshold")
+            if filter_rate < 0.20:
+                logger.warning(f"⚠️ Filter rate {filter_rate:.1%} too low - decrease threshold")
+
             return events
 
         except Exception as e:
@@ -88,13 +115,13 @@ class CUSUMEventFilter:
             threshold: Event threshold
 
         Returns:
-            Dictionary with 'up_events' and 'down_events'
+            Dictionary with 'events' and 'down_events'
         """
         h = threshold or self.threshold
 
         if h is None:
-            daily_returns = close.pct_change().dropna()
-            h = daily_returns.rolling(20).std().mean()
+            h = self._calculate_threshold(close)
+            logger.info(f"Auto-calculated threshold for symmetric CUSUM")
 
         logger.info(f"Running symmetric CUSUM with threshold={h:.6f}")
 
@@ -102,7 +129,14 @@ class CUSUMEventFilter:
             # RiskLabAI's symmetric CUSUM returns combined events
             events = symmetric_cusum_filter(prices=close, threshold=h)
 
-            logger.info(f"Symmetric CUSUM: {len(events)} total events")
+            # Log filter rate with warnings
+            filter_rate = len(events) / len(close)
+            logger.info(f"Symmetric CUSUM filter rate: {filter_rate*100:.1f}% ({len(events)}/{len(close)})")
+
+            if filter_rate > 0.50:
+                logger.warning(f"⚠️ Filter rate {filter_rate:.1%} too high - increase threshold")
+            if filter_rate < 0.20:
+                logger.warning(f"⚠️ Filter rate {filter_rate:.1%} too low - decrease threshold")
 
             return {
                 'events': events,

@@ -20,12 +20,35 @@ Why use a class here?
 
 import sqlite3
 import logging
+import pytz
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
 from config.tick_config import TICK_DB_PATH
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# TIMEZONE UTILITIES
+# =============================================================================
+ET_TZ = pytz.timezone('America/New_York')
+UTC_TZ = pytz.UTC
+
+
+def to_utc(dt):
+    """Convert any datetime to UTC."""
+    if dt.tzinfo is None:
+        # Assume ET if naive
+        dt = ET_TZ.localize(dt)
+    return dt.astimezone(UTC_TZ)
+
+
+def to_et(dt):
+    """Convert any datetime to Eastern Time."""
+    if dt.tzinfo is None:
+        dt = UTC_TZ.localize(dt)
+    return dt.astimezone(ET_TZ)
 
 
 class TickStorage:
@@ -87,6 +110,13 @@ class TickStorage:
         then reuses that same connection for all future calls. This is more
         efficient than creating a new connection for every operation.
 
+        Thread Safety & Performance Optimizations:
+        - timeout=30.0: Prevents immediate failures under load
+        - check_same_thread=False: Allows multi-threaded access (use with care)
+        - isolation_level='DEFERRED': Delays locks until needed
+        - WAL mode: Write-Ahead Logging for better concurrency
+        - synchronous=NORMAL: Balanced safety/performance
+
         Returns:
             sqlite3.Connection: Active database connection
 
@@ -95,11 +125,70 @@ class TickStorage:
         users of this class don't need to call it directly.
         """
         if self._connection is None:
-            self._connection = sqlite3.connect(self.db_path)
+            self._connection = sqlite3.connect(
+                self.db_path,
+                timeout=30.0,              # Wait up to 30s for lock (prevents immediate failures)
+                check_same_thread=False,   # Allow multi-threaded access
+                isolation_level='DEFERRED' # Delay locks until write actually happens
+            )
             # Set row factory to return rows as dictionaries (easier to work with)
             self._connection.row_factory = sqlite3.Row
 
+            # Enable Write-Ahead Logging for better concurrency
+            # Multiple readers can access DB while one writer is writing
+            self._connection.execute("PRAGMA journal_mode=WAL")
+
+            # Balanced synchronous mode - safer than OFF, faster than FULL
+            self._connection.execute("PRAGMA synchronous=NORMAL")
+
+            logger.debug("Database connection established with WAL mode")
+
         return self._connection
+
+    def _validate_tick(self, tick: dict, symbol: str) -> bool:
+        """
+        Validate tick data before saving to database.
+
+        This prevents corrupt/invalid data from polluting the database.
+        Invalid ticks are logged but skipped (not saved).
+
+        Validation Rules:
+        1. Price must be > 0 (no negative or zero prices)
+        2. Price must be < $100,000 (catches obvious errors like $45,000,000)
+        3. Size must be > 0 (no zero-share trades)
+
+        Args:
+            tick: Tick dictionary with 'price' and 'size' fields
+            symbol: Stock symbol (for logging)
+
+        Returns:
+            bool: True if tick is valid, False if should be skipped
+
+        Example:
+            >>> tick1 = {'price': 450.0, 'size': 100}
+            >>> storage._validate_tick(tick1, 'SPY')  # True
+            >>> tick2 = {'price': -10.0, 'size': 100}
+            >>> storage._validate_tick(tick2, 'SPY')  # False (negative price)
+        """
+        price = tick.get('price', 0)
+        size = tick.get('size', 0)
+
+        # Validation 1: Price must be positive
+        if price <= 0:
+            logger.warning(f"{symbol}: Invalid price {price} (must be > 0)")
+            return False
+
+        # Validation 2: Price sanity check (catch obvious errors)
+        if price > 100000:
+            logger.warning(f"{symbol}: Suspicious price {price} (> $100,000)")
+            return False
+
+        # Validation 3: Size must be positive
+        if size <= 0:
+            logger.warning(f"{symbol}: Invalid size {size} (must be > 0)")
+            return False
+
+        return True
 
     def save_ticks(self, symbol: str, ticks: List[Dict]) -> int:
         """
@@ -110,17 +199,27 @@ class TickStorage:
         - Individual inserts: ~10 seconds
         - Batch insert: ~0.1 seconds (100x faster!)
 
+        Data Validation:
+        - Invalid ticks (price<=0, price>$100k, size<=0) are filtered out
+        - Filtered ticks are logged but not saved
+        - This prevents corrupt data from entering the database
+
+        Timezone Handling:
+        - All timestamps are converted to UTC before storage
+        - Naive timestamps are assumed to be in Eastern Time (ET)
+        - This ensures consistency across different data sources
+
         Args:
             symbol: Stock ticker like "SPY", "QQQ", "IWM"
             ticks: List of tick dictionaries, each containing:
-                   - timestamp: datetime or ISO string
+                   - timestamp: datetime or ISO string (converted to UTC)
                    - price: float (trade price)
                    - size: int (number of shares)
                    - exchange: str (optional, which exchange executed the trade)
                    - trade_id: str (optional, unique trade identifier)
 
         Returns:
-            int: Number of ticks successfully saved
+            int: Number of ticks successfully saved (after validation)
 
         Example:
             >>> storage = TickStorage(db_path)
@@ -135,17 +234,47 @@ class TickStorage:
             logger.debug(f"No ticks to save for {symbol}")
             return 0
 
+        # STEP 1: Validate ticks before processing
+        # Filter out invalid ticks (bad prices, bad sizes, etc.)
+        valid_ticks = [tick for tick in ticks if self._validate_tick(tick, symbol)]
+
+        if len(valid_ticks) < len(ticks):
+            invalid_count = len(ticks) - len(valid_ticks)
+            logger.warning(
+                f"{symbol}: Filtered {invalid_count}/{len(ticks)} invalid ticks "
+                f"({invalid_count/len(ticks)*100:.1f}% rejected)"
+            )
+
+        if not valid_ticks:
+            logger.warning(f"{symbol}: No valid ticks to save (all filtered)")
+            return 0
+
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        # Prepare data for batch insert
+        # STEP 2: Get count BEFORE insert (for accurate reporting)
+        # cursor.rowcount is unreliable with INSERT OR IGNORE
+        count_before = self.get_tick_count(symbol)
+
+        # STEP 3: Prepare data for batch insert
         # Convert list of dicts to list of tuples for SQL INSERT
         insert_data = []
-        for tick in ticks:
+        for tick in valid_ticks:
             # Convert datetime to ISO format string if needed
+            # ALWAYS store in UTC for consistency
             timestamp = tick['timestamp']
             if isinstance(timestamp, datetime):
+                # Convert to UTC if timezone-aware, assume ET if naive
+                timestamp = to_utc(timestamp)
                 timestamp = timestamp.isoformat()
+            elif isinstance(timestamp, str):
+                # If string, parse and convert to UTC
+                try:
+                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                    timestamp = to_utc(dt).isoformat()
+                except Exception:
+                    # Keep as-is if can't parse
+                    pass
 
             insert_data.append((
                 symbol,
@@ -157,7 +286,8 @@ class TickStorage:
             ))
 
         try:
-            # INSERT OR IGNORE: Skip ticks that already exist (based on UNIQUE constraint)
+            # STEP 4: INSERT OR IGNORE
+            # Skip ticks that already exist (based on UNIQUE constraint)
             # This makes the operation idempotent - safe to run multiple times
             cursor.executemany("""
                 INSERT OR IGNORE INTO ticks
@@ -168,11 +298,19 @@ class TickStorage:
             # Commit changes to disk (make them permanent)
             conn.commit()
 
-            # rowcount tells us how many rows were actually inserted
-            # (may be less than len(ticks) if some were duplicates)
-            saved_count = cursor.rowcount
+            # STEP 5: Get count AFTER insert for accurate reporting
+            # cursor.rowcount is UNRELIABLE with INSERT OR IGNORE (SQLite bug)
+            # Instead, we calculate: saved = count_after - count_before
+            count_after = self.get_tick_count(symbol)
+            saved_count = count_after - count_before
 
-            logger.info(f"Saved {saved_count}/{len(ticks)} ticks for {symbol}")
+            # Log results with detailed breakdown
+            duplicate_count = len(valid_ticks) - saved_count
+            logger.info(
+                f"{symbol}: Saved {saved_count}/{len(ticks)} ticks "
+                f"(filtered: {len(ticks) - len(valid_ticks)}, duplicates: {duplicate_count})"
+            )
+
             return saved_count
 
         except sqlite3.Error as e:
@@ -291,10 +429,14 @@ class TickStorage:
 
         Call this after fetching new tick data to keep track of what you have.
 
+        Timezone Handling:
+        - Timestamps are stored in UTC for consistency
+        - Input timestamps should be UTC or will be converted
+
         Args:
             symbol: Stock ticker
-            earliest: Earliest timestamp in the data
-            latest: Latest timestamp in the data
+            earliest: Earliest timestamp in the data (UTC preferred)
+            latest: Latest timestamp in the data (UTC preferred)
             count: Total number of ticks stored
 
         Example:
@@ -309,8 +451,8 @@ class TickStorage:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        # Get current timestamp
-        now = datetime.now().isoformat()
+        # Get current timestamp in UTC
+        now = datetime.now(UTC_TZ).isoformat()
 
         # INSERT OR REPLACE: Update if exists, insert if doesn't exist
         cursor.execute("""

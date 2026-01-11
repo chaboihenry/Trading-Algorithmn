@@ -26,14 +26,16 @@ class ConnectionManager:
     API clients are properly closed on shutdown to prevent socket exhaustion.
     """
 
-    def __init__(self, broker=None):
+    def __init__(self, broker=None, strategy=None):
         """
         Initialize connection manager.
 
         Args:
             broker: Optional Alpaca broker instance (for Lumibot compatibility)
+            strategy: Optional strategy instance (for state persistence)
         """
         self.broker = broker
+        self.strategy = strategy
         self.active = True
         self._cleanup_registered = False
 
@@ -48,6 +50,15 @@ class ConnectionManager:
     def _signal_handler(self, signum, frame):
         """Handle shutdown signals gracefully."""
         logger.info(f"Received signal {signum}, cleaning up connections...")
+
+        # NEW: Save strategy state before cleanup (cooldowns, trade history, etc.)
+        if self.strategy and hasattr(self.strategy, '_save_state'):
+            try:
+                logger.info("Saving strategy state...")
+                self.strategy._save_state()
+            except Exception as e:
+                logger.error(f"Failed to save strategy state: {e}")
+
         self.cleanup_all()
         sys.exit(0)
 
@@ -159,12 +170,13 @@ class ConnectionManager:
 
 _connection_manager = None
 
-def get_connection_manager(broker=None) -> ConnectionManager:
+def get_connection_manager(broker=None, strategy=None) -> ConnectionManager:
     """
     Get the global ConnectionManager instance (creates it if needed).
 
     Args:
         broker: Optional broker instance for Lumibot compatibility
+        strategy: Optional strategy instance (for state persistence)
 
     Returns:
         Singleton ConnectionManager instance
@@ -172,6 +184,6 @@ def get_connection_manager(broker=None) -> ConnectionManager:
     global _connection_manager
 
     if _connection_manager is None:
-        _connection_manager = ConnectionManager(broker)
+        _connection_manager = ConnectionManager(broker, strategy)
 
     return _connection_manager

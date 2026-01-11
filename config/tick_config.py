@@ -81,19 +81,31 @@ ALPACA_PAPER = True
 # TRADING SYMBOLS
 # =============================================================================
 
-# Start with liquid ETFs (high tick volume, good for testing)
-# SPY: S&P 500 - most liquid security in the world
-# QQQ: NASDAQ-100 - tech heavy
-# IWM: Russell 2000 - small caps
-SYMBOLS = ["SPY", "QQQ", "IWM"]
+# Top 99 S&P 500 symbols by market cap (plus SPY, QQQ, IWM)
+# These symbols have been selected for high liquidity and market coverage
+SYMBOLS = [
+    # Market indices
+    "SPY", "QQQ", "IWM",
+    # Top 99 stocks
+    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "ADI", "AMAT", "AMD", "AMGN", "AMT",
+    "AMZN", "AON", "APH", "AVGO", "AXP", "BA", "BAC", "BDX", "BKNG", "BLK",
+    "BRK.B", "BSX", "C", "CAT", "CB", "CI", "CMCSA", "CME", "COP", "COST",
+    "CRM", "CSCO", "CVX", "DE", "DHR", "DUK", "ELV", "ETN", "GD", "GE",
+    "GILD", "GOOG", "GOOGL", "HD", "HON", "IBM", "INTC", "INTU", "ISRG", "ITW",
+    "JNJ", "JPM", "KO", "LIN", "LLY", "LOW", "LRCX", "MA", "MCD", "MDLZ",
+    "META", "MMC", "MMM", "MRK", "MSFT", "MU", "NEE", "NFLX", "NOC", "NOW",
+    "NVDA", "ORCL", "PANW", "PEP", "PG", "PGR", "PLD", "PM", "QCOM", "REGN",
+    "RTX", "SBUX", "SCHW", "SLB", "SO", "SPGI", "SYK", "TJX", "TMO", "TMUS",
+    "TSLA", "TXN", "UNH", "UNP", "V", "VRTX", "VZ", "WMT", "XOM"
+]
 
 # =============================================================================
 # BACKFILL SETTINGS
 # =============================================================================
 
 # How many days of historical tick data to fetch
-# 60 days = ~3 months of data for training
-BACKFILL_DAYS = 60
+# 365 days = 12 months of data for ML training (need 2000+ samples minimum)
+BACKFILL_DAYS = 365
 
 # Rate limiting to avoid Alpaca API throttling
 # Alpaca allows 200 requests/minute
@@ -148,11 +160,11 @@ INITIAL_IMBALANCE_THRESHOLD = 70.0
 #
 # IEX DATA (free):
 # - SPY: ~50,000 trades/day * 100 bytes ≈ 5 MB/day
-# - 3 symbols * 60 days ≈ 900 MB total
+# - 3 symbols * 365 days ≈ 5.5 GB total
 #
 # SIP DATA (after upgrade):
 # - SPY: ~500,000 trades/day * 100 bytes ≈ 50 MB/day
-# - 3 symbols * 60 days ≈ 9 GB total
+# - 3 symbols * 365 days ≈ 55 GB total
 #
 # 2TB SSD has plenty of space for both scenarios
 
@@ -200,10 +212,10 @@ def validate_tick_config():
     if BACKFILL_DAYS <= 0:
         errors.append(f"BACKFILL_DAYS must be positive, got {BACKFILL_DAYS}")
 
-    if BACKFILL_DAYS > 365:
+    if BACKFILL_DAYS > 730:
         errors.append(
             f"BACKFILL_DAYS too large ({BACKFILL_DAYS}). "
-            f"Consider shorter period to avoid excessive API usage."
+            f"Consider shorter period to avoid excessive API usage (max 2 years)."
         )
 
     # 5. Validate rate limit delay
@@ -287,7 +299,7 @@ OPTIMAL_PROB_THRESHOLD = 0.015   # 1.5% - Primary model probability threshold
 # Exit parameters
 OPTIMAL_PROFIT_TARGET = 0.04     # 4.0% - Take profit level
 OPTIMAL_STOP_LOSS = 0.02         # 2.0% - Stop loss level
-OPTIMAL_MAX_HOLDING_BARS = 20    # bars - Maximum holding period
+OPTIMAL_MAX_HOLDING_BARS = 30    # bars - Maximum holding period (30 bars → ~30-35% neutral labels)
 
 # Risk management
 OPTIMAL_RISK_REWARD_RATIO = 2.0  # Risk $1 to make $2
@@ -345,6 +357,23 @@ def should_use_tick_bars() -> bool:
         print(f"⚠️  Error checking tick database: {e}")
         print(f"ℹ️  Will use Alpaca API for real-time bars")
         return False
+
+# =============================================================================
+# MARKET TIMEZONE (Eastern Time)
+# =============================================================================
+
+from zoneinfo import ZoneInfo
+
+# US Eastern timezone - the market's official timezone
+# All time comparisons, market hours checks, and trading day logic use this
+# Do NOT use datetime.now() - use datetime.now(MARKET_TZ) instead
+MARKET_TZ = ZoneInfo("America/New_York")
+
+# Market hours (in Eastern Time)
+MARKET_OPEN_HOUR = 9
+MARKET_OPEN_MINUTE = 30
+MARKET_CLOSE_HOUR = 16
+MARKET_CLOSE_MINUTE = 0
 
 # =============================================================================
 # AUTO-VALIDATION ON IMPORT

@@ -38,7 +38,7 @@ from datetime import datetime, timedelta
 from typing import List, Tuple
 
 # Add project root to path
-project_root = Path(__file__).parent.parent
+project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 from config.tick_config import (
@@ -49,6 +49,7 @@ from config.tick_config import (
 )
 from data.tick_storage import TickStorage
 from data.alpaca_tick_client import AlpacaTickClient
+from utils.market_calendar import get_trading_days, is_trading_day, MARKET_TZ
 
 # Set up logging
 logging.basicConfig(
@@ -58,36 +59,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def get_trading_days(start_date: datetime, end_date: datetime) -> List[datetime]:
-    """
-    Get list of trading days (weekdays) between two dates.
-
-    This filters out weekends. In a production system, you'd also filter
-    out market holidays (New Year's, Christmas, etc.), but for now we'll
-    just skip weekends.
-
-    Args:
-        start_date: First date
-        end_date: Last date (inclusive)
-
-    Returns:
-        List of datetime objects representing trading days
-
-    Example:
-        >>> from datetime import datetime
-        >>> days = get_trading_days(datetime(2024, 1, 1), datetime(2024, 1, 7))
-        >>> print(f"{len(days)} trading days")  # Should be 5 (Mon-Fri)
-    """
-    trading_days = []
-    current = start_date
-
-    while current <= end_date:
-        # Skip weekends (Monday=0, Sunday=6)
-        if current.weekday() < 5:
-            trading_days.append(current)
-        current += timedelta(days=1)
-
-    return trading_days
+# NOTE: get_trading_days() is now imported from utils.market_calendar
+# It uses Alpaca's Calendar API to get accurate trading days (no hardcoded holidays!)
+# The old implementation only skipped weekends - the new one also skips:
+# - NYSE holidays (New Year's, MLK Day, Presidents Day, Good Friday, Memorial Day,
+#   Juneteenth, Independence Day, Labor Day, Thanksgiving, Christmas)
+# - Early closes (Christmas Eve, day before Thanksgiving)
 
 
 def estimate_time_remaining(
@@ -126,6 +103,28 @@ def estimate_time_remaining(
         return f"{hours}h {minutes}m"
 
 
+def verify_data_sufficiency(symbol: str, min_ticks: int = 1_000_000) -> bool:
+    """
+    Verify symbol has enough data for ML training.
+
+    Args:
+        symbol: Stock ticker to check
+        min_ticks: Minimum required ticks (default: 1M for sufficient ML training)
+
+    Returns:
+        bool: True if data is sufficient, False otherwise
+    """
+    storage = TickStorage(str(TICK_DB_PATH))
+    count = storage.get_tick_count(symbol)
+    storage.close()
+
+    if count < min_ticks:
+        logger.error(f"❌ {symbol}: {count:,} ticks (need {min_ticks:,})")
+        return False
+    logger.info(f"✓ {symbol}: {count:,} ticks - SUFFICIENT")
+    return True
+
+
 def backfill_symbol(
     symbol: str,
     days: int,
@@ -147,19 +146,19 @@ def backfill_symbol(
     logger.info("=" * 80)
 
     # Initialize components
-    storage = TickStorage(TICK_DB_PATH)
+    storage = TickStorage(str(TICK_DB_PATH))
     client = AlpacaTickClient()
 
-    # Calculate date range
-    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    # Calculate date range in Eastern Time (market's timezone)
+    end_date = datetime.now(MARKET_TZ).date()
     start_date = end_date - timedelta(days=days)
 
-    logger.info(f"Date range: {start_date.date()} to {end_date.date()}")
+    logger.info(f"Date range: {start_date} to {end_date}")
     logger.info(f"Data feed: {FEED_NAME}")
 
-    # Get trading days in range
+    # Get trading days in range (uses Alpaca Calendar API - no hardcoded holidays!)
     trading_days = get_trading_days(start_date, end_date)
-    logger.info(f"Trading days to process: {len(trading_days)}")
+    logger.info(f"Trading days to process: {len(trading_days)} (weekends and holidays excluded)")
 
     # Check existing data
     if not force:
@@ -175,8 +174,8 @@ def backfill_symbol(
             earliest_str = status['earliest_timestamp'].split('+')[0].split('T')[0] if 'T' in status['earliest_timestamp'] or '+' in status['earliest_timestamp'] else status['earliest_timestamp'].split()[0]
             latest_str = status['latest_timestamp'].split('+')[0].split('T')[0] if 'T' in status['latest_timestamp'] or '+' in status['latest_timestamp'] else status['latest_timestamp'].split()[0]
 
-            existing_start = datetime.fromisoformat(earliest_str)
-            existing_end = datetime.fromisoformat(latest_str)
+            existing_start = datetime.fromisoformat(earliest_str).date()
+            existing_end = datetime.fromisoformat(latest_str).date()
 
             trading_days = [
                 day for day in trading_days
@@ -197,12 +196,20 @@ def backfill_symbol(
 
     for i, trading_day in enumerate(trading_days, 1):
         try:
-            logger.info(f"\nDay {i}/{len(trading_days)}: {trading_day.date()}")
+            logger.info(f"\nDay {i}/{len(trading_days)}: {trading_day}")
+
+            # Convert date to datetime for API call
+            trading_datetime = datetime(
+                trading_day.year,
+                trading_day.month,
+                trading_day.day,
+                tzinfo=MARKET_TZ
+            )
 
             # Fetch ticks for this day
             day_ticks = client.fetch_day_ticks(
                 symbol,
-                trading_day,
+                trading_datetime,
                 extended_hours=True
             )
 
@@ -228,7 +235,7 @@ def backfill_symbol(
             logger.warning("\n\nBackfill interrupted by user")
             break
         except Exception as e:
-            logger.error(f"  ❌ Error fetching {trading_day.date()}: {e}")
+            logger.error(f"  ❌ Error fetching {trading_day}: {e}")
             continue
 
     # Update backfill status
@@ -252,6 +259,10 @@ def backfill_symbol(
             logger.info(f"Total stored: {total_stored:,} ticks")
             logger.info(f"Date range: {earliest} to {latest}")
             logger.info("=" * 80)
+
+            # Verify data sufficiency for ML training
+            logger.info("\nVerifying data sufficiency...")
+            verify_data_sufficiency(symbol)
 
     storage.close()
     return (total_ticks, days_processed)

@@ -18,9 +18,12 @@ Broker Integration:
 """
 
 import logging
+import json
+import uuid
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from pathlib import Path
 from lumibot.strategies import Strategy
 from typing import Dict, Tuple, Optional
 
@@ -30,6 +33,7 @@ from risklabai.strategy.risklabai_strategy import RiskLabAIStrategy
 # Import tick data infrastructure
 from data.tick_storage import TickStorage
 from data.tick_to_bars import generate_bars_from_ticks
+from data.model_storage import ModelStorage
 from config.tick_config import (
     TICK_DB_PATH,
     INITIAL_IMBALANCE_THRESHOLD,
@@ -38,9 +42,18 @@ from config.tick_config import (
     MAX_POSITION_SIZE_PCT,
     SYMBOLS
 )
+from utils.market_calendar import (
+    is_market_open,
+    is_trading_day,
+    now_et,
+    time_until_market_open,
+    MARKET_TZ
+)
 
 logger = logging.getLogger(__name__)
 
+# NOTE: Timezone utilities are now imported from utils.market_calendar
+# This ensures consistent use of Eastern Time across the entire codebase
 
 class KellyCriterion:
     """
@@ -86,6 +99,124 @@ class KellyCriterion:
         position_size = max(0.01, min(kelly * fraction, 0.15))  # Between 1% and 15%
 
         return position_size
+
+
+class CircuitBreaker:
+    """
+    Circuit breaker pattern to halt trading on anomalous conditions.
+
+    Protects against:
+    - Excessive daily losses (default: 3%)
+    - Large drawdowns (default: 10%)
+    - Consecutive losing trades (default: 5)
+    - Excessive trading frequency (default: 10 trades/hour)
+
+    Once tripped, requires manual reset or will auto-reset next day.
+    """
+
+    def __init__(self,
+                 max_daily_loss: float = 0.03,
+                 max_drawdown: float = 0.10,
+                 max_consecutive_losses: int = 5,
+                 max_trades_per_hour: int = 10):
+        """
+        Initialize circuit breaker with safety thresholds.
+
+        Args:
+            max_daily_loss: Maximum daily loss (0.03 = 3%)
+            max_drawdown: Maximum drawdown from peak (0.10 = 10%)
+            max_consecutive_losses: Maximum consecutive losing trades
+            max_trades_per_hour: Maximum trades allowed per hour
+        """
+        self.max_daily_loss = max_daily_loss
+        self.max_drawdown = max_drawdown
+        self.max_consecutive_losses = max_consecutive_losses
+        self.max_trades_per_hour = max_trades_per_hour
+
+        self.is_tripped = False
+        self.trip_reason = None
+        self.trip_timestamp = None
+        self.hourly_trades = []
+
+    def check(self,
+              portfolio_value: float,
+              daily_start_value: float,
+              peak_value: float,
+              consecutive_losses: int,
+              trade_history: list) -> Tuple[bool, str]:
+        """
+        Check if circuit breaker should trip.
+
+        Args:
+            portfolio_value: Current portfolio value
+            daily_start_value: Portfolio value at market open
+            peak_value: Highest portfolio value ever reached
+            consecutive_losses: Number of consecutive losing trades
+            trade_history: List of recent trades with timestamps
+
+        Returns:
+            Tuple of (should_trip: bool, reason: str)
+        """
+        # Daily loss check
+        if daily_start_value and daily_start_value > 0:
+            daily_pnl = (portfolio_value - daily_start_value) / daily_start_value
+            if daily_pnl <= -self.max_daily_loss:
+                return True, f"Daily loss limit exceeded: {daily_pnl:.2%} (limit: {-self.max_daily_loss:.2%})"
+
+        # Drawdown check
+        if peak_value and peak_value > 0:
+            drawdown = (portfolio_value - peak_value) / peak_value
+            if drawdown <= -self.max_drawdown:
+                return True, f"Max drawdown exceeded: {drawdown:.2%} (limit: {-self.max_drawdown:.2%})"
+
+        # Consecutive losses check
+        if consecutive_losses >= self.max_consecutive_losses:
+            return True, f"Consecutive losses limit: {consecutive_losses} (limit: {self.max_consecutive_losses})"
+
+        # Trades per hour check
+        hour_ago = datetime.now() - timedelta(hours=1)
+        recent_trades = [t for t in trade_history if 'timestamp' in t and t['timestamp'] > hour_ago]
+        if len(recent_trades) >= self.max_trades_per_hour:
+            return True, f"Too many trades per hour: {len(recent_trades)} (limit: {self.max_trades_per_hour})"
+
+        return False, ""
+
+    def trip(self, reason: str):
+        """Trip the circuit breaker with a reason."""
+        self.is_tripped = True
+        self.trip_reason = reason
+        self.trip_timestamp = datetime.now()
+        logger.error("=" * 80)
+        logger.error(f"🚨 CIRCUIT BREAKER TRIPPED: {reason}")
+        logger.error(f"   Timestamp: {self.trip_timestamp}")
+        logger.error("   Trading halted until manual reset or next market day")
+        logger.error("=" * 80)
+
+    def reset(self):
+        """Reset circuit breaker (manual intervention or daily reset)."""
+        if self.is_tripped:
+            logger.warning("=" * 60)
+            logger.warning("⚠️  CIRCUIT BREAKER RESET")
+            logger.warning(f"   Previous trip reason: {self.trip_reason}")
+            logger.warning(f"   Tripped at: {self.trip_timestamp}")
+            logger.warning("   Trading resumed")
+            logger.warning("=" * 60)
+
+        self.is_tripped = False
+        self.trip_reason = None
+        self.trip_timestamp = None
+
+    def should_auto_reset(self) -> bool:
+        """Check if circuit breaker should auto-reset (new trading day)."""
+        if not self.is_tripped or not self.trip_timestamp:
+            return False
+
+        # Auto-reset if it's a new trading day
+        now = datetime.now()
+        if now.date() > self.trip_timestamp.date():
+            return True
+
+        return False
 
 
 class RiskLabAICombined(Strategy):
@@ -145,6 +276,23 @@ class RiskLabAICombined(Strategy):
         # NEW: Per-symbol model storage
         self.symbol_models = {}  # Dict[symbol -> RiskLabAIStrategy instance]
 
+        # NEW: Model storage with S3 (primary) + local cache support
+        self.model_storage = ModelStorage(local_dir=self.models_dir)
+
+        # Verify S3 is configured (required for production/portable use)
+        if not self.model_storage.s3_client:
+            logger.warning("=" * 60)
+            logger.warning("⚠️  AWS S3 NOT CONFIGURED")
+            logger.warning("   Models will only be stored/loaded locally")
+            logger.warning("   This bot will NOT be portable to other machines")
+            logger.warning("   ")
+            logger.warning("   To enable S3 storage, set these in .env:")
+            logger.warning("   - AWS_ACCESS_KEY_ID")
+            logger.warning("   - AWS_SECRET_ACCESS_KEY")
+            logger.warning("   - AWS_REGION")
+            logger.warning("   - S3_MODEL_BUCKET")
+            logger.warning("=" * 60)
+
         # Trading symbols
         if parameters and 'symbols' in parameters:
             self.symbols = parameters['symbols']
@@ -155,7 +303,7 @@ class RiskLabAICombined(Strategy):
         self.last_train_date = None
         self.models_trained = False
         self.min_training_bars = parameters.get('min_training_bars', 500) if parameters else 500
-        self.retrain_days = parameters.get('retrain_days', 7) if parameters else 7
+        self.retrain_days = parameters.get('retrain_days', 30) if parameters else 30  # Retrain every 30 days (was 7)
 
         # NEW: Tick bars support
         self.use_tick_bars = parameters.get('use_tick_bars', False) if parameters else False
@@ -188,7 +336,10 @@ class RiskLabAICombined(Strategy):
         # NEW: Kelly Criterion parameters
         self.use_kelly_sizing = parameters.get('use_kelly_sizing', True) if parameters else True
         self.kelly_fraction = parameters.get('kelly_fraction', 0.5) if parameters else 0.5  # Half-Kelly
-        self.estimated_win_rate = parameters.get('estimated_win_rate', 0.5656) if parameters else 0.5656  # From 365-day model
+
+        # DYNAMIC WIN RATE: Track actual trade history instead of hardcoded estimate
+        self.trade_history = []  # List of completed trades with P&L
+        self.dynamic_win_rate = 0.50  # Start at 50%, will update based on actual results
 
         # Risk tracking state
         self.daily_start_value = None
@@ -206,6 +357,15 @@ class RiskLabAICombined(Strategy):
         self.stop_loss_cooldowns = {}  # {symbol: datetime_of_stop_loss}
         self.stop_loss_cooldown_days = 7  # Don't re-buy for 7 days after stop loss
 
+        # NEW: Circuit breaker for anomalous conditions
+        max_trades_per_hour = parameters.get('max_trades_per_hour', 10) if parameters else 10
+        self.circuit_breaker = CircuitBreaker(
+            max_daily_loss=self.daily_loss_limit,
+            max_drawdown=self.max_drawdown_limit,
+            max_consecutive_losses=self.max_consecutive_losses,
+            max_trades_per_hour=max_trades_per_hour
+        )
+
         logger.info("=" * 60)
         logger.info("RISK MANAGEMENT ENABLED")
         logger.info("=" * 60)
@@ -217,49 +377,32 @@ class RiskLabAICombined(Strategy):
         logger.info(f"  Kelly sizing: {'Enabled' if self.use_kelly_sizing else 'Disabled'}")
         logger.info(f"  Kelly fraction: {self.kelly_fraction:.1%} (Half-Kelly)")
         logger.info(f"  Stop loss cooldown: {self.stop_loss_cooldown_days} days (prevents re-buying after stop)")
+        logger.info("")
+        logger.info("  CIRCUIT BREAKER:")
+        logger.info(f"    Max daily loss: {self.circuit_breaker.max_daily_loss:.1%}")
+        logger.info(f"    Max drawdown: {self.circuit_breaker.max_drawdown:.1%}")
+        logger.info(f"    Max consecutive losses: {self.circuit_breaker.max_consecutive_losses}")
+        logger.info(f"    Max trades/hour: {self.circuit_breaker.max_trades_per_hour}")
         logger.info("=" * 60)
 
-        # Load per-symbol models
+        # Load per-symbol models using ModelStorage
         logger.info("=" * 60)
         logger.info("LOADING PER-SYMBOL MODELS")
         logger.info("=" * 60)
 
-        models_loaded = 0
-        models_missing = []
+        self._load_models_from_storage()
 
-        for symbol in self.symbols:
-            model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
-            try:
-                # Create a new RiskLabAI instance for this symbol
-                symbol_strategy = RiskLabAIStrategy(
-                    profit_taking=self.risklabai_params['profit_taking'],
-                    stop_loss=self.risklabai_params['stop_loss'],
-                    max_holding=self.risklabai_params['max_holding'],
-                    d=self.risklabai_params['d'],
-                    n_cv_splits=5
-                )
-
-                # Load the trained model
-                symbol_strategy.load_models(model_path)
-                self.symbol_models[symbol] = symbol_strategy
-                models_loaded += 1
-                logger.info(f"  ✓ {symbol}: Loaded from {model_path}")
-
-            except Exception as e:
-                models_missing.append(symbol)
-                logger.warning(f"  ✗ {symbol}: No model found ({model_path})")
+        models_loaded = len(self.symbol_models)
+        models_missing = [s for s in self.symbols if s not in self.symbol_models]
 
         logger.info("=" * 60)
         logger.info(f"Models loaded: {models_loaded}/{len(self.symbols)}")
 
         if models_missing:
             logger.warning(f"Missing models for: {', '.join(models_missing)}")
-            logger.warning(f"Run: python scripts/setup/train_all_symbols.py --phase phase_X")
-            logger.warning(f"These symbols will be skipped during trading.")
+            logger.warning(f"Will train on first retraining cycle")
 
         self.models_trained = models_loaded > 0
-        if self.models_trained:
-            self.last_train_date = datetime.now()
 
         logger.info("=" * 60)
         logger.info(f"Trading {len(self.symbol_models)} symbols with trained models")
@@ -282,6 +425,156 @@ class RiskLabAICombined(Strategy):
         except Exception as e:
             logger.warning(f"Could not check positions on startup: {e}")
             logger.warning("Will check on first iteration")
+
+        # NEW: Load saved state from previous run (cooldowns, trade history, etc.)
+        self._load_state()
+
+    def _save_state(self):
+        """
+        Save bot state to disk for crash recovery.
+
+        State includes:
+        - stop_loss_cooldowns: Symbols in cooldown period after stop loss
+        - trade_history: Last 100 trades for win rate calculation
+        - last_train_date: When models were last trained
+        - daily_start_value: Portfolio value at start of trading day
+        - peak_portfolio_value: Highest portfolio value (for drawdown tracking)
+
+        This enables the bot to resume exactly where it left off after:
+        - Ctrl+C shutdown
+        - Crash/exception
+        - System restart
+        - Container restart (Docker/Kubernetes)
+        """
+        state_file = Path("bot_state.json")
+
+        state = {
+            'stop_loss_cooldowns': {
+                symbol: dt.isoformat()
+                for symbol, dt in self.stop_loss_cooldowns.items()
+            },
+            'trade_history': self.trade_history[-100:],  # Last 100 trades
+            'last_train_date': self.last_train_date.isoformat() if self.last_train_date else None,
+            'daily_start_value': self.daily_start_value,
+            'peak_portfolio_value': self.peak_portfolio_value,
+            # Circuit breaker state
+            'circuit_breaker': {
+                'is_tripped': self.circuit_breaker.is_tripped,
+                'trip_reason': self.circuit_breaker.trip_reason,
+                'trip_timestamp': self.circuit_breaker.trip_timestamp.isoformat() if self.circuit_breaker.trip_timestamp else None
+            },
+            'timestamp': datetime.now().isoformat()
+        }
+
+        try:
+            with open(state_file, 'w') as f:
+                json.dump(state, f, indent=2, default=str)
+
+            logger.info(f"✓ State saved to {state_file}")
+            logger.info(f"  Cooldowns: {len(self.stop_loss_cooldowns)}")
+            logger.info(f"  Trade history: {len(self.trade_history)} trades")
+
+        except Exception as e:
+            logger.error(f"Failed to save state: {e}")
+
+    def _load_state(self):
+        """
+        Load state from previous run.
+
+        Restores:
+        - stop_loss_cooldowns: Prevents re-buying symbols that hit stop loss
+        - trade_history: Enables accurate win rate calculation
+        - last_train_date: Determines when next retraining is needed
+        - daily_start_value: For daily loss limit tracking
+        - peak_portfolio_value: For drawdown calculations
+
+        If no state file exists (first run), starts with clean slate.
+        If state file is corrupted, logs error and starts fresh.
+        """
+        state_file = Path("bot_state.json")
+
+        if not state_file.exists():
+            logger.info("No previous state file found - starting fresh")
+            return
+
+        try:
+            with open(state_file, 'r') as f:
+                state = json.load(f)
+
+            # Restore cooldowns (critical for stop loss cooldown logic)
+            cooldowns_data = state.get('stop_loss_cooldowns', {})
+            self.stop_loss_cooldowns = {
+                symbol: datetime.fromisoformat(dt_str)
+                for symbol, dt_str in cooldowns_data.items()
+            }
+
+            # Restore trade history (for win rate calculation)
+            self.trade_history = state.get('trade_history', [])
+
+            # Restore training date (if present)
+            if state.get('last_train_date'):
+                self.last_train_date = datetime.fromisoformat(state['last_train_date'])
+
+            # Restore daily/peak values (if present)
+            self.daily_start_value = state.get('daily_start_value')
+            self.peak_portfolio_value = state.get('peak_portfolio_value')
+
+            # Restore circuit breaker state (if present)
+            cb_state = state.get('circuit_breaker', {})
+            if cb_state:
+                self.circuit_breaker.is_tripped = cb_state.get('is_tripped', False)
+                self.circuit_breaker.trip_reason = cb_state.get('trip_reason')
+                if cb_state.get('trip_timestamp'):
+                    self.circuit_breaker.trip_timestamp = datetime.fromisoformat(cb_state['trip_timestamp'])
+
+            logger.info("=" * 60)
+            logger.info("STATE RESTORED FROM PREVIOUS RUN")
+            logger.info("=" * 60)
+            logger.info(f"  Cooldowns: {len(self.stop_loss_cooldowns)} symbols")
+            logger.info(f"  Trade history: {len(self.trade_history)} trades")
+            logger.info(f"  Last train: {self.last_train_date or 'Never'}")
+            logger.info(f"  Circuit breaker: {'TRIPPED' if self.circuit_breaker.is_tripped else 'OK'}")
+            if self.circuit_breaker.is_tripped:
+                logger.info(f"    Reason: {self.circuit_breaker.trip_reason}")
+                logger.info(f"    Since: {self.circuit_breaker.trip_timestamp}")
+            logger.info(f"  State saved: {state.get('timestamp', 'Unknown')}")
+            logger.info("=" * 60)
+
+            # Log active cooldowns (if any)
+            if self.stop_loss_cooldowns:
+                logger.info("Active stop loss cooldowns:")
+                for symbol, cooldown_end in self.stop_loss_cooldowns.items():
+                    days_remaining = (cooldown_end - datetime.now()).days
+                    if days_remaining > 0:
+                        logger.info(f"  {symbol}: {days_remaining} days remaining")
+                    else:
+                        logger.info(f"  {symbol}: expired (will be removed)")
+
+        except Exception as e:
+            logger.error(f"Failed to load state: {e}")
+            logger.warning("Starting with fresh state")
+
+    def _generate_order_id(self, symbol: str, signal: int) -> str:
+        """
+        Generate unique order ID to prevent duplicate orders.
+
+        This provides idempotency - if the bot crashes mid-order and restarts,
+        it won't accidentally place the same order twice.
+
+        Args:
+            symbol: Stock ticker (e.g., "SPY")
+            signal: Trade direction (+1 long, -1 short, 0 neutral)
+
+        Returns:
+            Unique order ID string: "SPY_1_20260111143052_a3f8b2c1"
+
+        Example:
+            >>> self._generate_order_id("SPY", 1)
+            "SPY_1_20260111143052_a3f8b2c1"
+        """
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        unique = uuid.uuid4().hex[:8]
+        return f"{symbol}_{signal}_{timestamp}_{unique}"
 
     def on_trading_iteration(self):
         """
@@ -313,7 +606,35 @@ class RiskLabAICombined(Strategy):
         if self.peak_portfolio_value is None:
             self.peak_portfolio_value = current_value
 
-        # Step 0.6: Check if trading is halted due to risk limits
+        # Step 0.5.5: Auto-reset circuit breaker on new trading day
+        if self.circuit_breaker.should_auto_reset():
+            logger.info("🔄 New trading day - Auto-resetting circuit breaker")
+            self.circuit_breaker.reset()
+
+        # Step 0.5.6: Check circuit breaker FIRST (consolidates all safety checks)
+        should_trip, trip_reason = self.circuit_breaker.check(
+            portfolio_value=current_value,
+            daily_start_value=self.daily_start_value if self.daily_start_value is not None else current_value,
+            peak_value=self.peak_portfolio_value if self.peak_portfolio_value is not None else current_value,
+            consecutive_losses=self.consecutive_losses,
+            trade_history=self.trade_history
+        )
+
+        if should_trip and not self.circuit_breaker.is_tripped:
+            # Trip the circuit breaker
+            self.circuit_breaker.trip(trip_reason)
+            self._save_state()  # Save state immediately
+            return
+
+        if self.circuit_breaker.is_tripped:
+            logger.warning("=" * 80)
+            logger.warning(f"⛔ CIRCUIT BREAKER TRIPPED: {self.circuit_breaker.trip_reason}")
+            logger.warning(f"   Tripped at: {self.circuit_breaker.trip_timestamp}")
+            logger.warning("   Trading halted until manual reset or next market day")
+            logger.warning("=" * 80)
+            return
+
+        # Step 0.6: Check if trading is halted due to risk limits (legacy check)
         if self.risk_halt_reason:
             logger.warning(f"⛔ TRADING HALTED: {self.risk_halt_reason}")
             logger.warning("Manual intervention required to resume trading.")
@@ -397,10 +718,10 @@ class RiskLabAICombined(Strategy):
         logger.info("=" * 80)
         self._check_existing_positions()
 
-        # Step 2: Check if we need to retrain (weekly)
+        # Step 2: Check if we need to retrain (monthly or performance-based)
         if self._should_retrain():
-            logger.info("Retraining models...")
-            self._train_models()
+            logger.info("Initiating model retraining...")
+            self._retrain_models()
 
         if not self.models_trained:
             logger.warning("Models not trained, skipping iteration")
@@ -438,27 +759,41 @@ class RiskLabAICombined(Strategy):
 
     def _is_market_open(self) -> bool:
         """
-        Check if the market is currently open.
+        Check if the market is currently open (uses Eastern Time + Alpaca Calendar API).
+
+        This now uses the MarketCalendar utility which:
+        - Gets accurate trading days from Alpaca API (no hardcoded holidays!)
+        - Handles NYSE holidays automatically (Christmas, Thanksgiving, etc.)
+        - Uses Eastern Time for all checks
+
+        Market hours: 9:30 AM - 4:00 PM ET, Monday-Friday (excluding holidays)
 
         Returns:
             bool: True if market is open, False otherwise
         """
         try:
-            # Use Lumibot's built-in method if available
-            if hasattr(self, 'get_datetime'):
-                current_time = self.get_datetime()
+            # Use market_calendar utility (imported from utils.market_calendar)
+            current_time = now_et()
+            market_open = is_market_open()
+
+            if market_open:
+                logger.debug(f"Market check: OPEN at {current_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
             else:
-                current_time = datetime.now()
+                # Check if today is a trading day
+                today_is_trading_day = is_trading_day(current_time.date())
 
-            # Check if it's a weekday (Monday=0, Sunday=6)
-            if current_time.weekday() >= 5:  # Saturday or Sunday
-                return False
+                if not today_is_trading_day:
+                    logger.debug(f"Market check: CLOSED - Holiday/Weekend ({current_time.strftime('%Y-%m-%d')})")
+                else:
+                    # Trading day but outside market hours
+                    time_to_open = time_until_market_open()
+                    if time_to_open:
+                        hours = time_to_open.total_seconds() / 3600
+                        logger.debug(f"Market check: CLOSED - Opens in {hours:.1f} hours")
+                    else:
+                        logger.debug(f"Market check: CLOSED - Outside hours")
 
-            # Check market hours (9:30 AM - 4:00 PM ET)
-            market_open = current_time.replace(hour=9, minute=30, second=0, microsecond=0)
-            market_close = current_time.replace(hour=16, minute=0, second=0, microsecond=0)
-
-            return market_open <= current_time <= market_close
+            return market_open
 
         except Exception as e:
             logger.warning(f"Error checking market hours: {e}")
@@ -466,17 +801,45 @@ class RiskLabAICombined(Strategy):
             return True
 
     def _should_retrain(self) -> bool:
-        """Check if models need retraining."""
+        """
+        Check if models need retraining based on schedule and performance.
+
+        Two triggers for retraining:
+        1. Time-based: More than retrain_days since last training
+        2. Performance-based: Recent win rate drops below 40%
+
+        Returns:
+            True if retraining is needed
+        """
+        # First run - always need to train or load
         if self.last_train_date is None:
+            logger.info("No training date - will attempt to load or train models")
             return True
 
+        # Time-based check
         days_since_train = (datetime.now() - self.last_train_date).days
-        should_retrain = days_since_train >= self.retrain_days
 
-        if should_retrain:
-            logger.info(f"Time to retrain: {days_since_train} days since last training")
+        if days_since_train >= self.retrain_days:
+            logger.info(f"⏰ Retraining due: {days_since_train} days since last train (threshold: {self.retrain_days} days)")
+            return True
 
-        return should_retrain
+        # Performance-based check
+        # Only check if we have enough trade history
+        if len(self.trade_history) >= 20:
+            recent_trades = self.trade_history[-20:]
+            wins = sum(1 for t in recent_trades if t['pnl'] > 0)
+            recent_win_rate = wins / 20
+
+            if recent_win_rate < 0.40:
+                logger.warning("")
+                logger.warning("=" * 60)
+                logger.warning(f"📉 PERFORMANCE DROP DETECTED")
+                logger.warning(f"   Recent win rate: {recent_win_rate:.1%} (threshold: 40%)")
+                logger.warning(f"   Triggering early retrain to adapt to market changes")
+                logger.warning("=" * 60)
+                return True
+
+        return False
 
     def _train_models(self):
         """Train RiskLabAI models."""
@@ -517,6 +880,164 @@ class RiskLabAICombined(Strategy):
             logger.info(f"  Top features: {results['top_features'][:3]}")
         else:
             logger.warning(f"Training failed: {results.get('reason')}")
+
+    def _load_models_from_storage(self):
+        """
+        Load all symbol models from storage (S3 primary, local cache fallback).
+
+        This is called on startup to restore previously trained models.
+        S3 is the primary storage to ensure the bot is portable across machines.
+        Local storage is used only as a cache when S3 is unavailable.
+        """
+        logger.info("Loading models from storage (S3 primary)...")
+
+        for symbol in self.symbols:
+            try:
+                model_data = self.model_storage.load_model(
+                    symbol,
+                    version="latest",
+                    prefer_s3=True  # S3 is primary storage, local is cache only
+                )
+
+                if model_data is None:
+                    logger.warning(f"  ✗ {symbol}: No saved model found")
+                    continue
+
+                # Reconstruct strategy from saved model
+                strategy = RiskLabAIStrategy(
+                    profit_taking=self.risklabai_params['profit_taking'],
+                    stop_loss=self.risklabai_params['stop_loss'],
+                    max_holding=self.risklabai_params['max_holding'],
+                    d=self.risklabai_params['d'],
+                    n_cv_splits=5
+                )
+
+                # Load the trained components
+                strategy.primary_model = model_data.get('primary_model')
+                strategy.meta_model = model_data.get('meta_model')
+                strategy.scaler = model_data.get('scaler')
+                strategy.label_encoder = model_data.get('label_encoder')
+                strategy.feature_names = model_data.get('feature_names')
+                strategy.important_features = model_data.get('important_features')
+
+                self.symbol_models[symbol] = strategy
+
+                trained_at = model_data.get('trained_at', 'unknown')
+                metrics = model_data.get('training_metrics', {})
+                accuracy = metrics.get('primary_accuracy', 'N/A')
+                logger.info(f"  ✓ {symbol}: Loaded (trained: {trained_at[:10]}, acc: {accuracy})")
+
+            except Exception as e:
+                logger.error(f"  ✗ {symbol}: Failed to load model: {e}")
+                continue
+
+        # Set last_train_date based on loaded models
+        if self.symbol_models:
+            # Use the most recent training date from loaded models
+            try:
+                training_dates = []
+                for strategy in self.symbol_models.values():
+                    if hasattr(strategy, 'primary_model'):
+                        # Models exist, assume they were trained recently
+                        training_dates.append(datetime.now())
+                if training_dates:
+                    self.last_train_date = min(training_dates)  # Use earliest to trigger retrain sooner
+            except Exception:
+                self.last_train_date = datetime.now()
+
+    def _retrain_models(self):
+        """
+        Retrain all symbol models with latest data.
+
+        This method:
+        1. Fetches fresh bar data for each symbol
+        2. Creates and trains a new RiskLabAIStrategy
+        3. Saves the model locally AND to S3
+        4. Updates the symbol_models dictionary
+        """
+        logger.info("=" * 80)
+        logger.info("RETRAINING MODELS")
+        logger.info("=" * 80)
+
+        successful = 0
+        failed = 0
+
+        for symbol in self.symbols:
+            logger.info(f"\n📚 Retraining {symbol}...")
+
+            # Get fresh data
+            bars = self._get_historical_bars(symbol, self.min_training_bars)
+
+            if bars is None or len(bars) < self.min_training_bars:
+                logger.warning(f"  {symbol}: Insufficient data ({len(bars) if bars else 0} bars)")
+                failed += 1
+                continue
+
+            # Create new strategy instance
+            strategy = RiskLabAIStrategy(
+                profit_taking=self.risklabai_params['profit_taking'],
+                stop_loss=self.risklabai_params['stop_loss'],
+                max_holding=self.risklabai_params['max_holding'],
+                d=self.risklabai_params['d'],
+                n_cv_splits=5
+            )
+
+            # Train the strategy
+            try:
+                results = strategy.train(bars, symbol=symbol)
+            except Exception as e:
+                logger.error(f"  {symbol}: Training exception: {e}")
+                failed += 1
+                continue
+
+            if not results['success']:
+                logger.error(f"  {symbol}: Training failed")
+                failed += 1
+                continue
+
+            # Prepare model data for storage
+            model_data = {
+                'primary_model': strategy.primary_model,
+                'meta_model': strategy.meta_model,
+                'scaler': strategy.scaler,
+                'label_encoder': strategy.label_encoder,
+                'feature_names': strategy.feature_names,
+                'important_features': strategy.important_features,
+                'training_metrics': {
+                    'primary_accuracy': results.get('primary_accuracy'),
+                    'meta_accuracy': results.get('meta_accuracy'),
+                    'n_samples': results.get('n_samples'),
+                    'training_bars': len(bars)
+                }
+            }
+
+            # Save to local AND S3
+            try:
+                self.model_storage.save_model(symbol, model_data, upload_to_s3=True)
+            except Exception as e:
+                logger.error(f"  {symbol}: Failed to save model: {e}")
+                # Continue anyway - model is trained in memory
+
+            # Update in-memory model reference
+            self.symbol_models[symbol] = strategy
+
+            logger.info(f"  ✓ {symbol} retrained: acc={results['primary_accuracy']:.1%}, "
+                       f"samples={results['n_samples']}")
+            successful += 1
+
+        # Update training timestamp
+        self.last_train_date = datetime.now()
+
+        logger.info("=" * 80)
+        logger.info(f"🎓 RETRAINING COMPLETE: {successful} success, {failed} failed")
+        logger.info("=" * 80)
+
+        # Cleanup old model versions (keep last 5)
+        for symbol in self.symbols:
+            try:
+                self.model_storage.delete_old_versions(symbol, keep_count=5)
+            except Exception as e:
+                logger.debug(f"Cleanup failed for {symbol}: {e}")
 
     def _get_historical_bars(
         self,
@@ -685,6 +1206,61 @@ class RiskLabAICombined(Strategy):
         except Exception as e:
             logger.error(f"Error checking existing positions: {e}")
 
+    def _update_dynamic_win_rate(self):
+        """
+        Calculate win rate from recent trade history.
+
+        Uses rolling window of last 50 trades to adapt to changing market conditions.
+        Clamps to realistic range (35-65%) to prevent extreme values.
+        """
+        if len(self.trade_history) < 10:
+            # Need at least 10 trades before trusting the calculation
+            self.dynamic_win_rate = 0.50  # Default 50% until enough history
+            logger.debug(f"Dynamic win rate: 50.0% (need {10 - len(self.trade_history)} more trades)")
+            return
+
+        # Use last 50 trades (or all if less) for rolling window
+        recent = self.trade_history[-50:]
+        wins = sum(1 for t in recent if t['pnl'] > 0)
+        calculated_win_rate = wins / len(recent)
+
+        # Clamp to realistic range (35% to 65%)
+        # Prevents extreme values from small sample sizes
+        self.dynamic_win_rate = max(0.35, min(0.65, calculated_win_rate))
+
+        logger.info("")
+        logger.info("=" * 60)
+        logger.info("DYNAMIC WIN RATE UPDATE")
+        logger.info("=" * 60)
+        logger.info(f"  Trades analyzed: {len(recent)}")
+        logger.info(f"  Wins: {wins}, Losses: {len(recent) - wins}")
+        logger.info(f"  Calculated win rate: {calculated_win_rate:.1%}")
+        logger.info(f"  Dynamic win rate (clamped): {self.dynamic_win_rate:.1%}")
+        logger.info("=" * 60)
+
+    def _record_trade(self, symbol: str, pnl: float, entry_price: float, exit_price: float):
+        """
+        Record completed trade for dynamic win rate tracking.
+
+        Args:
+            symbol: Stock symbol
+            pnl: P&L in dollars (positive = win, negative = loss)
+            entry_price: Entry price
+            exit_price: Exit price
+        """
+        self.trade_history.append({
+            'symbol': symbol,
+            'pnl': pnl,
+            'entry_price': entry_price,
+            'exit_price': exit_price,
+            'timestamp': datetime.now()
+        })
+
+        logger.info(f"📊 Trade recorded: {symbol} P&L=${pnl:+,.2f} (Total trades: {len(self.trade_history)})")
+
+        # Update dynamic win rate with new trade
+        self._update_dynamic_win_rate()
+
     def _exit_position(self, symbol: str, reason: str):
         """
         Exit a position by issuing an independent SELL order.
@@ -702,12 +1278,41 @@ class RiskLabAICombined(Strategy):
 
             quantity = abs(position.quantity)
 
+            # Capture trade details for recording (BEFORE exit)
+            # Get entry price and current price from position/broker
+            try:
+                # Try to get price data from Alpaca API for accuracy
+                if (hasattr(self, 'broker') and
+                    self.broker is not None and
+                    hasattr(self.broker, 'api') and
+                    self.broker.api is not None):
+                    alpaca_position = self.broker.api.get_position(symbol)
+                    entry_price = float(alpaca_position.avg_entry_price)
+                    exit_price = float(alpaca_position.current_price)
+                    pnl_dollars = float(alpaca_position.unrealized_pl)
+                else:
+                    # Fallback to Lumibot methods
+                    entry_price = position.avg_fill_price if hasattr(position, 'avg_fill_price') else 0
+                    exit_price = self.get_last_price(symbol) or 0
+                    pnl_dollars = (exit_price - entry_price) * quantity
+            except Exception as e:
+                logger.warning(f"Could not get precise trade details for recording: {e}")
+                entry_price = 0
+                exit_price = 0
+                pnl_dollars = 0
+
             # Issue simple SELL order (bot manages independently)
             order = self.create_order(symbol, quantity, "sell")
             self.submit_order(order)
 
             logger.info(f"✅ SELL ORDER SUBMITTED: {quantity} shares of {symbol}")
             logger.info(f"   Exit reason: {reason}")
+
+            # Record trade for dynamic win rate calculation
+            if entry_price > 0 and exit_price > 0:
+                self._record_trade(symbol, pnl_dollars, entry_price, exit_price)
+            else:
+                logger.warning(f"   Could not record trade (invalid prices: entry=${entry_price}, exit=${exit_price})")
 
             # If this is a stop loss exit, add to cooldown to prevent immediate re-entry
             if "STOP LOSS" in reason.upper():
@@ -765,10 +1370,10 @@ class RiskLabAICombined(Strategy):
         portfolio_value = self.get_portfolio_value()
 
         if self.use_kelly_sizing:
-            # Calculate Kelly fraction
+            # Calculate Kelly fraction using DYNAMIC win rate (adapts to actual performance)
             kelly_calc = KellyCriterion()
             kelly_fraction = kelly_calc.calculate_kelly(
-                win_rate=self.estimated_win_rate,
+                win_rate=self.dynamic_win_rate,  # DYNAMIC: Updates based on actual trades (was: self.estimated_win_rate)
                 avg_win=self.risklabai.labeler.profit_taking_mult,  # 4% (0.04)
                 avg_loss=self.risklabai.labeler.stop_loss_mult,      # 2% (0.02)
                 fraction=self.kelly_fraction  # Half-Kelly
@@ -786,6 +1391,7 @@ class RiskLabAICombined(Strategy):
             position_value = portfolio_value * kelly_fraction * bet_size
 
             logger.info(f"  💰 Kelly sizing: {kelly_fraction:.2%} of ${portfolio_value:,.2f} × {bet_size:.2f} confidence = ${position_value:,.2f}")
+            logger.info(f"      Using dynamic win rate: {self.dynamic_win_rate:.1%} (from {len(self.trade_history)} trades)")
         else:
             # Fallback to original sizing
             position_value = portfolio_value * MAX_POSITION_SIZE_PCT * bet_size
@@ -862,15 +1468,32 @@ class RiskLabAICombined(Strategy):
         """Handle strategy shutdown."""
         logger.info("Strategy shutting down...")
 
-        # Save models if trained
-        if self.models_trained:
+        # NEW: Save state before shutdown (cooldowns, trade history, etc.)
+        try:
+            self._save_state()
+        except Exception as e:
+            logger.error(f"Failed to save state on shutdown: {e}")
+
+        # Save models to S3 if trained (ensures latest models are backed up)
+        if self.models_trained and self.model_storage.s3_client:
             try:
                 for symbol, strategy in self.symbol_models.items():
-                    model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
-                    strategy.save_models(model_path)
-                logger.info(f"Models saved for {len(self.symbol_models)} symbols on shutdown")
+                    # Prepare model data for S3 storage
+                    model_data = {
+                        'primary_model': strategy.primary_model,
+                        'meta_model': strategy.meta_model,
+                        'scaler': strategy.scaler,
+                        'label_encoder': strategy.label_encoder,
+                        'feature_names': strategy.feature_names,
+                        'important_features': strategy.important_features,
+                    }
+                    # Save to S3 (will also cache locally)
+                    self.model_storage.save_model(symbol, model_data, upload_to_s3=True)
+                logger.info(f"Models saved to S3 for {len(self.symbol_models)} symbols on shutdown")
             except Exception as e:
                 logger.error(f"Failed to save models on shutdown: {e}")
+        elif self.models_trained and not self.model_storage.s3_client:
+            logger.warning("⚠️  S3 not configured - models not backed up on shutdown")
 
     def trace_stats(self, context, snapshot_before):
         """

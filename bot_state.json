@@ -1,0 +1,27 @@
+{
+  "stop_loss_cooldowns": {
+    "SPY": "2026-01-16T14:17:24.440972",
+    "QQQ": "2026-01-14T14:17:24.440977"
+  },
+  "trade_history": [
+    {
+      "symbol": "SPY",
+      "profit": 150.0,
+      "win": true
+    },
+    {
+      "symbol": "QQQ",
+      "profit": -75.0,
+      "win": false
+    },
+    {
+      "symbol": "IWM",
+      "profit": 200.0,
+      "win": true
+    }
+  ],
+  "last_train_date": "2026-01-11T14:17:24.440979",
+  "daily_start_value": 100000.0,
+  "peak_portfolio_value": 102500.0,
+  "timestamp": "2026-01-11T14:17:24.440980"
+}
