@@ -45,8 +45,9 @@ FEED_NAME = "SIP (Algo Trader Plus)" if USE_SIP else "IEX (Free)"
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
-# Get data path from environment variable, with default for Docker
-DATA_BASE_PATH = Path(os.environ.get("DATA_PATH", "/app/data"))
+# Get data path from environment variable, with default to Vault (2TB SSD)
+# This points to your external drive to store the large tick database
+DATA_BASE_PATH = Path(os.environ.get("DATA_PATH", "/Volumes/Vault"))
 
 # Create base directory if it doesn't exist
 DATA_BASE_PATH.mkdir(parents=True, exist_ok=True)

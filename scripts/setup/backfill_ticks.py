@@ -7,6 +7,7 @@ It's designed to be:
 - Resumable: If interrupted, it picks up where it left off
 - Efficient: Skips days that are already fetched
 - Informative: Shows progress and estimates time remaining
+- Adaptive: Automatically removes ultra-low liquidity symbols after backfill
 
 The script works with both IEX (free) and SIP (paid) data - just set USE_SIP
 in config/tick_config.py.
@@ -28,6 +29,9 @@ Usage:
 
     # Force re-fetch (ignore existing data):
     python scripts/setup/backfill_ticks.py --force
+
+    # Disable automatic cleanup of low-liquidity symbols:
+    python scripts/setup/backfill_ticks.py --no-auto-cleanup
 """
 
 import sys
@@ -293,6 +297,17 @@ def main():
         action='store_true',
         help='Force re-fetch even if data exists'
     )
+    parser.add_argument(
+        '--no-auto-cleanup',
+        action='store_true',
+        help='Disable automatic cleanup of ultra-low liquidity symbols (<200 bars)'
+    )
+    parser.add_argument(
+        '--min-bars',
+        type=int,
+        default=200,
+        help='Minimum bars required for auto-cleanup (default: 200)'
+    )
 
     args = parser.parse_args()
 
@@ -340,7 +355,69 @@ def main():
     logger.info(f"Total ticks: {grand_total_ticks:,}")
     logger.info("=" * 80)
     logger.info("\n✓ Tick data is ready!")
-    logger.info("  Next step: Run scripts/calibrate_threshold.py to find optimal bar threshold")
+
+    # Adaptive cleanup: Auto-remove symbols with insufficient bars
+    if not args.no_auto_cleanup and grand_total_ticks > 0:
+        logger.info("\n" + "=" * 80)
+        logger.info("ADAPTIVE CLEANUP: Checking symbol liquidity...")
+        logger.info("=" * 80)
+        logger.info(f"Removing symbols with <{args.min_bars} imbalance bars")
+        logger.info("(Insufficient data for ML training)\n")
+
+        try:
+            # Import cleanup module
+            sys.path.insert(0, str(project_root / "scripts"))
+            from auto_cleanup_low_liquidity import check_symbol_liquidity, delete_symbol_data
+
+            # Check all symbols in database
+            storage = TickStorage(str(TICK_DB_PATH))
+            conn = storage._get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT symbol FROM backfill_status ORDER BY symbol")
+            all_symbols = [row[0] for row in cursor.fetchall()]
+
+            symbols_to_delete = []
+            for symbol in all_symbols:
+                result = check_symbol_liquidity(storage, symbol, args.min_bars)
+                if result['should_delete']:
+                    symbols_to_delete.append(result)
+                    logger.warning(
+                        f"  ❌ {symbol}: {result['bar_count']} bars - "
+                        f"DELETING ({result['reason']})"
+                    )
+
+            # Delete insufficient symbols
+            if symbols_to_delete:
+                logger.info(f"\n🗑️  Deleting {len(symbols_to_delete)} ultra-low liquidity symbols...")
+                deleted_count = 0
+                deleted_ticks = 0
+
+                for r in symbols_to_delete:
+                    if delete_symbol_data(storage, r['symbol']):
+                        deleted_count += 1
+                        deleted_ticks += r['total_ticks']
+
+                logger.info(f"✓ Deleted {deleted_count} symbols")
+                logger.info(f"✓ Freed ~{deleted_ticks:,} tick records")
+
+                # Vacuum database
+                logger.info("\n💾 Vacuuming database to reclaim space...")
+                conn.execute("VACUUM")
+                logger.info("✓ Database vacuumed successfully")
+
+                logger.info("\n" + "=" * 80)
+                logger.info(f"FINAL: {len(all_symbols) - deleted_count} symbols remain in database")
+                logger.info("=" * 80)
+            else:
+                logger.info("\n✓ All symbols have sufficient liquidity - no cleanup needed!")
+
+            storage.close()
+
+        except Exception as e:
+            logger.error(f"\n❌ Auto-cleanup failed: {e}")
+            logger.info("You can manually run: python scripts/auto_cleanup_low_liquidity.py")
+
+    logger.info("\n  Next step: Run scripts/calibrate_threshold.py to find optimal bar threshold")
 
 
 if __name__ == "__main__":

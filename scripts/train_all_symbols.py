@@ -4,8 +4,9 @@ Train RiskLabAI Models for All Symbols
 
 This script trains models for all 102 symbols using the tier 1 fixes:
 - C1: Extended data (365 days, 2000+ samples)
-- C2: CUSUM filter (~35% filter rate with 2.5x volatility threshold)
+- C2: CUSUM filter (~35-40% filter rate with 5.5x volatility threshold)
 - C3: Robust fractional differentiation (optimal d per symbol)
+- C7: max_holding=30 bars for balanced label distribution (~25-35% neutral)
 
 Usage:
     # Train all symbols:
@@ -63,7 +64,7 @@ def train_symbol(symbol: str, save_models: bool = True) -> dict:
         strategy = RiskLabAIStrategy(
             profit_taking=2.0,
             stop_loss=2.0,
-            max_holding=10,
+            max_holding=30,  # C7 Fix: 30 bars for ~35% neutral labels (was 10)
             d=None,  # Auto-calculate optimal d
             n_cv_splits=5
         )

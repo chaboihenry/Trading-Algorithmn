@@ -198,8 +198,12 @@ class AlpacaTickClient:
         # Create timezone-aware datetime objects (Eastern Time)
         et_tz = pytz.timezone('America/New_York')
 
+        # Ensure date is naive (remove any existing timezone info)
+        # This handles cases where the caller passes timezone-aware datetimes
+        naive_date = date.replace(tzinfo=None) if date.tzinfo else date
+
         # Start of trading day (4 AM or 9:30 AM ET)
-        start = et_tz.localize(date.replace(
+        start = et_tz.localize(naive_date.replace(
             hour=start_hour,
             minute=30 if start_hour == 9 else 0,
             second=0,
@@ -207,7 +211,7 @@ class AlpacaTickClient:
         ))
 
         # End of trading day (8 PM or 4 PM ET)
-        end = et_tz.localize(date.replace(
+        end = et_tz.localize(naive_date.replace(
             hour=end_hour,
             minute=0,
             second=0,

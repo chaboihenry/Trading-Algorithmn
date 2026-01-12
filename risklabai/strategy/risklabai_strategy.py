@@ -365,7 +365,8 @@ class RiskLabAIStrategy:
         self,
         bars: pd.DataFrame,
         min_samples: int = 100,
-        symbol: Optional[str] = None
+        symbol: Optional[str] = None,
+        cusum_already_applied: bool = False
     ) -> Dict:
         """
         Train primary and meta models.
@@ -374,6 +375,7 @@ class RiskLabAIStrategy:
             bars: OHLCV bar data
             min_samples: Minimum samples required
             symbol: Symbol name (for logging)
+            cusum_already_applied: If True, skip CUSUM (already applied to ticks)
 
         Returns:
             Training results dictionary
@@ -392,22 +394,32 @@ class RiskLabAIStrategy:
 
         logger.debug(f"Training data timezone: {bars.index.tz} (None = naive)")
 
-        # Step 1: Sample events with CUSUM filter
-        logger.info("Step 1: Filtering events with CUSUM...")
-        events = self.cusum_filter.get_events(bars['close'])
-        logger.info(f"  Found {len(events)} significant events")
+        # Step 1: Handle event sampling (CUSUM already applied or apply now)
+        if cusum_already_applied:
+            # C2 FIX: CUSUM already applied to ticks - use ALL bars
+            logger.info("Step 1: CUSUM already applied to ticks - using all bars")
+            logger.info(f"  Using all {len(bars)} bars (pre-filtered via tick CUSUM)")
+            features = self.prepare_features(bars, symbol=symbol)
+            logger.info(f"  Feature matrix shape: {features.shape}")
+            # Use all bar timestamps as events (CUSUM already filtered ticks)
+            events = features.index
+        else:
+            # OLD PATH: Apply CUSUM to bar prices (for non-tick training)
+            logger.info("Step 1: Filtering events with CUSUM...")
+            events = self.cusum_filter.get_events(bars['close'])
+            logger.info(f"  Found {len(events)} significant events")
 
-        if len(events) < min_samples:
-            logger.warning(f"Insufficient events ({len(events)} < {min_samples})")
-            return {'success': False, 'reason': 'insufficient_events'}
+            if len(events) < min_samples:
+                logger.warning(f"Insufficient events ({len(events)} < {min_samples})")
+                return {'success': False, 'reason': 'insufficient_events'}
 
-        # Step 2: Create features
-        logger.info("Step 2: Creating stationary features...")
-        features = self.prepare_features(bars, symbol=symbol)
+            # Step 2: Create features
+            logger.info("Step 2: Creating stationary features...")
+            features = self.prepare_features(bars, symbol=symbol)
 
-        # Align features with events
-        features = features.loc[features.index.isin(events)]
-        logger.info(f"  Feature matrix shape: {features.shape}")
+            # Align features with events
+            features = features.loc[features.index.isin(events)]
+            logger.info(f"  Feature matrix shape: {features.shape}")
 
         if len(features) < min_samples:
             logger.warning(f"Insufficient samples ({len(features)} < {min_samples})")
@@ -972,11 +984,17 @@ class RiskLabAIStrategy:
         """
         Train models from tick data stored in database.
 
-        This method:
+        ARCHITECTURE (C2 FIX):
+        This method applies CUSUM filtering at the TICK level (not bar level):
         1. Loads tick data from the SQLite database
-        2. Generates tick imbalance bars
-        3. Converts bars to DataFrame
-        4. Runs the full RiskLabAI training pipeline
+        2. Applies CUSUM filter to tick prices (~35% filter rate)
+        3. Generates imbalance bars from CUSUM-filtered ticks
+        4. Converts bars to DataFrame
+        5. Runs RiskLabAI training pipeline (CUSUM skipped - already done)
+
+        This is the correct architecture. The old approach (CUSUM on bars)
+        filtered almost nothing (98% pass rate) because bars are already
+        filtered by imbalance events.
 
         Args:
             symbol: Stock ticker (e.g., "SPY", "QQQ")
@@ -1033,18 +1051,47 @@ class RiskLabAIStrategy:
 
         logger.info(f"  Loaded {len(ticks):,} ticks")
 
-        # Step 2: Generate tick imbalance bars
-        logger.info("Step 2: Generating tick imbalance bars...")
-        bars_list = generate_bars_from_ticks(ticks, threshold=threshold)
+        # Step 2: Apply CUSUM filter to ticks (C2 FIX)
+        logger.info("Step 2: Applying CUSUM filter to tick prices...")
+
+        # Convert ticks to pandas Series for CUSUM filtering
+        # ticks format: List[Tuple[timestamp_str, price_float, volume_int]]
+        # Use format='ISO8601' to handle timestamps with/without microseconds
+        tick_timestamps = pd.to_datetime([t[0] for t in ticks], format='ISO8601')
+        tick_prices = pd.Series([t[1] for t in ticks], index=tick_timestamps)
+
+        # Apply CUSUM filter to get event timestamps
+        cusum_events = self.cusum_filter.get_events(tick_prices)
+        logger.info(f"  CUSUM events: {len(cusum_events)} from {len(ticks):,} ticks")
+        logger.info(f"  Filter rate: {len(cusum_events)/len(ticks)*100:.1f}%")
+
+        if len(cusum_events) < min_samples:
+            raise ValueError(
+                f"Insufficient CUSUM events ({len(cusum_events)} < {min_samples}). "
+                f"Try reducing the CUSUM threshold."
+            )
+
+        # Filter ticks to only those matching CUSUM events
+        # Keep ticks within a small window around each CUSUM event
+        cusum_event_set = set(cusum_events)
+        filtered_ticks = [
+            tick for tick in ticks
+            if pd.to_datetime(tick[0]) in cusum_event_set
+        ]
+        logger.info(f"  Filtered ticks: {len(filtered_ticks):,} (from CUSUM events)")
+
+        # Step 3: Generate tick imbalance bars from filtered ticks
+        logger.info("Step 3: Generating tick imbalance bars from filtered ticks...")
+        bars_list = generate_bars_from_ticks(filtered_ticks, threshold=threshold)
 
         if not bars_list:
-            raise ValueError(f"No bars generated from {len(ticks)} ticks")
+            raise ValueError(f"No bars generated from {len(filtered_ticks)} filtered ticks")
 
         logger.info(f"  Generated {len(bars_list)} bars")
-        logger.info(f"  Bars per tick: {len(bars_list)/len(ticks):.4f}")
+        logger.info(f"  Bars per filtered tick: {len(bars_list)/len(filtered_ticks):.4f}")
 
-        # Step 3: Convert to DataFrame for RiskLabAI
-        logger.info("Step 3: Converting bars to DataFrame...")
+        # Step 4: Convert to DataFrame for RiskLabAI
+        logger.info("Step 4: Converting bars to DataFrame...")
 
         # Create DataFrame from bars
         bars_df = pd.DataFrame(bars_list)
@@ -1063,9 +1110,9 @@ class RiskLabAIStrategy:
         logger.info(f"  DataFrame shape: {bars_df.shape}")
         logger.info(f"  Columns: {bars_df.columns.tolist()}")
 
-        # Step 4: Run RiskLabAI training pipeline
-        logger.info("Step 4: Running RiskLabAI training pipeline...")
-        results = self.train(bars_df, min_samples=min_samples, symbol=symbol)
+        # Step 5: Run RiskLabAI training pipeline (CUSUM already applied)
+        logger.info("Step 5: Running RiskLabAI training pipeline...")
+        results = self.train(bars_df, min_samples=min_samples, symbol=symbol, cusum_already_applied=True)
 
         if results['success']:
             logger.info("=" * 80)

@@ -36,13 +36,13 @@ class CUSUMEventFilter:
 
     def _calculate_threshold(self, prices: pd.Series) -> float:
         """
-        Calculate CUSUM threshold to filter ~35% of events.
+        Calculate CUSUM threshold to filter ~35-40% of events.
 
         Args:
             prices: Price series
 
         Returns:
-            Threshold value (volatility * 2.5)
+            Threshold value (volatility * multiplier)
         """
         daily_returns = prices.pct_change().dropna()
         daily_vol = daily_returns.std()
