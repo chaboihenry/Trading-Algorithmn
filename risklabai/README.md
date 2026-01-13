@@ -93,8 +93,8 @@ strategy = RiskLabAIStrategy(
     max_holding=10
 )
 
-# Train on historical data
-results = strategy.train(bars_dataframe)
+# Train from tick database (CUSUM → imbalance bars → fractional diff → labels)
+results = strategy.train_from_ticks("SPY")
 
 # Generate signals
 signal, bet_size = strategy.predict(recent_bars)

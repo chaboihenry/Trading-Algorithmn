@@ -29,6 +29,7 @@ from typing import Dict, Tuple, Optional
 
 # Import our RiskLabAI strategy
 from risklabai.strategy.risklabai_strategy import RiskLabAIStrategy
+from risklabai.sampling.cusum_filter import CUSUMEventFilter
 
 # Import tick data infrastructure
 from data.tick_storage import TickStorage
@@ -37,6 +38,7 @@ from data.model_storage import ModelStorage
 from config.tick_config import (
     TICK_DB_PATH,
     INITIAL_IMBALANCE_THRESHOLD,
+    CUSUM_EVENT_WINDOW_SECONDS,
     OPTIMAL_PROFIT_TARGET,
     OPTIMAL_STOP_LOSS,
     MAX_POSITION_SIZE_PCT,
@@ -233,7 +235,6 @@ class RiskLabAICombined(Strategy):
     Attributes:
         symbol_models: Dictionary of per-symbol RiskLabAI strategy instances
         symbols: Trading symbols with trained models
-        use_tick_bars: Whether to use tick imbalance bars (default: True)
         kelly_fraction: Kelly Criterion fraction for position sizing (default: 0.1)
     """
 
@@ -261,7 +262,7 @@ class RiskLabAICombined(Strategy):
             'profit_taking': parameters.get('profit_taking', 0.5) if parameters else 0.5,
             'stop_loss': parameters.get('stop_loss', 0.5) if parameters else 0.5,
             'max_holding': parameters.get('max_holding', 20) if parameters else 20,
-            'd': parameters.get('d', 1.0) if parameters else 1.0,
+            'd': parameters.get('d', None) if parameters else None,
         }
 
         # Create a template RiskLabAI instance (for accessing labeler params)
@@ -272,12 +273,16 @@ class RiskLabAICombined(Strategy):
             d=self.risklabai_params['d'],
             n_cv_splits=5
         )
+        self.cusum_filter = CUSUMEventFilter()
 
         # NEW: Per-symbol model storage
         self.symbol_models = {}  # Dict[symbol -> RiskLabAIStrategy instance]
 
         # NEW: Model storage with S3 (primary) + local cache support
         self.model_storage = ModelStorage(local_dir=self.models_dir)
+
+        # HRP optimization output (computed after retraining)
+        self.hrp_weights = None
 
         # Verify S3 is configured (required for production/portable use)
         if not self.model_storage.s3_client:
@@ -305,8 +310,6 @@ class RiskLabAICombined(Strategy):
         self.min_training_bars = parameters.get('min_training_bars', 500) if parameters else 500
         self.retrain_days = parameters.get('retrain_days', 30) if parameters else 30  # Retrain every 30 days (was 7)
 
-        # NEW: Tick bars support
-        self.use_tick_bars = parameters.get('use_tick_bars', False) if parameters else False
         self.imbalance_threshold = parameters.get('imbalance_threshold', INITIAL_IMBALANCE_THRESHOLD) if parameters else INITIAL_IMBALANCE_THRESHOLD
 
         # Signal generation thresholds
@@ -406,7 +409,6 @@ class RiskLabAICombined(Strategy):
 
         logger.info("=" * 60)
         logger.info(f"Trading {len(self.symbol_models)} symbols with trained models")
-        logger.info(f"Using tick bars: {self.use_tick_bars}")
         logger.info("=" * 80)
 
         # Lumibot framework compatibility
@@ -841,46 +843,6 @@ class RiskLabAICombined(Strategy):
 
         return False
 
-    def _train_models(self):
-        """Train RiskLabAI models."""
-        logger.info("=" * 60)
-        logger.info("TRAINING RISKLABAI MODELS")
-        logger.info("=" * 60)
-
-        # Use first symbol for training (or combine multiple symbols)
-        training_symbol = self.symbols[0]
-
-        # Get historical data
-        bars = self._get_historical_bars(training_symbol, self.min_training_bars)
-
-        if bars is None or len(bars) < self.min_training_bars:
-            logger.warning(f"Insufficient data for training: {len(bars) if bars is not None else 0} bars")
-            return
-
-        # Train
-        results = self.risklabai.train(bars)
-
-        if results['success']:
-            self.models_trained = True
-            self.last_train_date = datetime.now()
-
-            # Save per-symbol models
-            try:
-                for symbol, strategy in self.symbol_models.items():
-                    model_path = f"{self.models_dir}/risklabai_{symbol}_models.pkl"
-                    strategy.save_models(model_path)
-                logger.info(f"Models saved for {len(self.symbol_models)} symbols")
-            except Exception as e:
-                logger.warning(f"Failed to save models: {e}")
-
-            logger.info(f"Training successful!")
-            logger.info(f"  Samples: {results['n_samples']}")
-            logger.info(f"  Primary accuracy: {results['primary_accuracy']:.3f}")
-            logger.info(f"  Meta accuracy: {results['meta_accuracy']:.3f}")
-            logger.info(f"  Top features: {results['top_features'][:3]}")
-        else:
-            logger.warning(f"Training failed: {results.get('reason')}")
-
     def _load_models_from_storage(self):
         """
         Load all symbol models from storage (S3 primary, local cache fallback).
@@ -919,6 +881,10 @@ class RiskLabAICombined(Strategy):
                 strategy.label_encoder = model_data.get('label_encoder')
                 strategy.feature_names = model_data.get('feature_names')
                 strategy.important_features = model_data.get('important_features')
+                frac_diff_d = model_data.get('frac_diff_d')
+                if frac_diff_d is not None:
+                    strategy.frac_diff.d = frac_diff_d
+                    strategy.frac_diff._optimal_d = frac_diff_d
 
                 self.symbol_models[symbol] = strategy
 
@@ -961,17 +927,10 @@ class RiskLabAICombined(Strategy):
 
         successful = 0
         failed = 0
+        returns_by_symbol = {}
 
         for symbol in self.symbols:
             logger.info(f"\n📚 Retraining {symbol}...")
-
-            # Get fresh data
-            bars = self._get_historical_bars(symbol, self.min_training_bars)
-
-            if bars is None or len(bars) < self.min_training_bars:
-                logger.warning(f"  {symbol}: Insufficient data ({len(bars) if bars else 0} bars)")
-                failed += 1
-                continue
 
             # Create new strategy instance
             strategy = RiskLabAIStrategy(
@@ -984,7 +943,11 @@ class RiskLabAICombined(Strategy):
 
             # Train the strategy
             try:
-                results = strategy.train(bars, symbol=symbol)
+                results = strategy.train_from_ticks(
+                    symbol=symbol,
+                    threshold=self.imbalance_threshold,
+                    min_samples=self.min_training_bars
+                )
             except Exception as e:
                 logger.error(f"  {symbol}: Training exception: {e}")
                 failed += 1
@@ -1003,11 +966,12 @@ class RiskLabAICombined(Strategy):
                 'label_encoder': strategy.label_encoder,
                 'feature_names': strategy.feature_names,
                 'important_features': strategy.important_features,
+                'frac_diff_d': strategy.frac_diff.d,
                 'training_metrics': {
                     'primary_accuracy': results.get('primary_accuracy'),
                     'meta_accuracy': results.get('meta_accuracy'),
                     'n_samples': results.get('n_samples'),
-                    'training_bars': len(bars)
+                    'training_bars': results.get('bars_count')
                 }
             }
 
@@ -1021,9 +985,12 @@ class RiskLabAICombined(Strategy):
             # Update in-memory model reference
             self.symbol_models[symbol] = strategy
 
-            logger.info(f"  ✓ {symbol} retrained: acc={results['primary_accuracy']:.1%}, "
+            logger.info(f"  ✓ {symbol} retrained: bal_acc={results['primary_accuracy']:.1%}, "
                        f"samples={results['n_samples']}")
             successful += 1
+
+            if results.get('returns') is not None:
+                returns_by_symbol[symbol] = results['returns']
 
         # Update training timestamp
         self.last_train_date = datetime.now()
@@ -1031,6 +998,16 @@ class RiskLabAICombined(Strategy):
         logger.info("=" * 80)
         logger.info(f"🎓 RETRAINING COMPLETE: {successful} success, {failed} failed")
         logger.info("=" * 80)
+
+        # HRP portfolio optimization across symbols
+        if returns_by_symbol:
+            returns_df = pd.concat(returns_by_symbol, axis=1).dropna()
+            if not returns_df.empty:
+                try:
+                    self.hrp_weights = self.risklabai.optimize_portfolio(returns_df)
+                    logger.info("HRP portfolio weights computed")
+                except Exception as e:
+                    logger.warning(f"HRP optimization failed: {e}")
 
         # Cleanup old model versions (keep last 5)
         for symbol in self.symbols:
@@ -1048,81 +1025,103 @@ class RiskLabAICombined(Strategy):
         """
         Fetch historical bar data for a symbol.
 
-        If use_tick_bars is True, fetches tick imbalance bars from database.
-        Otherwise, fetches regular OHLC bars from broker.
+        Always fetches tick imbalance bars from the tick database.
 
         Args:
             symbol: Stock symbol
             length: Number of bars to fetch
-            timeframe: Bar timeframe ("minute", "day", etc.) - ignored if use_tick_bars=True
+            timeframe: Bar timeframe ("minute", "day", etc.) - ignored (tick data only)
 
         Returns:
             DataFrame with OHLCV data
         """
         try:
-            # NEW: Fetch tick imbalance bars from database
-            if self.use_tick_bars:
-                logger.debug(f"{symbol}: Fetching tick imbalance bars from database")
+            logger.debug(f"{symbol}: Fetching tick imbalance bars from database")
 
-                # Load ticks from database
-                storage = TickStorage(TICK_DB_PATH)
-                ticks = storage.load_ticks(symbol)
-                storage.close()
+            # Load ticks from database
+            storage = TickStorage(TICK_DB_PATH)
+            ticks = storage.load_ticks(symbol)
+            storage.close()
 
-                if not ticks:
-                    logger.warning(f"{symbol}: No ticks found in database")
-                    return None
-
-                # Generate imbalance bars from ticks
-                bars = generate_bars_from_ticks(ticks, threshold=self.imbalance_threshold)
-
-                if not bars:
-                    logger.warning(f"{symbol}: No bars generated from ticks")
-                    return None
-
-                # Convert to DataFrame with proper datetime index
-                df = pd.DataFrame(bars)
-
-                # Set timestamp as index (required for fractional differencing)
-                if 'timestamp' in df.columns:
-                    df['timestamp'] = pd.to_datetime(df['timestamp'])
-                    df = df.set_index('timestamp')
-                elif 'bar_end' in df.columns:
-                    df['bar_end'] = pd.to_datetime(df['bar_end'])
-                    df = df.set_index('bar_end')
-
-                # Take most recent bars
-                if len(df) > length:
-                    df = df.tail(length)
-
-                logger.debug(f"{symbol}: Loaded {len(df)} tick imbalance bars with datetime index")
-
-                return df
-
-            # ORIGINAL: Fetch regular OHLC bars from broker
-            bars = self.get_historical_prices(
-                symbol,
-                length,
-                timeframe
-            )
-
-            if bars is None:
+            if not ticks:
+                logger.warning(f"{symbol}: No ticks found in database")
                 return None
 
-            # Convert to DataFrame with expected format
-            df = bars.df
-
-            # Ensure we have required columns
-            required_columns = ['open', 'high', 'low', 'close', 'volume']
-            if not all(col in df.columns for col in required_columns):
-                logger.warning(f"Missing required columns for {symbol}")
+            # Apply CUSUM filter before building imbalance bars
+            filtered_ticks = self._filter_ticks_with_cusum(ticks, symbol)
+            if not filtered_ticks:
+                logger.warning(f"{symbol}: No ticks after CUSUM filtering")
                 return None
+
+            # Generate imbalance bars from CUSUM-filtered ticks
+            bars = generate_bars_from_ticks(filtered_ticks, threshold=self.imbalance_threshold)
+
+            if not bars:
+                logger.warning(f"{symbol}: No bars generated from ticks")
+                return None
+
+            # Convert to DataFrame with proper datetime index
+            df = pd.DataFrame(bars)
+
+            # Set timestamp as index (required for fractional differencing)
+            if 'timestamp' in df.columns:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                df = df.set_index('timestamp')
+            elif 'bar_end' in df.columns:
+                df['bar_end'] = pd.to_datetime(df['bar_end'])
+                df = df.set_index('bar_end')
+
+            # Take most recent bars
+            if len(df) > length:
+                df = df.tail(length)
+
+            logger.debug(f"{symbol}: Loaded {len(df)} tick imbalance bars with datetime index")
 
             return df
 
         except Exception as e:
             logger.error(f"Error fetching bars for {symbol}: {e}")
             return None
+
+    def _filter_ticks_with_cusum(self, ticks, symbol: str):
+        """
+        Apply CUSUM event filtering to ticks before imbalance bar generation.
+
+        Returns:
+            List of ticks aligned to CUSUM event timestamps.
+        """
+        tick_timestamps = pd.to_datetime([t[0] for t in ticks], format='ISO8601')
+        tick_prices = pd.Series([t[1] for t in ticks], index=tick_timestamps)
+
+        cusum_events = self.cusum_filter.get_events(tick_prices)
+        logger.debug(f"{symbol}: CUSUM events {len(cusum_events)} from {len(ticks):,} ticks")
+
+        if len(cusum_events) == 0:
+            return []
+
+        event_values = cusum_events.values
+        tick_values = tick_timestamps.values
+        max_delta = np.timedelta64(CUSUM_EVENT_WINDOW_SECONDS, 's')
+
+        idx = np.searchsorted(event_values, tick_values)
+        large_delta = np.timedelta64(10**9, 's')
+        prev_delta = np.full(len(tick_values), large_delta)
+        next_delta = np.full(len(tick_values), large_delta)
+
+        has_prev = idx > 0
+        has_next = idx < len(event_values)
+        prev_delta[has_prev] = tick_values[has_prev] - event_values[idx[has_prev] - 1]
+        next_delta[has_next] = event_values[idx[has_next]] - tick_values[has_next]
+
+        min_delta = np.minimum(prev_delta, next_delta)
+        keep_mask = min_delta <= max_delta
+        filtered_ticks = [tick for tick, keep in zip(ticks, keep_mask) if keep]
+
+        logger.debug(
+            f"{symbol}: Filtered ticks {len(filtered_ticks):,} after CUSUM "
+            f"(window: ±{CUSUM_EVENT_WINDOW_SECONDS}s)"
+        )
+        return filtered_ticks
 
     def _check_existing_positions(self):
         """
@@ -1351,7 +1350,7 @@ class RiskLabAICombined(Strategy):
             logger.info(f"{symbol}: Insufficient data ({len(bars) if bars is not None else 0} bars)")
             return
 
-        # Get signal from RiskLabAI model (includes CUSUM filtering for event detection)
+        # Get signal from RiskLabAI model (tick-level CUSUM happens before bar generation)
         symbol_strategy = self.symbol_models[symbol]
         signal, bet_size = symbol_strategy.predict(
             bars,
@@ -1486,6 +1485,7 @@ class RiskLabAICombined(Strategy):
                         'label_encoder': strategy.label_encoder,
                         'feature_names': strategy.feature_names,
                         'important_features': strategy.important_features,
+                        'frac_diff_d': strategy.frac_diff.d,
                     }
                     # Save to S3 (will also cache locally)
                     self.model_storage.save_model(symbol, model_data, upload_to_s3=True)

@@ -61,6 +61,12 @@ TICK_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 print(f"✓ Tick configuration loaded successfully (Data path: {DATA_BASE_PATH})")
 
 # =============================================================================
+# CUSUM FILTER WINDOW (Tick-Level)
+# =============================================================================
+# Expand CUSUM events to include ticks within this window (seconds)
+CUSUM_EVENT_WINDOW_SECONDS = int(os.environ.get("CUSUM_EVENT_WINDOW_SECONDS", "30"))
+
+# =============================================================================
 # ALPACA API CREDENTIALS
 # =============================================================================
 
@@ -316,48 +322,6 @@ BACKTEST_MAX_DRAWDOWN = -0.0779
 # =============================================================================
 # FRACTIONAL DIFFERENCING PARAMETER
 # =============================================================================
-
-# Optimal d value for making time series stationary
-# Found by analyzing 7,286 tick imbalance bars (2020-2025)
-# d=0.30 achieves stationarity (p=0.0405) while preserving 70% of memory
-# Lower d = more memory = better predictions
-OPTIMAL_FRACTIONAL_D = 0.30
-
-# =============================================================================
-# PORTABILITY HELPER
-# =============================================================================
-
-def should_use_tick_bars() -> bool:
-    """
-    Auto-detect whether to use tick bars based on database existence.
-
-    This makes the bot portable - it will automatically use tick bars if
-    the database exists, otherwise fall back to Alpaca API bars.
-
-    Returns:
-        bool: True if tick database exists and is accessible, False otherwise
-    """
-    try:
-        # Check if database file exists
-        if not TICK_DB_PATH.exists():
-            print(f"ℹ️  Tick database not found at {TICK_DB_PATH}")
-            print(f"ℹ️  Will use Alpaca API for real-time bars")
-            return False
-
-        # Check if database is readable (has content)
-        if TICK_DB_PATH.stat().st_size == 0:
-            print(f"⚠️  Tick database exists but is empty: {TICK_DB_PATH}")
-            print(f"ℹ️  Will use Alpaca API for real-time bars")
-            return False
-
-        print(f"✓ Tick database found: {TICK_DB_PATH} ({TICK_DB_PATH.stat().st_size / 1024 / 1024:.1f} MB)")
-        print(f"✓ Will use tick imbalance bars from database")
-        return True
-
-    except Exception as e:
-        print(f"⚠️  Error checking tick database: {e}")
-        print(f"ℹ️  Will use Alpaca API for real-time bars")
-        return False
 
 # =============================================================================
 # MARKET TIMEZONE (Eastern Time)

@@ -127,6 +127,7 @@ class MetaLabeler:
         logger.info(f"Meta labels created:")
         logger.info(f"  Correct predictions (1): {n_correct} ({n_correct/len(meta_labels)*100:.1f}%)")
         logger.info(f"  Wrong predictions (0):   {n_wrong} ({n_wrong/len(meta_labels)*100:.1f}%)")
+        logger.info(f"Meta-label baseline (majority class): {max(accuracy, 1-accuracy)*100:.1f}%")
         logger.info("=" * 60)
 
         # Sanity checks
@@ -155,9 +156,9 @@ class MetaLabeler:
         balance = abs(0.5 - accuracy)
         if balance < 0.05:
             logger.info(f"✓ Good meta-label balance: {accuracy:.1%} vs {1-accuracy:.1%}")
-        elif accuracy > 0.55 or accuracy < 0.45:
-            logger.warning(f"⚠️ Imbalanced meta-labels: {accuracy:.1%} correct vs {1-accuracy:.1%} wrong")
-            logger.warning(f"   Meta model may struggle to learn meaningful patterns")
+        elif accuracy >= 0.70 or accuracy <= 0.30:
+            logger.warning(f"⚠️ Highly imbalanced meta-labels: {accuracy:.1%} correct vs {1-accuracy:.1%} wrong")
+            logger.warning("   Meta model may struggle to learn meaningful patterns")
 
         return meta_labels
 

@@ -34,23 +34,29 @@ class CUSUMEventFilter:
         self.threshold = threshold
         logger.info(f"CUSUMEventFilter initialized: threshold={threshold}")
 
-    def _calculate_threshold(self, prices: pd.Series) -> float:
+    def _calculate_threshold(self, prices: pd.Series, multiplier: float = 0.7) -> float:
         """
-        Calculate CUSUM threshold to filter ~35-40% of events.
+        Calculate CUSUM threshold in DOLLAR units to match prices.diff().
+
+        BUG FIX: Was using pct_change() (percentage) but CUSUM uses diff() (dollars).
+        This caused unit mismatch where threshold changes had no effect.
 
         Args:
             prices: Price series
+            multiplier: Volatility multiplier (0.7 targets ~35-40% filter rate)
 
         Returns:
-            Threshold value (volatility * multiplier)
+            Threshold value in dollars (not percentage)
         """
-        daily_returns = prices.pct_change().dropna()
-        daily_vol = daily_returns.std()
+        # Calculate volatility of ABSOLUTE price differences (same units as CUSUM)
+        price_diff = prices.diff().dropna()
+        diff_vol = price_diff.std()
 
-        # Multiply by 2.5 to get ~35% filter rate (was ~1.0)
-        threshold = daily_vol * 2.5
+        # Multiply by calibrated factor for 30-40% filter rate
+        # Empirical: 1.5 → 9.4%, so 0.7 → ~35-40%
+        threshold = diff_vol * multiplier
 
-        logger.info(f"CUSUM threshold: {threshold:.6f} (vol={daily_vol:.6f})")
+        logger.info(f"CUSUM threshold: ${threshold:.4f} (diff_vol=${diff_vol:.4f}, mult={multiplier})")
         return threshold
 
     def get_events(

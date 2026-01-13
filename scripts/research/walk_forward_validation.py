@@ -171,7 +171,7 @@ def walk_forward_validation(
                 profit_taking=0.5,
                 stop_loss=0.5,
                 max_holding=20,
-                d=1.0,
+                d=None,
                 n_cv_splits=3  # Use fewer CV splits for speed
             )
 

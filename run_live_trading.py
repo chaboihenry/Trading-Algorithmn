@@ -29,8 +29,7 @@ from config.tick_config import (
     OPTIMAL_MAX_HOLDING_BARS,
     OPTIMAL_META_THRESHOLD,
     OPTIMAL_PROB_THRESHOLD,
-    OPTIMAL_FRACTIONAL_D,
-    should_use_tick_bars  # Auto-detect tick database for portability
+    TICK_DB_PATH
 )
 # Set up logging
 logging.basicConfig(
@@ -122,11 +121,13 @@ def main():
     logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from tier_1")
     logger.info(f"First 10: {', '.join(ACTIVE_SYMBOLS[:10])}")
 
-    # AUTO-DETECT: Use tick bars if database exists, otherwise use Alpaca API
-    USE_TICK_BARS = should_use_tick_bars()
     logger.info("=" * 80)
-    logger.info(f"DATA SOURCE: {'Tick Imbalance Bars (Database)' if USE_TICK_BARS else 'Alpaca API Real-Time Bars'}")
+    logger.info(f"DATA SOURCE: Tick Imbalance Bars (Database @ {TICK_DB_PATH})")
     logger.info("=" * 80)
+    if not TICK_DB_PATH.exists() or TICK_DB_PATH.stat().st_size == 0:
+        logger.error(f"Tick database missing or empty: {TICK_DB_PATH}")
+        logger.error("Run tick backfill before starting live trading.")
+        return 1
 
     # Initialize strategy with OPTIMIZED tick-based models
     # Set parameters as class attribute before creating instance
@@ -140,14 +141,13 @@ def main():
         'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% (0.04) profit target
         'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% (0.02) stop loss
         'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 20 bars max hold
-        'd': OPTIMAL_FRACTIONAL_D,               # 0.30 - Fractional differencing (preserves 70% memory)
+        'd': None,                               # Auto-calculated per symbol
 
         # Signal thresholds
         'meta_threshold': OPTIMAL_META_THRESHOLD,  # 0.001 (0.1%) - Meta model confidence
         'prob_threshold': OPTIMAL_PROB_THRESHOLD,  # 0.015 (1.5%) - Primary model probability
 
-        # Strategy settings - AUTO-DETECTED for portability
-        'use_tick_bars': USE_TICK_BARS,  # Auto-detect: True if DB exists, False otherwise
+        # Strategy settings
         'enable_profitability_tracking': True,
         'min_training_bars': 100,
         'retrain_days': 30,
