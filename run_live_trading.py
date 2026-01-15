@@ -12,9 +12,11 @@ Usage:
 """
 
 import logging
+import os
 import signal
 import sys
 from datetime import datetime
+from pathlib import Path
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
 from utils.model_downloader import download_models
@@ -29,14 +31,22 @@ from config.tick_config import (
     OPTIMAL_MAX_HOLDING_BARS,
     OPTIMAL_META_THRESHOLD,
     OPTIMAL_PROB_THRESHOLD,
+    SYMBOLS,
+    SYMBOL_TIER,
+    MAX_SYMBOLS,
     TICK_DB_PATH
 )
+from config.tick_config import ensure_alpaca_credentials
+LOG_DIR = Path(os.environ.get("LOG_DIR", "logs"))
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+(LOG_DIR / "profitability_logs").mkdir(parents=True, exist_ok=True)
+
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(f'logs/live_trading_{datetime.now().strftime("%Y%m%d")}.log'),
+        logging.FileHandler(LOG_DIR / f'live_trading_{datetime.now().strftime("%Y%m%d")}.log'),
         logging.StreamHandler()
     ]
 )
@@ -81,11 +91,10 @@ def main():
     """
     Run live trading bot with profitability tracking.
     """
+    ensure_alpaca_credentials()
     print("=" * 80)
     print("RISKLABAI LIVE TRADING BOT")
     print("=" * 80)
-
-    download_models()
 
     print(f"Mode: {'PAPER TRADING' if ALPACA_PAPER else 'LIVE TRADING'}")
     print(f"Started: {datetime.now()}")
@@ -110,16 +119,36 @@ def main():
     # tier_4: Top 2000
     # tier_5: ALL liquid US stocks (2000-5000 symbols)
 
+    ACTIVE_SYMBOLS = SYMBOLS
+
+    tier_desc = SYMBOL_TIER or "tier_1"
+    if MAX_SYMBOLS:
+        tier_desc += f" (max {MAX_SYMBOLS})"
+    logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from {tier_desc}")
+    logger.info(f"First 10: {', '.join(ACTIVE_SYMBOLS[:10])}")
+
     try:
-        from config.all_symbols import get_symbols_by_tier
-        ACTIVE_SYMBOLS = get_symbols_by_tier('tier_1')  # Start with top 100
-    except ImportError:
-        logger.error("all_symbols.py not found!")
-        logger.error("Run: python scripts/setup/fetch_all_symbols.py first")
+        download_models(symbols=ACTIVE_SYMBOLS, require_s3=True)
+    except Exception as exc:
+        logger.error(f"Model download failed: {exc}")
         return 1
 
-    logger.info(f"Trading {len(ACTIVE_SYMBOLS)} symbols from tier_1")
-    logger.info(f"First 10: {', '.join(ACTIVE_SYMBOLS[:10])}")
+    models_dir = Path(os.environ.get("MODELS_PATH", "models"))
+    if not models_dir.exists():
+        logger.error(f"Models directory missing: {models_dir}")
+        return 1
+
+    missing_models = [
+        symbol for symbol in ACTIVE_SYMBOLS
+        if not any(models_dir.glob(f"risklabai_{symbol}_*.pkl"))
+    ]
+    if missing_models:
+        logger.error(
+            "Missing models after S3 download for: "
+            f"{', '.join(missing_models)}"
+        )
+        logger.error("Update the S3 bucket or reduce the symbol list.")
+        return 1
 
     logger.info("=" * 80)
     logger.info(f"DATA SOURCE: Tick Imbalance Bars (Database @ {TICK_DB_PATH})")
@@ -136,11 +165,11 @@ def main():
         # Each symbol will load its own model: models/risklabai_{symbol}_models.pkl
         'symbols': ACTIVE_SYMBOLS,
 
-        # OPTIMAL PARAMETERS from parameter sweep (Sharpe 3.53, Win Rate 73.1%)
+        # OPTIMAL PARAMETERS (Locked for Tuning)
         # Note: Each symbol loads its own model from models/risklabai_{symbol}_models.pkl
-        'profit_taking': OPTIMAL_PROFIT_TARGET,  # 4.0% (0.04) profit target
-        'stop_loss': OPTIMAL_STOP_LOSS,          # 2.0% (0.02) stop loss
-        'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 20 bars max hold
+        'profit_taking': OPTIMAL_PROFIT_TARGET,  # 2.5x volatility profit target
+        'stop_loss': OPTIMAL_STOP_LOSS,          # 2.5x volatility stop loss
+        'max_holding': OPTIMAL_MAX_HOLDING_BARS, # 10 bars max hold
         'd': None,                               # Auto-calculated per symbol
 
         # Signal thresholds

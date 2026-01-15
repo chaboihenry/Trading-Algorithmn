@@ -21,8 +21,6 @@ services:
     volumes:
       # Logs (view trading activity)
       - ./logs:/app/logs
-      # Models (pre-trained ML models)
-      - ./models:/app/models
       # Data (optional tick database)
       - ./data:/app/data
 
@@ -65,5 +63,4 @@ services:
 
 volumes:
   logs:
-  models:
   data:

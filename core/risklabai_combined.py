@@ -19,6 +19,7 @@ Broker Integration:
 
 import logging
 import json
+import os
 import uuid
 import numpy as np
 import pandas as pd
@@ -259,9 +260,9 @@ class RiskLabAICombined(Strategy):
 
         # Store RiskLabAI parameters for creating per-symbol strategies
         self.risklabai_params = {
-            'profit_taking': parameters.get('profit_taking', 0.5) if parameters else 0.5,
-            'stop_loss': parameters.get('stop_loss', 0.5) if parameters else 0.5,
-            'max_holding': parameters.get('max_holding', 20) if parameters else 20,
+            'profit_taking': parameters.get('profit_taking', 2.5) if parameters else 2.5,
+            'stop_loss': parameters.get('stop_loss', 2.5) if parameters else 2.5,
+            'max_holding': parameters.get('max_holding', 10) if parameters else 10,
             'd': parameters.get('d', None) if parameters else None,
         }
 
@@ -277,6 +278,9 @@ class RiskLabAICombined(Strategy):
 
         # NEW: Per-symbol model storage
         self.symbol_models = {}  # Dict[symbol -> RiskLabAIStrategy instance]
+
+        # Model storage directory (each symbol gets its own model file)
+        self.models_dir = os.environ.get("MODELS_PATH", "models")
 
         # NEW: Model storage with S3 (primary) + local cache support
         self.model_storage = ModelStorage(local_dir=self.models_dir)
@@ -315,9 +319,6 @@ class RiskLabAICombined(Strategy):
         # Signal generation thresholds
         self.meta_threshold = parameters.get('meta_threshold', 0.001) if parameters else 0.001
         self.prob_threshold = parameters.get('prob_threshold', 0.015) if parameters else 0.015
-
-        # Model storage directory (each symbol gets its own model file)
-        self.models_dir = 'models'
 
         # NEW: Profitability tracking
         self.enable_profitability_tracking = parameters.get('enable_profitability_tracking', False) if parameters else False
@@ -1065,10 +1066,16 @@ class RiskLabAICombined(Strategy):
 
             # Set timestamp as index (required for fractional differencing)
             if 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
+                if isinstance(df['timestamp'].iloc[0], (int, float)):
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit="ms", utc=True)
+                else:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
                 df = df.set_index('timestamp')
             elif 'bar_end' in df.columns:
-                df['bar_end'] = pd.to_datetime(df['bar_end'])
+                if isinstance(df['bar_end'].iloc[0], (int, float)):
+                    df['bar_end'] = pd.to_datetime(df['bar_end'], unit="ms", utc=True)
+                else:
+                    df['bar_end'] = pd.to_datetime(df['bar_end'], utc=True)
                 df = df.set_index('bar_end')
 
             # Take most recent bars
@@ -1090,7 +1097,11 @@ class RiskLabAICombined(Strategy):
         Returns:
             List of ticks aligned to CUSUM event timestamps.
         """
-        tick_timestamps = pd.to_datetime([t[0] for t in ticks], format='ISO8601')
+        tick_timestamp_values = [t[0] for t in ticks]
+        if tick_timestamp_values and isinstance(tick_timestamp_values[0], (int, float)):
+            tick_timestamps = pd.to_datetime(tick_timestamp_values, unit="ms", utc=True)
+        else:
+            tick_timestamps = pd.to_datetime(tick_timestamp_values, format='ISO8601', utc=True)
         tick_prices = pd.Series([t[1] for t in ticks], index=tick_timestamps)
 
         cusum_events = self.cusum_filter.get_events(tick_prices)

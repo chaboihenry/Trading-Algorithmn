@@ -20,9 +20,7 @@ import sys
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split, StratifiedKFold, ParameterSampler
-from sklearn.metrics import balanced_accuracy_score
-from sklearn.utils.class_weight import compute_class_weight
+from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.pipeline import Pipeline
@@ -42,7 +40,11 @@ project_root = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(project_root))
 
 try:
-    from config.tick_config import TICK_DB_PATH, INITIAL_IMBALANCE_THRESHOLD, CUSUM_EVENT_WINDOW_SECONDS
+    from config.tick_config import (
+        TICK_DB_PATH,
+        INITIAL_IMBALANCE_THRESHOLD,
+        CUSUM_EVENT_WINDOW_SECONDS
+    )
     from data.tick_storage import TickStorage
     from data.tick_to_bars import generate_bars_from_ticks
     TICK_DATA_AVAILABLE = True
@@ -115,32 +117,12 @@ class RiskLabAIStrategy:
 
     def __init__(
         self,
-        profit_taking: float = 2.0,
-        stop_loss: float = 2.0,
-        max_holding: int = 20,
+        profit_taking: float = 2.5,
+        stop_loss: float = 2.5,
+        max_holding: int = 10,
         d: float = None,
         n_cv_splits: int = 5,
-        margin_threshold: float = 0.03,
-        tune_primary: bool = False,
-        tune_meta: bool = False,
-        primary_gap_tolerance: float = 0.05,
-        primary_gap_penalty: float = 0.75,
-        tune_primary_trials: int = 25,
-        tune_primary_seed: int = 42,
-        primary_param_space: Optional[Dict[str, List]] = None,
-        meta_c_candidates: Optional[List[float]] = None,
-        primary_search_depth: str = "standard",
-        meta_search_depth: str = "standard",
-        meta_l1_ratios: Optional[List[float]] = None,
-        split_method: str = "stratified",
-        split_test_size: float = 0.2,
-        walk_forward_splits: int = 5,
-        walk_forward_train_size: Optional[float] = None,
-        walk_forward_test_size: Optional[float] = None,
-        walk_forward_step_size: Optional[float] = None,
-        walk_forward_expanding: bool = True,
-        primary_params_override: Optional[Dict] = None,
-        meta_params_override: Optional[Dict] = None
+        margin_threshold: float = 0.03
     ):
         """
         Initialize RiskLabAI strategy.
@@ -148,31 +130,11 @@ class RiskLabAIStrategy:
         Args:
             profit_taking: Take-profit multiplier (vs volatility)
             stop_loss: Stop-loss multiplier (vs volatility)
-            max_holding: Max periods before timeout (30 → ~30-35% neutral labels)
+            max_holding: Max periods before timeout
             d: Fractional differencing parameter (0-1, typically 0.3-0.6)
             n_cv_splits: Cross-validation folds
             margin_threshold: Minimum probability margin between winner and runner-up
                             for accepting signals (default: 0.03 = 3%)
-            tune_primary: Whether to tune primary model params (default: False)
-            tune_meta: Whether to tune meta model params (default: False)
-            primary_gap_tolerance: Allowed train/test gap before penalty (default: 0.05)
-            primary_gap_penalty: Penalty applied to gap beyond tolerance (default: 0.75)
-            tune_primary_trials: Number of primary param samples (default: 25)
-            tune_primary_seed: Random seed for primary param sampling
-            primary_param_space: Optional param search space override
-            meta_c_candidates: Optional list of C values for meta tuning
-            primary_search_depth: Search depth for primary params (standard|deep)
-            meta_search_depth: Search depth for meta params (standard|deep)
-            meta_l1_ratios: Optional list of l1_ratio values for elasticnet meta tuning
-            split_method: Train/test split method (stratified|time|walk_forward)
-            split_test_size: Fraction of data reserved for test
-            walk_forward_splits: Number of walk-forward folds (default: 5)
-            walk_forward_train_size: Train window size for walk-forward (int or fraction)
-            walk_forward_test_size: Test window size for walk-forward (int or fraction)
-            walk_forward_step_size: Step size between folds (int or fraction)
-            walk_forward_expanding: Use expanding train window if True
-            primary_params_override: Optional fixed primary params to use
-            meta_params_override: Optional fixed meta params to use
         """
         # Initialize components
         self.cusum_filter = CUSUMEventFilter()
@@ -189,7 +151,6 @@ class RiskLabAIStrategy:
         # Models (initialized during training)
         self.primary_model = None
         self.meta_model = None
-        self.primary_params = {}
 
         # Preprocessing (initialized during training)
         self.scaler = None
@@ -202,50 +163,6 @@ class RiskLabAIStrategy:
 
         # Prediction parameters
         self.margin_threshold = margin_threshold  # Configurable margin threshold (H9)
-        self.tune_primary = tune_primary
-        self.tune_meta = tune_meta
-        self.primary_gap_tolerance = primary_gap_tolerance
-        self.primary_gap_penalty = primary_gap_penalty
-        self.tune_primary_trials = tune_primary_trials
-        self.tune_primary_seed = tune_primary_seed
-        self.primary_param_space = primary_param_space
-        self.meta_c_candidates = meta_c_candidates
-        self.primary_search_depth = primary_search_depth
-        self.meta_search_depth = meta_search_depth
-        self.meta_l1_ratios = meta_l1_ratios
-        self.split_method = split_method
-        self.split_test_size = split_test_size
-        self.walk_forward_splits = walk_forward_splits
-        self.walk_forward_train_size = walk_forward_train_size
-        self.walk_forward_test_size = walk_forward_test_size
-        self.walk_forward_step_size = walk_forward_step_size
-        self.walk_forward_expanding = walk_forward_expanding
-        self.primary_params_override = primary_params_override
-        self.meta_params_override = meta_params_override
-
-        if self.primary_search_depth not in {"standard", "deep"}:
-            logger.warning(
-                f"Unknown primary_search_depth '{self.primary_search_depth}', defaulting to 'standard'"
-            )
-            self.primary_search_depth = "standard"
-
-        if self.meta_search_depth not in {"standard", "deep"}:
-            logger.warning(
-                f"Unknown meta_search_depth '{self.meta_search_depth}', defaulting to 'standard'"
-            )
-            self.meta_search_depth = "standard"
-
-        if self.split_method not in {"stratified", "time", "walk_forward"}:
-            logger.warning(
-                f"Unknown split_method '{self.split_method}', defaulting to 'stratified'"
-            )
-            self.split_method = "stratified"
-
-        if self.walk_forward_splits is not None and self.walk_forward_splits <= 0:
-            logger.warning(
-                f"Invalid walk_forward_splits '{self.walk_forward_splits}', defaulting to 5"
-            )
-            self.walk_forward_splits = 5
 
         logger.info("RiskLabAI Strategy initialized")
         logger.info(f"  Margin threshold: {self.margin_threshold:.1%}")
@@ -279,7 +196,7 @@ class RiskLabAIStrategy:
         7. trend: Directional bias (MA crossover)
 
         Args:
-            bars: OHLCV bar data
+            bars: Imbalance Bars
             symbol: Symbol name (for logging optimal d per symbol)
 
         Returns:
@@ -364,7 +281,7 @@ class RiskLabAIStrategy:
             logger.warning("    ACTION: Collect more data or reduce feature count further")
             logger.warning("")
         elif samples_per_feature < 20:
-            logger.info(f"Samples/feature: {samples_per_feature:.1f} (target: 20-40)")
+            logger.warning(f"⚠️ Low samples/feature: {samples_per_feature:.1f} (target: 20-40)")
         else:
             logger.info(f"✓ Good samples/feature ratio: {samples_per_feature:.1f}")
 
@@ -450,47 +367,7 @@ class RiskLabAIStrategy:
 
         return max_shift
 
-    def _filter_ticks_by_event_window(
-        self,
-        ticks: List[Tuple[str, float, int]],
-        tick_timestamps: pd.DatetimeIndex,
-        cusum_events: pd.DatetimeIndex,
-        window_seconds: int
-    ) -> List[Tuple[str, float, int]]:
-        """
-        Expand CUSUM events to include ticks within a time window.
-
-        This increases bar counts when tick volumes are low.
-        """
-        if len(cusum_events) == 0:
-            return []
-
-        event_values = cusum_events.values
-        tick_values = tick_timestamps.values
-        max_delta = np.timedelta64(window_seconds, 's')
-
-        idx = np.searchsorted(event_values, tick_values)
-
-        large_delta = np.timedelta64(10**9, 's')
-        prev_delta = np.full(len(tick_values), large_delta)
-        next_delta = np.full(len(tick_values), large_delta)
-
-        has_prev = idx > 0
-        has_next = idx < len(event_values)
-
-        prev_delta[has_prev] = tick_values[has_prev] - event_values[idx[has_prev] - 1]
-        next_delta[has_next] = event_values[idx[has_next]] - tick_values[has_next]
-
-        min_delta = np.minimum(prev_delta, next_delta)
-        keep_mask = min_delta <= max_delta
-
-        return [tick for tick, keep in zip(ticks, keep_mask) if keep]
-
-    def _build_primary_model(
-        self,
-        use_early_stopping: bool = True,
-        params_override: Optional[Dict] = None
-    ) -> XGBClassifier:
+    def _build_primary_model(self, use_early_stopping: bool = True) -> XGBClassifier:
         """
         Build a configured primary XGBoost model.
 
@@ -501,103 +378,28 @@ class RiskLabAIStrategy:
             Configured XGBClassifier instance.
         """
         params = {
-            'n_estimators': 200,
-            'max_depth': 3,
-            'min_child_weight': 30,
-            'reg_alpha': 0.3,
-            'reg_lambda': 2.0,
-            'gamma': 0.2,
-            'subsample': 0.6,
-            'colsample_bytree': 0.6,
-            'colsample_bylevel': 0.6,
-            'learning_rate': 0.04,
+            'n_estimators': 100,
+            'max_depth': 4,
+            'min_child_weight': 20,
+            'reg_alpha': 0.1,
+            'reg_lambda': 1.0,
+            'gamma': 0.1,
+            'subsample': 0.7,
+            'colsample_bytree': 0.7,
+            'colsample_bylevel': 0.7,
+            'learning_rate': 0.05,
             'objective': 'multi:softprob',
             'num_class': 3,
             'eval_metric': 'mlogloss',
+            'use_label_encoder': False,
             'random_state': 42,
             'n_jobs': -1
         }
 
-        if params_override:
-            params.update(params_override)
-
         if use_early_stopping:
-            params.setdefault('early_stopping_rounds', 15)
-        else:
-            params.pop('early_stopping_rounds', None)
+            params['early_stopping_rounds'] = 20
 
         return XGBClassifier(**params)
-
-    def _oof_primary_predictions(
-        self,
-        X: pd.DataFrame,
-        y_encoded: pd.Series,
-        samples_info: pd.Series,
-        expected_classes: Optional[set] = None
-    ) -> pd.Series:
-        """
-        Generate out-of-fold primary predictions using purged time blocks.
-        """
-        def _is_zero_based_contiguous(class_set: set) -> bool:
-            if not class_set:
-                return False
-            class_list = sorted(class_set)
-            return class_list[0] == 0 and class_list[-1] == len(class_list) - 1
-
-        oof_preds = pd.Series(index=X.index, dtype="float64")
-        total = len(X)
-        covered = 0
-
-        if expected_classes is None:
-            expected_classes = set(np.unique(y_encoded))
-
-        for fold, (train_idx, test_idx) in enumerate(
-            self.cv.iter_time_block_splits(X, y_encoded, samples_info), 1
-        ):
-            y_train_fold = y_encoded.iloc[train_idx]
-            y_test_fold = y_encoded.iloc[test_idx]
-
-            train_classes = set(np.unique(y_train_fold))
-            test_classes = set(np.unique(y_test_fold))
-            if train_classes != expected_classes or test_classes != expected_classes:
-                logger.info(
-                    f"OOF fold {fold}/{self.cv.n_splits}: skipped (classes train={sorted(train_classes)} "
-                    f"test={sorted(test_classes)})"
-                )
-                continue
-            if (not _is_zero_based_contiguous(train_classes) or
-                    not _is_zero_based_contiguous(test_classes)):
-                logger.info(
-                    f"OOF fold {fold}/{self.cv.n_splits}: skipped (non-contiguous classes train={sorted(train_classes)} "
-                    f"test={sorted(test_classes)})"
-                )
-                continue
-
-            scaler = StandardScaler()
-            X_train_fold = scaler.fit_transform(X.iloc[train_idx])
-            X_test_fold = scaler.transform(X.iloc[test_idx])
-
-            classes = np.unique(y_train_fold)
-            class_weights = compute_class_weight(
-                class_weight='balanced',
-                classes=classes,
-                y=y_train_fold
-            )
-            weight_map = dict(zip(classes, class_weights))
-            train_weights = np.array([weight_map[c] for c in y_train_fold])
-
-            model = self._build_primary_model(
-                use_early_stopping=False,
-                params_override=self.primary_params
-            )
-            model.fit(X_train_fold, y_train_fold, sample_weight=train_weights, verbose=False)
-            preds = model.predict(X_test_fold)
-
-            oof_preds.iloc[test_idx] = preds
-            covered += len(test_idx)
-
-        logger.info(f"OOF primary coverage: {covered}/{total} ({covered/total:.1%})")
-        return oof_preds
 
     def train(
         self,
@@ -657,30 +459,6 @@ class RiskLabAIStrategy:
         features = features.loc[features.index.isin(labels.index)]
         event_df = event_df.loc[event_df.index.isin(labels.index)]
 
-        # Build samples_info for purged CV / OOF meta-labeling
-        samples_info = None
-        try:
-            if 'End Time' in labels.columns:
-                samples_info = labels['End Time']
-            else:
-                from RiskLabAI.data.labeling import vertical_barrier
-                samples_info = vertical_barrier(
-                    close=bars['close'],
-                    time_events=labels.index,
-                    number_days=self.labeler.max_holding_period
-                )
-            samples_info = samples_info.reindex(features.index)
-            valid_mask = samples_info.notna()
-            if valid_mask.sum() < len(features):
-                logger.info(f"Purged-CV samples with valid t1: {valid_mask.sum()}/{len(features)}")
-            features = features.loc[valid_mask]
-            labels = labels.loc[valid_mask]
-            event_df = event_df.loc[valid_mask]
-            samples_info = samples_info.loc[valid_mask]
-        except Exception as e:
-            logger.warning(f"Failed to build samples_info for purged CV: {e}")
-            samples_info = None
-
         # Log detailed label distribution
         label_counts = labels['bin'].value_counts().to_dict()
         label_pcts = (labels['bin'].value_counts(normalize=True) * 100).to_dict()
@@ -692,6 +470,18 @@ class RiskLabAIStrategy:
         logger.info("Step 4: Splitting data for train/test validation...")
         X = features
         y_direction = labels['bin']
+
+        # Remove classes with too few samples for stratification
+        class_counts = y_direction.value_counts()
+        min_samples_for_class = 2  # For train_test_split with stratification
+        classes_to_remove = class_counts[class_counts < min_samples_for_class].index
+        if not classes_to_remove.empty:
+            logger.warning(
+                f"Removing classes with < {min_samples_for_class} samples: {list(classes_to_remove)}"
+            )
+            filter_mask = ~y_direction.isin(classes_to_remove)
+            X = X[filter_mask]
+            y_direction = y_direction[filter_mask]
 
         # Log overall label distribution BEFORE split
         overall_dist = y_direction.value_counts(normalize=True).sort_index()
@@ -708,29 +498,15 @@ class RiskLabAIStrategy:
         self.label_encoder = LabelEncoder()
         self.label_encoder.fit(y_direction)
 
-        # Split data (default: stratified 80/20)
-        if self.split_method == "time":
-            X_sorted = X.sort_index()
-            y_sorted = y_direction.loc[X_sorted.index]
-            split_idx = int(len(X_sorted) * (1 - self.split_test_size))
-            split_idx = max(1, min(split_idx, len(X_sorted) - 1))
-            X_train = X_sorted.iloc[:split_idx]
-            X_test = X_sorted.iloc[split_idx:]
-            y_train = y_sorted.iloc[:split_idx]
-            y_test = y_sorted.iloc[split_idx:]
-            logger.info(
-                f"  Split method: time (train={len(X_train)}, test={len(X_test)})"
-            )
-        else:
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y_direction,
-                test_size=self.split_test_size,
-                random_state=42,
-                stratify=y_direction  # CRITICAL: Maintain label distribution
-            )
-            logger.info(
-                f"  Split method: stratified (train={len(X_train)}, test={len(X_test)})"
-            )
+        # Split data (80/20 train/test) with STRATIFICATION
+        # stratify=y_direction ensures train/test have same label distribution
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y_direction,
+            test_size=0.2,
+            random_state=42,
+            stratify=y_direction  # CRITICAL: Maintain label distribution
+        )
+        logger.info(f"  Train size: {len(X_train)}, Test size: {len(X_test)}")
 
         # Verify distributions match after split
         train_dist = y_train.value_counts(normalize=True).sort_index()
@@ -756,9 +532,6 @@ class RiskLabAIStrategy:
         logger.info("=" * 60)
 
         # Check for significant distribution shift
-        if self.split_method == "time":
-            logger.info("Note: time split can show larger label shifts by design")
-
         if max_shift > 0.10:
             logger.warning("")
             logger.warning("⚠️  LARGE LABEL DISTRIBUTION SHIFT DETECTED")
@@ -796,174 +569,31 @@ class RiskLabAIStrategy:
         # =============================================================================
         # XGBoost overfits easily - these params are carefully tuned to prevent it
 
+        self.primary_model = self._build_primary_model(use_early_stopping=True)
+
         # Train with early stopping using validation set
-        # Class balancing for primary model
-        classes = np.unique(y_train_encoded)
-        class_weights = compute_class_weight(class_weight='balanced', classes=classes, y=y_train_encoded)
-        weight_map = dict(zip(classes, class_weights))
-        train_weights = np.array([weight_map[c] for c in y_train_encoded])
-        test_weights = np.array([weight_map.get(c, 1.0) for c in y_test_encoded])
+        self.primary_model.fit(
+            X_train_scaled,
+            y_train_encoded,
+            eval_set=[(X_test_scaled, y_test_encoded)],
+            verbose=False
+        )
 
-        fit_kwargs = {
-            "X": X_train_scaled,
-            "y": y_train_encoded,
-            "eval_set": [(X_test_scaled, y_test_encoded)],
-            "sample_weight": train_weights,
-            "sample_weight_eval_set": [test_weights],
-            "verbose": False
-        }
+        # Log training info
+        best_iteration = self.primary_model.best_iteration
+        logger.info(f"  XGBoost stopped at iteration {best_iteration} (early stopping)")
 
-        train_bal_acc = None
-        test_bal_acc = None
-        gap = None
+        # =============================================================================
+        # EVALUATE AND CHECK FOR OVERFITTING
+        # =============================================================================
+        train_preds = self.primary_model.predict(X_train_scaled)
+        test_preds = self.primary_model.predict(X_test_scaled)
 
-        if self.primary_params_override:
-            logger.info("  Using primary params override (skipping tuning)")
-            self.primary_model = self._build_primary_model(
-                use_early_stopping=True,
-                params_override=dict(self.primary_params_override)
-            )
-            self.primary_params = dict(self.primary_params_override)
-            self.primary_model.fit(**fit_kwargs)
+        train_acc = (train_preds == y_train_encoded).mean()
+        test_acc = (test_preds == y_test_encoded).mean()
+        gap = train_acc - test_acc
 
-            train_preds = self.primary_model.predict(X_train_scaled)
-            test_preds = self.primary_model.predict(X_test_scaled)
-
-            train_bal_acc = balanced_accuracy_score(y_train_encoded, train_preds)
-            test_bal_acc = balanced_accuracy_score(y_test_encoded, test_preds)
-            gap = train_bal_acc - test_bal_acc
-        elif self.tune_primary:
-            standard_space = {
-                "max_depth": [2, 3, 4, 5],
-                "min_child_weight": [10, 15, 20, 30, 40, 60],
-                "reg_alpha": [0.0, 0.05, 0.1, 0.3, 0.6, 1.0],
-                "reg_lambda": [0.8, 1.0, 1.5, 2.0, 3.0, 4.0],
-                "gamma": [0.0, 0.05, 0.1, 0.2, 0.3, 0.4],
-                "subsample": [0.5, 0.6, 0.7, 0.8],
-                "colsample_bytree": [0.5, 0.6, 0.7, 0.8],
-                "colsample_bylevel": [0.5, 0.6, 0.7, 0.8],
-                "learning_rate": [0.02, 0.03, 0.04, 0.05, 0.07],
-                "n_estimators": [150, 200, 250, 300, 400],
-                "early_stopping_rounds": [10, 15, 20]
-            }
-            deep_space = {
-                "max_depth": [1, 2, 3, 4, 5, 6],
-                "min_child_weight": [1, 5, 10, 20, 30, 40, 60, 80, 100],
-                "reg_alpha": [0.0, 0.01, 0.05, 0.1, 0.3, 0.6, 1.0, 2.0],
-                "reg_lambda": [0.5, 0.8, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0],
-                "gamma": [0.0, 0.05, 0.1, 0.2, 0.4, 0.6, 1.0],
-                "subsample": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                "colsample_bytree": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                "colsample_bylevel": [0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-                "learning_rate": [0.01, 0.02, 0.03, 0.04, 0.05, 0.07, 0.1],
-                "n_estimators": [100, 150, 200, 250, 300, 400, 500, 800],
-                "early_stopping_rounds": [10, 15, 20, 30]
-            }
-            param_space = deep_space if self.primary_search_depth == "deep" else standard_space
-            if self.primary_param_space:
-                param_space = self.primary_param_space
-            sampled = list(
-                ParameterSampler(
-                    param_space,
-                    n_iter=self.tune_primary_trials,
-                    random_state=self.tune_primary_seed
-                )
-            )
-            candidates = [("base", {})]
-            for i, params_override in enumerate(sampled, 1):
-                candidates.append((f"sample_{i}", params_override))
-
-            best = None
-            results = []
-            logger.info("  Tuning primary model parameters...")
-            logger.info(
-                f"  Primary search depth: {self.primary_search_depth} "
-                f"(trials={self.tune_primary_trials})"
-            )
-            if self.primary_param_space:
-                logger.info("  Primary param space override active")
-            for name, params_override in candidates:
-                model = self._build_primary_model(
-                    use_early_stopping=True,
-                    params_override=params_override
-                )
-                model.fit(**fit_kwargs)
-
-                train_preds = model.predict(X_train_scaled)
-                test_preds = model.predict(X_test_scaled)
-
-                cand_train_acc = balanced_accuracy_score(y_train_encoded, train_preds)
-                cand_test_acc = balanced_accuracy_score(y_test_encoded, test_preds)
-                cand_gap = cand_train_acc - cand_test_acc
-                penalty = max(0.0, cand_gap - self.primary_gap_tolerance)
-                score = cand_test_acc - self.primary_gap_penalty * penalty
-
-                logger.info(
-                    f"  Candidate {name}: Train {cand_train_acc:.1%}, "
-                    f"Test {cand_test_acc:.1%}, Gap {cand_gap:.1%}, "
-                    f"Score {score:.3f}"
-                )
-
-                results.append({
-                    "name": name,
-                    "params": params_override,
-                    "train_acc": cand_train_acc,
-                    "test_acc": cand_test_acc,
-                    "gap": cand_gap,
-                    "score": score
-                })
-
-                if best is None or score > best["score"]:
-                    best = {
-                        "name": name,
-                        "model": model,
-                        "params": params_override,
-                        "train_acc": cand_train_acc,
-                        "test_acc": cand_test_acc,
-                        "gap": cand_gap,
-                        "score": score
-                    }
-
-            self.primary_model = best["model"]
-            self.primary_params = best["params"]
-            train_bal_acc = best["train_acc"]
-            test_bal_acc = best["test_acc"]
-            gap = best["gap"]
-
-            best_iteration = getattr(self.primary_model, "best_iteration", None)
-            if best_iteration is not None:
-                logger.info(f"  XGBoost stopped at iteration {best_iteration} (early stopping)")
-            logger.info(f"  Selected primary params: {best['name']}")
-
-            if results:
-                top_candidates = sorted(results, key=lambda r: r["score"], reverse=True)[:5]
-                logger.info("  Top primary candidates:")
-                for cand in top_candidates:
-                    logger.info(
-                        f"    {cand['name']}: Test {cand['test_acc']:.1%}, "
-                        f"Gap {cand['gap']:.1%}, Score {cand['score']:.3f}, "
-                        f"Params {cand['params']}"
-                    )
-        else:
-            self.primary_model = self._build_primary_model(use_early_stopping=True)
-            self.primary_params = {}
-            self.primary_model.fit(**fit_kwargs)
-
-            # Log training info
-            best_iteration = self.primary_model.best_iteration
-            logger.info(f"  XGBoost stopped at iteration {best_iteration} (early stopping)")
-
-            # =============================================================================
-            # EVALUATE AND CHECK FOR OVERFITTING
-            # =============================================================================
-            train_preds = self.primary_model.predict(X_train_scaled)
-            test_preds = self.primary_model.predict(X_test_scaled)
-
-            train_bal_acc = balanced_accuracy_score(y_train_encoded, train_preds)
-            test_bal_acc = balanced_accuracy_score(y_test_encoded, test_preds)
-            gap = train_bal_acc - test_bal_acc
-
-        logger.info(f"  Primary Model (Balanced Acc) - Train: {train_bal_acc:.1%}, Test: {test_bal_acc:.1%}, Gap: {gap:.1%}")
+        logger.info(f"  Primary Model - Train: {train_acc:.1%}, Test: {test_acc:.1%}, Gap: {gap:.1%}")
 
         if gap > 0.10:
             logger.warning(f"  ⚠️ OVERFITTING: {gap:.1%} gap. Increase regularization.")
@@ -992,149 +622,28 @@ class RiskLabAIStrategy:
         # Meta model predicts: "Will the primary model be correct?"
         # This is different from predicting direction - it predicts WHEN to trust primary
 
-        # Create meta labels on TRAINING data (OOF to reduce leakage)
-        meta_labels_train = None
-        meta_train_index = X_train.index
-        if samples_info is not None:
-            X_train_sorted = X_train.sort_index()
-            samples_info_train = samples_info.loc[X_train_sorted.index]
-            y_train_encoded_series = pd.Series(y_train_encoded, index=X_train.index)
-            y_train_encoded_series = y_train_encoded_series.loc[X_train_sorted.index]
-            expected_classes = set(range(len(self.label_encoder.classes_)))
-            oof_preds_encoded = None
-            try:
-                oof_preds_encoded = self._oof_primary_predictions(
-                    X_train_sorted,
-                    y_train_encoded_series,
-                    samples_info_train,
-                    expected_classes=expected_classes
-                )
-            except Exception as e:
-                logger.warning(f"OOF primary predictions failed: {e}")
+        # Create meta labels on TRAINING data
+        primary_train_preds = self.primary_model.predict(X_train_scaled)
+        # Decode back to original labels for comparison
+        primary_train_preds_decoded = self.label_encoder.inverse_transform(primary_train_preds)
 
-            if oof_preds_encoded is not None:
-                oof_valid = oof_preds_encoded.notna()
-                min_oof = max(50, int(0.5 * len(oof_preds_encoded)))
-                if oof_valid.sum() >= min_oof:
-                    logger.info("Creating meta labels from OOF primary predictions")
-                    meta_train_index = oof_valid[oof_valid].index
-                    oof_decoded = self.label_encoder.inverse_transform(
-                        oof_preds_encoded[oof_valid].astype(int)
-                    )
-                    meta_labels_train = self.meta_labeler.create_meta_labels_from_predictions(
-                        primary_predictions=oof_decoded,
-                        actual_labels=y_train.loc[meta_train_index].values
-                    )
-                else:
-                    logger.warning(
-                        f"OOF predictions too sparse ({oof_valid.sum()}/{len(oof_preds_encoded)}); "
-                        "falling back to in-sample meta labels"
-                    )
-
-        if meta_labels_train is None:
-            logger.info("Creating meta labels from in-sample primary predictions")
-            primary_train_preds = self.primary_model.predict(X_train_scaled)
-            primary_train_preds_decoded = self.label_encoder.inverse_transform(primary_train_preds)
-            meta_labels_train = self.meta_labeler.create_meta_labels_from_predictions(
-                primary_predictions=primary_train_preds_decoded,
-                actual_labels=y_train.values
-            )
-            meta_train_index = X_train.index
-
-        X_train_scaled_df = pd.DataFrame(X_train_scaled, index=X_train.index)
-        X_train_meta = X_train_scaled_df.loc[meta_train_index].to_numpy()
-        meta_labels_train = np.asarray(meta_labels_train)
-
-        # Tune meta model regularization if requested
-        best_meta_params = {"C": 0.1, "penalty": "l2", "solver": "lbfgs"}
-        if self.meta_params_override:
-            logger.info("  Using meta params override (skipping tuning)")
-            best_meta_params = dict(self.meta_params_override)
-        elif self.tune_meta and len(meta_labels_train) >= 100:
-            logger.info("  Tuning meta model regularization...")
-            if self.meta_search_depth == "deep":
-                c_candidates = self.meta_c_candidates or [
-                    0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0
-                ]
-            else:
-                c_candidates = self.meta_c_candidates or [0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0]
-
-            meta_candidates = []
-            if self.meta_search_depth == "deep":
-                l1_ratios = self.meta_l1_ratios or [0.1, 0.5, 0.9]
-                for c_val in c_candidates:
-                    meta_candidates.append({"C": c_val, "penalty": "l2", "solver": "lbfgs"})
-                    meta_candidates.append({"C": c_val, "penalty": "l1", "solver": "saga"})
-                    for l1_ratio in l1_ratios:
-                        meta_candidates.append({
-                            "C": c_val,
-                            "penalty": "elasticnet",
-                            "solver": "saga",
-                            "l1_ratio": l1_ratio
-                        })
-            else:
-                for c_val in c_candidates:
-                    meta_candidates.append({"C": c_val, "penalty": "l2", "solver": "lbfgs"})
-
-            logger.info(
-                f"  Meta search depth: {self.meta_search_depth} "
-                f"({len(meta_candidates)} candidates)"
-            )
-            skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
-            best_score = None
-            for cand in meta_candidates:
-                fold_scores = []
-                for train_idx, val_idx in skf.split(X_train_meta, meta_labels_train):
-                    model_params = {
-                        "C": cand["C"],
-                        "penalty": cand["penalty"],
-                        "solver": cand["solver"],
-                        "max_iter": 4000,
-                        "class_weight": "balanced",
-                        "random_state": 42
-                    }
-                    if "l1_ratio" in cand:
-                        model_params["l1_ratio"] = cand["l1_ratio"]
-
-                    model = LogisticRegression(**model_params)
-                    model.fit(X_train_meta[train_idx], meta_labels_train[train_idx])
-                    preds = model.predict(X_train_meta[val_idx])
-                    fold_scores.append(
-                        balanced_accuracy_score(meta_labels_train[val_idx], preds)
-                    )
-
-                mean_score = float(np.mean(fold_scores))
-                cand_desc = f"C={cand['C']:.3g}, penalty={cand['penalty']}, solver={cand['solver']}"
-                if "l1_ratio" in cand:
-                    cand_desc += f", l1_ratio={cand['l1_ratio']:.2f}"
-                logger.info(f"  Meta {cand_desc}: cv_balanced_accuracy={mean_score:.3f}")
-                if best_score is None or mean_score > best_score:
-                    best_score = mean_score
-                    best_meta_params = cand
-
-            best_desc = (
-                f"C={best_meta_params['C']:.3g}, penalty={best_meta_params['penalty']}, "
-                f"solver={best_meta_params['solver']}"
-            )
-            if "l1_ratio" in best_meta_params:
-                best_desc += f", l1_ratio={best_meta_params['l1_ratio']:.2f}"
-            logger.info(f"  Selected meta params: {best_desc} (cv_balanced_accuracy={best_score:.3f})")
+        # Use MetaLabeler to create labels with proper validation
+        meta_labels_train = self.meta_labeler.create_meta_labels_from_predictions(
+            primary_predictions=primary_train_preds_decoded,
+            actual_labels=y_train.values
+        )
 
         # Train meta model
-        meta_params = {
-            "C": best_meta_params["C"],
-            "penalty": best_meta_params["penalty"],
-            "solver": best_meta_params["solver"],
-            "max_iter": 4000,
-            "class_weight": "balanced",
-            "random_state": 42
-        }
-        if "l1_ratio" in best_meta_params:
-            meta_params["l1_ratio"] = best_meta_params["l1_ratio"]
+        self.meta_model = LogisticRegression(
+            C=0.1,
+            penalty='l2',
+            solver='lbfgs',
+            max_iter=2000,
+            class_weight='balanced',
+            random_state=42
+        )
 
-        self.meta_model = LogisticRegression(**meta_params)
-
-        self.meta_model.fit(X_train_meta, meta_labels_train)
+        self.meta_model.fit(X_train_scaled, meta_labels_train)
 
         # Evaluate meta model on test set
         primary_test_preds = self.primary_model.predict(X_test_scaled)
@@ -1142,42 +651,34 @@ class RiskLabAIStrategy:
         meta_labels_test = (primary_test_preds_decoded == y_test.values).astype(int)
 
         # Meta model performance
-        meta_train_pred = self.meta_model.predict(X_train_meta)
+        meta_train_pred = self.meta_model.predict(X_train_scaled)
         meta_test_pred = self.meta_model.predict(X_test_scaled)
 
         meta_train_acc = (meta_train_pred == meta_labels_train).mean()
         meta_test_acc = (meta_test_pred == meta_labels_test).mean()
-        meta_train_bal_acc = balanced_accuracy_score(meta_labels_train, meta_train_pred)
-        meta_test_bal_acc = balanced_accuracy_score(meta_labels_test, meta_test_pred)
-        meta_test_baseline = max(meta_labels_test.mean(), 1 - meta_labels_test.mean())
 
         logger.info("")
         logger.info("=" * 60)
         logger.info("META MODEL PERFORMANCE")
         logger.info("=" * 60)
         logger.info(f"Meta model accuracy:")
-        logger.info(f"  Train: {meta_train_acc:.1%} (balanced: {meta_train_bal_acc:.1%})")
-        logger.info(f"  Test:  {meta_test_acc:.1%} (balanced: {meta_test_bal_acc:.1%}, baseline: {meta_test_baseline:.1%})")
+        logger.info(f"  Train: {meta_train_acc:.1%} (predicting when primary is correct)")
+        logger.info(f"  Test:  {meta_test_acc:.1%} (predicting when primary is correct)")
         logger.info("=" * 60)
 
-        # Sanity check - meta model should beat baseline and ~50% balanced accuracy
-        if meta_test_acc < meta_test_baseline:
+        # Sanity check - meta model should perform around 45-55%
+        if meta_test_acc < 0.40:
             logger.warning("")
             logger.warning("⚠️  META MODEL UNDERPERFORMING")
-            logger.warning(f"    Current: {meta_test_acc:.1%} (baseline: {meta_test_baseline:.1%})")
-            logger.warning("    ISSUE: Meta model worse than majority-class baseline")
-            logger.warning("    ACTION: Improve features or retrain with stronger signal")
+            logger.warning(f"    Current: {meta_test_acc:.1%}")
+            logger.warning(f"    Expected: 45-60% (better than random guessing)")
+            logger.warning("    ISSUE: Meta model cannot predict when primary is correct")
+            logger.warning("    ACTION: Check features, try different meta model")
             logger.warning("")
-        elif meta_test_bal_acc < 0.50:
-            logger.warning("")
-            logger.warning("⚠️  META MODEL BELOW RANDOM (BALANCED)")
-            logger.warning(f"    Current balanced accuracy: {meta_test_bal_acc:.1%}")
-            logger.warning("    ACTION: Check feature usefulness or meta-label quality")
-            logger.warning("")
-        elif meta_test_acc > 0.70 and meta_test_bal_acc > 0.70:
+        elif meta_test_acc > 0.70:
             logger.warning("")
             logger.warning("⚠️  META MODEL SUSPICIOUSLY HIGH")
-            logger.warning(f"    Current: {meta_test_acc:.1%} (balanced: {meta_test_bal_acc:.1%})")
+            logger.warning(f"    Current: {meta_test_acc:.1%}")
             logger.warning(f"    Expected: 45-60% (modestly better than random)")
             logger.warning("    POSSIBLE ISSUE: Data leakage or overfitting")
             logger.warning("")
@@ -1185,42 +686,54 @@ class RiskLabAIStrategy:
             logger.info(f"✓ Good meta model accuracy: {meta_test_acc:.1%}")
             logger.info(f"  Meta model can help filter weak primary predictions")
 
-        meta_scores_mean = meta_test_bal_acc
+        meta_scores_mean = test_acc  # Use primary model test accuracy for results
 
         # Step 7: Purged CV validation (tick-level event timestamps)
         logger.info("Step 7: Purged CV validation...")
         cv_mean = None
         cv_std = None
-        try:
-            if samples_info is None:
-                raise ValueError("samples_info unavailable for purged CV")
-            samples_info_cv = samples_info.loc[features.index]
-            features_cv = features
 
-            cv_model = self._build_primary_model(
-                use_early_stopping=False,
-                params_override=self.primary_params
-            )
-            cv_pipeline = Pipeline([
-                ("scaler", StandardScaler()),
-                ("model", cv_model)
-            ])
+        # Check if we have enough samples in each class for cross-validation
+        min_samples_for_cv = self.cv.n_splits
+        class_counts_cv = y_direction.value_counts()
+        if (class_counts_cv < min_samples_for_cv).any():
+            logger.warning(f"Skipping purged CV: at least one class has fewer than {min_samples_for_cv} samples.")
+        else:
+            try:
+                if 'End Time' in labels.columns:
+                    samples_info = labels['End Time']
+                else:
+                    from RiskLabAI.data.labeling import vertical_barrier
+                    samples_info = vertical_barrier(
+                        close=bars['close'],
+                        time_events=labels.index,
+                        number_days=self.labeler.max_holding_period
+                    )
 
-            y_encoded_full = self.label_encoder.transform(y_direction.loc[features_cv.index])
-            y_encoded_full = pd.Series(y_encoded_full, index=features_cv.index)
+                samples_info = samples_info.loc[features.index].dropna()
+                features_cv = features.loc[samples_info.index]
 
-            cv_scores = self.cv.cross_val_score_purged_stratified(
-                model=cv_pipeline,
-                X=features_cv,
-                y=y_encoded_full,
-                samples_info=samples_info_cv,
-                scoring='balanced_accuracy'
-            )
-            cv_mean = float(cv_scores.mean())
-            cv_std = float(cv_scores.std())
-            logger.info(f"Purged CV balanced accuracy: {cv_mean:.4f} ± {cv_std:.4f}")
-        except Exception as e:
-            logger.warning(f"Purged CV failed: {e}")
+                cv_model = self._build_primary_model(use_early_stopping=False)
+                cv_pipeline = Pipeline([
+                    ("scaler", StandardScaler()),
+                    ("model", cv_model)
+                ])
+
+                y_encoded_full = self.label_encoder.transform(y_direction.loc[features_cv.index])
+                y_encoded_full = pd.Series(y_encoded_full, index=features_cv.index)
+
+                cv_scores = self.cv.cross_val_score_purged(
+                    model=cv_pipeline,
+                    X=features_cv,
+                    y=y_encoded_full,
+                    samples_info=samples_info,
+                    scoring='accuracy'
+                )
+                cv_mean = float(cv_scores.mean())
+                cv_std = float(cv_scores.std())
+                logger.info(f"Purged CV accuracy: {cv_mean:.4f} ± {cv_std:.4f}")
+            except Exception as e:
+                logger.warning(f"Purged CV failed: {e}")
 
         logger.info("=" * 60)
         logger.info("TRAINING COMPLETE")
@@ -1229,7 +742,7 @@ class RiskLabAIStrategy:
         return {
             'success': True,
             'n_samples': len(features),
-            'primary_accuracy': test_bal_acc,
+            'primary_accuracy': test_acc,
             'meta_accuracy': meta_scores_mean,
             'purged_cv_mean': cv_mean,
             'purged_cv_std': cv_std,
@@ -1433,8 +946,6 @@ class RiskLabAIStrategy:
             return
 
         # Prepare model data
-        primary_params = self.primary_model.get_params() if self.primary_model else {}
-        meta_params = self.meta_model.get_params() if self.meta_model else {}
         model_data = {
             'primary_model': self.primary_model,
             'meta_model': self.meta_model,
@@ -1445,18 +956,12 @@ class RiskLabAIStrategy:
             'frac_diff_d': self.frac_diff.d,
             'model_type': 'XGBoost_primary_LR_meta',
             'hyperparameters': {
-                'xgb_max_depth': primary_params.get('max_depth'),
-                'xgb_learning_rate': primary_params.get('learning_rate'),
-                'xgb_reg_alpha': primary_params.get('reg_alpha'),
-                'xgb_reg_lambda': primary_params.get('reg_lambda'),
-                'xgb_gamma': primary_params.get('gamma'),
-                'xgb_min_child_weight': primary_params.get('min_child_weight'),
-                'xgb_subsample': primary_params.get('subsample'),
-                'xgb_colsample_bytree': primary_params.get('colsample_bytree'),
-                'xgb_colsample_bylevel': primary_params.get('colsample_bylevel'),
-                'xgb_n_estimators': primary_params.get('n_estimators'),
-                'lr_C': meta_params.get('C'),
-                'lr_class_weight': meta_params.get('class_weight')
+                'xgb_max_depth': 4,
+                'xgb_learning_rate': 0.05,
+                'xgb_reg_alpha': 0.1,
+                'xgb_reg_lambda': 1.0,
+                'xgb_gamma': 0.1,
+                'lr_C': 0.1
             },
             # NEW: Add versioning metadata
             'version': datetime.now().strftime('%Y%m%d_%H%M%S'),
@@ -1524,12 +1029,40 @@ class RiskLabAIStrategy:
         if hyperparams:
             logger.debug(f"Model hyperparameters: {hyperparams}")
 
+    def _filter_ticks_with_cusum(self, ticks, cusum_events, tick_timestamps):
+        """
+        Filter ticks to only those within a window around CUSUM events.
+        """
+        event_values = cusum_events.values
+        tick_values = tick_timestamps.values
+        max_delta = np.timedelta64(CUSUM_EVENT_WINDOW_SECONDS, 's')
+
+        idx = np.searchsorted(event_values, tick_values)
+        large_delta = np.timedelta64(10**9, 's')
+        prev_delta = np.full(len(tick_values), large_delta)
+        next_delta = np.full(len(tick_values), large_delta)
+
+        has_prev = idx > 0
+        has_next = idx < len(event_values)
+        
+        # Ensure indices are within bounds
+        idx_prev = idx[has_prev] - 1
+        idx_next = idx[has_next]
+        
+        prev_delta[has_prev] = tick_values[has_prev] - event_values[idx_prev]
+        next_delta[has_next] = event_values[idx_next] - tick_values[has_next]
+
+        min_delta = np.minimum(prev_delta, next_delta)
+        keep_mask = min_delta <= max_delta
+        filtered_ticks = [tick for tick, keep in zip(ticks, keep_mask) if keep]
+        
+        return filtered_ticks
+
     def train_from_ticks(
         self,
         symbol: str,
         threshold: Optional[float] = None,
-        min_samples: int = 100,
-        event_window_seconds: Optional[int] = None
+        min_samples: int = 100
     ) -> Dict:
         """
         Train models from tick data stored in database.
@@ -1606,10 +1139,11 @@ class RiskLabAIStrategy:
         # Step 2: Apply CUSUM filter to ticks (C2 FIX)
         logger.info("Step 2: Applying CUSUM filter to tick prices...")
 
-        # Convert ticks to pandas Series for CUSUM filtering
-        # ticks format: List[Tuple[timestamp_str, price_float, volume_int]]
-        # Use format='ISO8601' to handle timestamps with/without microseconds
-        tick_timestamps = pd.to_datetime([t[0] for t in ticks], format='ISO8601')
+        tick_timestamp_values = [t[0] for t in ticks]
+        if tick_timestamp_values and isinstance(tick_timestamp_values[0], (int, float)):
+            tick_timestamps = pd.to_datetime(tick_timestamp_values, unit="ms", utc=True)
+        else:
+            tick_timestamps = pd.to_datetime(tick_timestamp_values, format='ISO8601', utc=True)
         tick_prices = pd.Series([t[1] for t in ticks], index=tick_timestamps)
 
         # Apply CUSUM filter to get event timestamps
@@ -1623,16 +1157,9 @@ class RiskLabAIStrategy:
                 f"Try reducing the CUSUM threshold."
             )
 
-        # Filter ticks to those within a window around CUSUM events
-        if event_window_seconds is None:
-            event_window_seconds = CUSUM_EVENT_WINDOW_SECONDS
-        filtered_ticks = self._filter_ticks_by_event_window(
-            ticks=ticks,
-            tick_timestamps=tick_timestamps,
-            cusum_events=cusum_events,
-            window_seconds=event_window_seconds
-        )
-        logger.info(f"  Filtered ticks: {len(filtered_ticks):,} (window: ±{event_window_seconds}s)")
+        # Filter ticks to only those matching CUSUM events
+        filtered_ticks = self._filter_ticks_with_cusum(ticks, cusum_events, tick_timestamps)
+        logger.info(f"  Filtered ticks: {len(filtered_ticks):,} (from CUSUM events)")
 
         # Step 3: Generate tick imbalance bars from filtered ticks
         logger.info("Step 3: Generating tick imbalance bars from filtered ticks...")
@@ -1656,6 +1183,9 @@ class RiskLabAIStrategy:
             bars_df['bar_end'] = bars_df['bar_end'].dt.tz_localize(None)
         bars_df.set_index('bar_end', inplace=True)
 
+        # Ensure index is unique
+        bars_df = bars_df[~bars_df.index.duplicated(keep='last')]
+
         # Ensure we have required OHLCV columns
         required_cols = ['open', 'high', 'low', 'close', 'volume']
         if not all(col in bars_df.columns for col in required_cols):
@@ -1677,8 +1207,8 @@ class RiskLabAIStrategy:
             logger.info(f"  Tick data: {len(ticks):,} ticks")
             logger.info(f"  Bars generated: {len(bars_list)}")
             logger.info(f"  Samples used: {results['n_samples']}")
-            logger.info(f"  Primary balanced accuracy: {results['primary_accuracy']:.3f}")
-            logger.info(f"  Meta balanced accuracy: {results['meta_accuracy']:.3f}")
+            logger.info(f"  Primary accuracy: {results['primary_accuracy']:.3f}")
+            logger.info(f"  Meta accuracy: {results['meta_accuracy']:.3f}")
             logger.info("=" * 80)
 
         return results

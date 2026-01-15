@@ -29,12 +29,6 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockTradesRequest
 from alpaca.data.timeframe import TimeFrame
 
-# Import configuration
-import sys
-from pathlib import Path
-project_root = Path(__file__).parent.parent
-sys.path.insert(0, str(project_root))
-
 from config.tick_config import (
     ALPACA_API_KEY,
     ALPACA_API_SECRET,
@@ -44,6 +38,7 @@ from config.tick_config import (
     COLLECTION_START_HOUR,
     COLLECTION_END_HOUR
 )
+from config.tick_config import ensure_alpaca_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +127,11 @@ class AlpacaTickClient:
         all communication with Alpaca's API. The client is configured
         to use either IEX (free) or SIP (paid) data based on config.
         """
+        ensure_alpaca_credentials()
+        if DATA_FEED is None:
+            raise ImportError(
+                "alpaca-py is not installed. Install requirements.txt before backfill."
+            )
         logger.info(f"Initializing Alpaca Tick Client with {FEED_NAME}")
 
         # Create Alpaca API client

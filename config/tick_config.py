@@ -18,8 +18,12 @@ OOP Concepts:
 
 import os
 from pathlib import Path
-from alpaca.data.enums import DataFeed
 from dotenv import load_dotenv
+
+try:
+    from alpaca.data.enums import DataFeed
+except ImportError:  # Allows non-Alpaca scripts/tests to run without alpaca-py.
+    DataFeed = None
 
 # Load environment variables from .env file
 PROJECT_ROOT = Path(__file__).parent.parent
@@ -37,7 +41,10 @@ USE_SIP = False  # Set True after purchasing Algo Trader Plus subscription
 
 # DataFeed.SIP: Securities Information Processor - 100% market coverage
 # DataFeed.IEX: Investors Exchange - ~10% market coverage (free)
-DATA_FEED = DataFeed.SIP if USE_SIP else DataFeed.IEX
+if DataFeed is not None:
+    DATA_FEED = DataFeed.SIP if USE_SIP else DataFeed.IEX
+else:
+    DATA_FEED = None
 
 # Readable name for logging
 FEED_NAME = "SIP (Algo Trader Plus)" if USE_SIP else "IEX (Free)"
@@ -45,9 +52,9 @@ FEED_NAME = "SIP (Algo Trader Plus)" if USE_SIP else "IEX (Free)"
 # =============================================================================
 # DATABASE CONFIGURATION
 # =============================================================================
-# Get data path from environment variable, with default to Vault (2TB SSD)
+# Get data path from environment variable, with default to /Volumes/vault
 # This points to your external drive to store the large tick database
-DATA_BASE_PATH = Path(os.environ.get("DATA_PATH", "/Volumes/Vault"))
+DATA_BASE_PATH = Path(os.environ.get("DATA_PATH", "/Volumes/vault"))
 
 # Create base directory if it doesn't exist
 DATA_BASE_PATH.mkdir(parents=True, exist_ok=True)
@@ -74,12 +81,6 @@ CUSUM_EVENT_WINDOW_SECONDS = int(os.environ.get("CUSUM_EVENT_WINDOW_SECONDS", "3
 ALPACA_API_KEY = os.getenv('ALPACA_API_KEY')
 ALPACA_API_SECRET = os.getenv('ALPACA_API_SECRET')
 
-if not ALPACA_API_KEY or not ALPACA_API_SECRET:
-    raise ValueError(
-        "Alpaca API credentials not found! "
-        "Set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file."
-    )
-
 # Paper trading mode (True = paper, False = live)
 # ALWAYS start with paper trading before going live!
 ALPACA_PAPER = True
@@ -88,31 +89,23 @@ ALPACA_PAPER = True
 # TRADING SYMBOLS
 # =============================================================================
 
-# Top 99 S&P 500 symbols by market cap (plus SPY, QQQ, IWM)
-# These symbols have been selected for high liquidity and market coverage
-SYMBOLS = [
-    # Market indices
-    "SPY", "QQQ", "IWM",
-    # Top 99 stocks
-    "AAPL", "ABBV", "ABT", "ACN", "ADBE", "ADI", "AMAT", "AMD", "AMGN", "AMT",
-    "AMZN", "AON", "APH", "AVGO", "AXP", "BA", "BAC", "BDX", "BKNG", "BLK",
-    "BRK.B", "BSX", "C", "CAT", "CB", "CI", "CMCSA", "CME", "COP", "COST",
-    "CRM", "CSCO", "CVX", "DE", "DHR", "DUK", "ELV", "ETN", "GD", "GE",
-    "GILD", "GOOG", "GOOGL", "HD", "HON", "IBM", "INTC", "INTU", "ISRG", "ITW",
-    "JNJ", "JPM", "KO", "LIN", "LLY", "LOW", "LRCX", "MA", "MCD", "MDLZ",
-    "META", "MMC", "MMM", "MRK", "MSFT", "MU", "NEE", "NFLX", "NOC", "NOW",
-    "NVDA", "ORCL", "PANW", "PEP", "PG", "PGR", "PLD", "PM", "QCOM", "REGN",
-    "RTX", "SBUX", "SCHW", "SLB", "SO", "SPGI", "SYK", "TJX", "TMO", "TMUS",
-    "TSLA", "TXN", "UNH", "UNP", "V", "VRTX", "VZ", "WMT", "XOM"
-]
+from config.universe import build_universe
+
+SYMBOL_TIER = os.environ.get("SYMBOL_TIER", "tier_1")
+MAX_SYMBOLS = int(os.environ.get("MAX_SYMBOLS", "0")) or None
+
+SYMBOLS, SYMBOL_TIERS, SYMBOL_BACKFILL_DAYS = build_universe(
+    tier=SYMBOL_TIER,
+    max_symbols=MAX_SYMBOLS
+)
 
 # =============================================================================
 # BACKFILL SETTINGS
 # =============================================================================
 
-# How many days of historical tick data to fetch
-# 365 days = 12 months of data for ML training (need 2000+ samples minimum)
-BACKFILL_DAYS = 365
+# How many days of historical tick data to fetch (fallback)
+# Per-symbol values are provided in SYMBOL_BACKFILL_DAYS.
+BACKFILL_DAYS = int(os.environ.get("BACKFILL_DAYS", "365"))
 
 # Rate limiting to avoid Alpaca API throttling
 # Alpaca allows 200 requests/minute
@@ -179,7 +172,16 @@ INITIAL_IMBALANCE_THRESHOLD = 70.0
 # VALIDATION
 # =============================================================================
 
-def validate_tick_config():
+def ensure_alpaca_credentials() -> None:
+    """Raise if Alpaca API credentials are missing."""
+    if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+        raise ValueError(
+            "Alpaca API credentials not found! "
+            "Set ALPACA_API_KEY and ALPACA_API_SECRET in your .env file."
+        )
+
+
+def validate_tick_config(require_alpaca_credentials: bool = False):
     """
     Validate tick configuration on import.
 
@@ -200,12 +202,17 @@ def validate_tick_config():
             f"Ensure DATA_PATH is correctly set in environment."
         )
 
-    # 2. Check API credentials
-    if not ALPACA_API_KEY:
-        errors.append("ALPACA_API_KEY not set")
-
-    if not ALPACA_API_SECRET:
-        errors.append("ALPACA_API_SECRET not set")
+    # 2. Check API credentials (optional)
+    if require_alpaca_credentials:
+        if not ALPACA_API_KEY:
+            errors.append("ALPACA_API_KEY not set")
+        if not ALPACA_API_SECRET:
+            errors.append("ALPACA_API_SECRET not set")
+    else:
+        if not ALPACA_API_KEY or not ALPACA_API_SECRET:
+            logger.warning(
+                "Alpaca API credentials missing. Backfill/live trading will fail until set."
+            )
 
     # 3. Validate symbols list
     if not SYMBOLS:
@@ -291,25 +298,18 @@ def get_tick_config_summary():
     }
 
 
-# =============================================================================
-# OPTIMAL TRADING PARAMETERS (From Parameter Sweep)
-# =============================================================================
+# OPTIMAL TRADING PARAMETERS (Locked for Tuning)
+# Based on user request to lock in these values for further tuning.
+# Last updated: 2026-01-14
 
-# Best parameters identified by parameter sweep on 2025-12-30
-# Based on 48 configurations tested with Sharpe ratio optimization
-# Backtest performance: Sharpe 3.53, Win Rate 73.1%, 52 trades
-
-# Signal filtering
 OPTIMAL_META_THRESHOLD = 0.001   # 0.1% - Meta model confidence filter
 OPTIMAL_PROB_THRESHOLD = 0.015   # 1.5% - Primary model probability threshold
 
-# Exit parameters
-OPTIMAL_PROFIT_TARGET = 0.04     # 4.0% - Take profit level
-OPTIMAL_STOP_LOSS = 0.02         # 2.0% - Stop loss level
-OPTIMAL_MAX_HOLDING_BARS = 30    # bars - Maximum holding period (30 bars → ~30-35% neutral labels)
+OPTIMAL_PROFIT_TARGET = 2.5      # Profit-taking multiplier vs. volatility
+OPTIMAL_STOP_LOSS = 2.5          # Stop-loss multiplier vs. volatility
+OPTIMAL_MAX_HOLDING_BARS = 10    # bars - Maximum holding period
 
-# Risk management
-OPTIMAL_RISK_REWARD_RATIO = 2.0  # Risk $1 to make $2
+OPTIMAL_RISK_REWARD_RATIO = 1.0  # Risk $1 to make $1
 MAX_POSITION_SIZE_PCT = 0.10     # 10% - Maximum position size
 MAX_DAILY_DRAWDOWN_PCT = 0.15    # 15% - Daily drawdown alert threshold
 
@@ -347,7 +347,7 @@ MARKET_CLOSE_MINUTE = 0
 # Validate configuration when this module is imported
 # This catches errors early before any tick operations begin
 try:
-    validate_tick_config()
+    validate_tick_config(require_alpaca_credentials=False)
     print(f"✓ Tick configuration loaded successfully ({FEED_NAME})")
 except (ValueError, RuntimeError) as e:
     # Re-raise validation errors to prevent bot from starting with bad config

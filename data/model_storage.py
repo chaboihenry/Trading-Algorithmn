@@ -57,7 +57,20 @@ class ModelStorage:
             local_dir: Local directory for model files
         """
         self.local_dir = Path(local_dir)
-        self.local_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.local_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            fallback_dir = Path.cwd() / "models"
+            if fallback_dir.resolve() != self.local_dir.resolve():
+                logger.warning(
+                    "Model path not writable (%s). Falling back to %s",
+                    exc,
+                    fallback_dir
+                )
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                self.local_dir = fallback_dir
+            else:
+                raise
 
         # Initialize S3 client if AWS is configured
         self.s3_client = None
@@ -179,31 +192,43 @@ class ModelStorage:
             Model data dictionary, or None if not found
         """
         if version == "latest":
-            filename = f"risklabai_{symbol}_latest.pkl"
+            filenames = [
+                f"risklabai_{symbol}_latest.pkl",
+                f"risklabai_{symbol}_models.pkl",
+            ]
         else:
-            filename = f"risklabai_{symbol}_{version}.pkl"
+            filenames = [
+                f"risklabai_{symbol}_{version}.pkl",
+                f"risklabai_{symbol}_models_{version}.pkl",
+            ]
 
-        local_path = self.local_dir / filename
+        s3_available = self.s3_client is not None
 
-        # Try local first (unless prefer_s3)
-        if local_path.exists() and not prefer_s3:
-            try:
-                logger.info(f"Loading model from local: {local_path}")
-                return joblib.load(local_path)
-            except Exception as e:
-                logger.warning(f"Failed to load local model: {e}")
-                # Fall through to try S3
+        for filename in filenames:
+            local_path = self.local_dir / filename
 
-        # Try S3 if local not found or prefer_s3 or local load failed
-        if self.s3_client is not None:
-            s3_key = f"models/{symbol}/{filename}"
-            downloaded = self._download_from_s3(s3_key, local_path)
-            if downloaded:
+            # Try local first if S3 isn't available or not preferred
+            if local_path.exists() and (not prefer_s3 or not s3_available):
                 try:
+                    logger.info(f"Loading model from local: {local_path}")
                     return joblib.load(local_path)
                 except Exception as e:
-                    logger.error(f"Failed to load downloaded model: {e}")
-                    return None
+                    logger.warning(f"Failed to load local model: {e}")
+
+            # Try S3 if available
+            if s3_available:
+                s3_keys = [
+                    f"models/{symbol}/{filename}",
+                    f"models/{filename}",
+                ]
+                for s3_key in s3_keys:
+                    downloaded = self._download_from_s3(s3_key, local_path)
+                    if downloaded:
+                        try:
+                            return joblib.load(local_path)
+                        except Exception as e:
+                            logger.error(f"Failed to load downloaded model: {e}")
+                            return None
 
         # Not found anywhere
         logger.warning(f"Model not found for {symbol} (version: {version})")

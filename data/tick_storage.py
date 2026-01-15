@@ -20,11 +20,12 @@ Why use a class here?
 
 import sqlite3
 import logging
+import hashlib
 import pytz
 from typing import List, Dict, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from config.tick_config import TICK_DB_PATH
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,30 @@ def to_et(dt):
     if dt.tzinfo is None:
         dt = UTC_TZ.localize(dt)
     return dt.astimezone(ET_TZ)
+
+
+def to_epoch_ms(value) -> int:
+    """Convert datetime/ISO string/epoch to epoch milliseconds (UTC)."""
+    if isinstance(value, (int, float)):
+        return int(value)
+
+    if isinstance(value, str):
+        try:
+            dt = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        except ValueError as exc:
+            raise ValueError(f"Invalid timestamp string: {value}") from exc
+    elif isinstance(value, datetime):
+        dt = value
+    else:
+        raise TypeError(f"Unsupported timestamp type: {type(value)}")
+
+    dt = to_utc(dt)
+    return int(dt.timestamp() * 1000)
+
+
+def epoch_ms_to_datetime(value: int) -> datetime:
+    """Convert epoch milliseconds to timezone-aware datetime in UTC."""
+    return datetime.fromtimestamp(value / 1000, tz=timezone.utc)
 
 
 class TickStorage:
@@ -141,9 +166,35 @@ class TickStorage:
             # Balanced synchronous mode - safer than OFF, faster than FULL
             self._connection.execute("PRAGMA synchronous=NORMAL")
 
+            # Performance tuning for large tick datasets
+            self._connection.execute("PRAGMA temp_store=MEMORY")
+            # Negative cache_size sets size in KB (e.g., -200000 ≈ 200MB)
+            self._connection.execute("PRAGMA cache_size=-200000")
+
+            self._verify_schema()
+
             logger.debug("Database connection established with WAL mode")
 
         return self._connection
+
+    def _verify_schema(self) -> None:
+        """Verify required tables/columns exist for the current schema."""
+        cursor = self._connection.cursor()
+        cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='ticks'"
+        )
+        if cursor.fetchone() is None:
+            raise RuntimeError(
+                "ticks table not found. Run scripts/init_tick_tables.py first."
+            )
+
+        cursor.execute("PRAGMA table_info(ticks)")
+        columns = {row[1] for row in cursor.fetchall()}
+        if "tick_id" not in columns:
+            raise RuntimeError(
+                "Legacy tick schema detected (missing tick_id). "
+                "Run scripts/migrate_tick_timestamps.py to upgrade."
+            )
 
     def _validate_tick(self, tick: dict, symbol: str) -> bool:
         """
@@ -190,6 +241,27 @@ class TickStorage:
 
         return True
 
+    def _build_tick_id(
+        self,
+        symbol: str,
+        timestamp_ms: int,
+        price: float,
+        size: int,
+        exchange: Optional[str],
+        trade_id: Optional[str]
+    ) -> str:
+        """
+        Build a deterministic tick identifier.
+
+        If trade_id is present, use it directly. Otherwise, hash a stable
+        tuple of fields to ensure idempotent inserts without a trade_id.
+        """
+        if trade_id:
+            return str(trade_id)
+
+        key = f"{symbol}|{timestamp_ms}|{price:.6f}|{size}|{exchange or ''}"
+        return hashlib.sha1(key.encode("utf-8")).hexdigest()
+
     def save_ticks(self, symbol: str, ticks: List[Dict]) -> int:
         """
         Save multiple ticks to database in one efficient batch operation.
@@ -204,8 +276,8 @@ class TickStorage:
         - Filtered ticks are logged but not saved
         - This prevents corrupt data from entering the database
 
-        Timezone Handling:
-        - All timestamps are converted to UTC before storage
+        Time Handling:
+        - All timestamps are converted to UTC epoch milliseconds before storage
         - Naive timestamps are assumed to be in Eastern Time (ET)
         - This ensures consistency across different data sources
 
@@ -260,29 +332,27 @@ class TickStorage:
         # Convert list of dicts to list of tuples for SQL INSERT
         insert_data = []
         for tick in valid_ticks:
-            # Convert datetime to ISO format string if needed
-            # ALWAYS store in UTC for consistency
-            timestamp = tick['timestamp']
-            if isinstance(timestamp, datetime):
-                # Convert to UTC if timezone-aware, assume ET if naive
-                timestamp = to_utc(timestamp)
-                timestamp = timestamp.isoformat()
-            elif isinstance(timestamp, str):
-                # If string, parse and convert to UTC
-                try:
-                    dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                    timestamp = to_utc(dt).isoformat()
-                except Exception:
-                    # Keep as-is if can't parse
-                    pass
+            # Convert timestamp to epoch milliseconds (UTC)
+            timestamp_ms = to_epoch_ms(tick['timestamp'])
+            exchange = tick.get('exchange')
+            trade_id = tick.get('trade_id')
+            tick_id = self._build_tick_id(
+                symbol=symbol,
+                timestamp_ms=timestamp_ms,
+                price=tick['price'],
+                size=tick['size'],
+                exchange=exchange,
+                trade_id=trade_id
+            )
 
             insert_data.append((
                 symbol,
-                timestamp,
+                timestamp_ms,
                 tick['price'],
                 tick['size'],
-                tick.get('exchange'),  # Optional field
-                tick.get('trade_id')   # Optional field
+                exchange,  # Optional field
+                trade_id,  # Optional field
+                tick_id
             ))
 
         try:
@@ -291,8 +361,8 @@ class TickStorage:
             # This makes the operation idempotent - safe to run multiple times
             cursor.executemany("""
                 INSERT OR IGNORE INTO ticks
-                (symbol, timestamp, price, size, exchange, trade_id)
-                VALUES (?, ?, ?, ?, ?, ?)
+                (symbol, timestamp, price, size, exchange, trade_id, tick_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, insert_data)
 
             # Commit changes to disk (make them permanent)
@@ -324,7 +394,8 @@ class TickStorage:
         symbol: str,
         start: Optional[str] = None,
         end: Optional[str] = None,
-        limit: Optional[int] = None
+        limit: Optional[int] = None,
+        timestamp_format: str = "epoch_ms"
     ) -> List[Tuple]:
         """
         Load ticks from database for a given symbol and time range.
@@ -334,9 +405,10 @@ class TickStorage:
 
         Args:
             symbol: Stock ticker
-            start: Start timestamp (ISO format string, e.g., "2024-01-01 09:30:00")
-            end: End timestamp (ISO format string)
+            start: Start timestamp (ISO string, datetime, or epoch ms)
+            end: End timestamp (ISO string, datetime, or epoch ms)
             limit: Maximum number of ticks to return (for testing with small samples)
+            timestamp_format: "epoch_ms", "datetime", or "iso"
 
         Returns:
             List of tuples: [(timestamp, price, size), ...]
@@ -356,11 +428,11 @@ class TickStorage:
 
         if start:
             query += " AND timestamp >= ?"
-            params.append(start)
+            params.append(to_epoch_ms(start))
 
         if end:
             query += " AND timestamp <= ?"
-            params.append(end)
+            params.append(to_epoch_ms(end))
 
         query += " ORDER BY timestamp ASC"
 
@@ -375,7 +447,17 @@ class TickStorage:
 
         logger.debug(f"Loaded {len(rows)} ticks for {symbol}")
 
-        return [(row['timestamp'], row['price'], row['size']) for row in rows]
+        if timestamp_format == "epoch_ms":
+            return [(row['timestamp'], row['price'], row['size']) for row in rows]
+        if timestamp_format == "datetime":
+            return [(epoch_ms_to_datetime(row['timestamp']), row['price'], row['size']) for row in rows]
+        if timestamp_format == "iso":
+            return [
+                (epoch_ms_to_datetime(row['timestamp']).isoformat(), row['price'], row['size'])
+                for row in rows
+            ]
+
+        raise ValueError(f"Unsupported timestamp_format: {timestamp_format}")
 
     def get_backfill_status(self, symbol: str) -> Optional[Dict]:
         """
@@ -420,8 +502,8 @@ class TickStorage:
     def update_backfill_status(
         self,
         symbol: str,
-        earliest: str,
-        latest: str,
+        earliest,
+        latest,
         count: int
     ):
         """
@@ -429,14 +511,14 @@ class TickStorage:
 
         Call this after fetching new tick data to keep track of what you have.
 
-        Timezone Handling:
-        - Timestamps are stored in UTC for consistency
-        - Input timestamps should be UTC or will be converted
+        Time Handling:
+        - Timestamps are stored in UTC epoch milliseconds for consistency
+        - Input timestamps can be ISO strings, datetimes, or epoch ms
 
         Args:
             symbol: Stock ticker
-            earliest: Earliest timestamp in the data (UTC preferred)
-            latest: Latest timestamp in the data (UTC preferred)
+            earliest: Earliest timestamp in the data
+            latest: Latest timestamp in the data
             count: Total number of ticks stored
 
         Example:
@@ -451,21 +533,21 @@ class TickStorage:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        # Get current timestamp in UTC
-        now = datetime.now(UTC_TZ).isoformat()
+        # Get current timestamp in UTC epoch ms
+        now = int(datetime.now(UTC_TZ).timestamp() * 1000)
 
         # INSERT OR REPLACE: Update if exists, insert if doesn't exist
         cursor.execute("""
             INSERT OR REPLACE INTO backfill_status
             (symbol, earliest_timestamp, latest_timestamp, total_ticks, last_updated)
             VALUES (?, ?, ?, ?, ?)
-        """, (symbol, earliest, latest, count, now))
+        """, (symbol, to_epoch_ms(earliest), to_epoch_ms(latest), count, now))
 
         conn.commit()
 
         logger.info(
             f"Updated backfill status for {symbol}: "
-            f"{count} ticks from {earliest} to {latest}"
+            f"{count} ticks from {to_epoch_ms(earliest)} to {to_epoch_ms(latest)}"
         )
 
     def get_tick_count(self, symbol: str) -> int:
@@ -494,12 +576,12 @@ class TickStorage:
 
         return cursor.fetchone()[0]
 
-    def get_date_range(self, symbol: str) -> Optional[Tuple[str, str]]:
+    def get_date_range(self, symbol: str) -> Optional[Tuple[int, int]]:
         """
         Get the date range of ticks stored for a symbol.
 
         Returns:
-            Tuple of (earliest, latest) timestamps, or None if no data
+            Tuple of (earliest_ms, latest_ms) timestamps, or None if no data
 
         Example:
             >>> storage = TickStorage(db_path)
@@ -554,21 +636,22 @@ class TickStorage:
         conn = self._get_connection()
         cursor = conn.cursor()
 
-        insert_data = [
-            (
-                symbol,
-                bar['bar_start'],
-                bar['bar_end'],
-                bar['open'],
-                bar['high'],
-                bar['low'],
-                bar['close'],
-                bar['volume'],
-                bar['tick_count'],
-                bar.get('imbalance', 0.0)
+        insert_data = []
+        for bar in bars:
+            insert_data.append(
+                (
+                    symbol,
+                    to_epoch_ms(bar['bar_start']),
+                    to_epoch_ms(bar['bar_end']),
+                    bar['open'],
+                    bar['high'],
+                    bar['low'],
+                    bar['close'],
+                    bar['volume'],
+                    bar['tick_count'],
+                    bar.get('imbalance', 0.0)
+                )
             )
-            for bar in bars
-        ]
 
         try:
             cursor.executemany("""
@@ -587,6 +670,73 @@ class TickStorage:
             conn.rollback()
             logger.error(f"Error saving bars for {symbol}: {e}")
             raise
+
+    def load_bars(
+        self,
+        symbol: str,
+        start: Optional[str] = None,
+        end: Optional[str] = None,
+        limit: Optional[int] = None,
+        timestamp_format: str = "datetime"
+    ) -> pd.DataFrame:
+        """
+        Load imbalance bars from database.
+
+        Args:
+            symbol: Stock ticker
+            start: Start timestamp (ISO string, datetime, or epoch ms)
+            end: End timestamp (ISO string, datetime, or epoch ms)
+            limit: Maximum number of bars to return
+            timestamp_format: "datetime", "iso", or "epoch_ms"
+
+        Returns:
+            DataFrame indexed by bar_end with OHLCV columns.
+        """
+        conn = self._get_connection()
+        cursor = conn.cursor()
+
+        query = """
+            SELECT bar_start, bar_end, open, high, low, close, volume, tick_count, imbalance
+            FROM imbalance_bars
+            WHERE symbol = ?
+        """
+        params = [symbol]
+
+        if start:
+            query += " AND bar_end >= ?"
+            params.append(to_epoch_ms(start))
+        if end:
+            query += " AND bar_end <= ?"
+            params.append(to_epoch_ms(end))
+
+        query += " ORDER BY bar_end ASC"
+        if limit:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+
+        if not rows:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(rows, columns=[
+            "bar_start", "bar_end", "open", "high", "low", "close",
+            "volume", "tick_count", "imbalance"
+        ])
+
+        if timestamp_format == "epoch_ms":
+            df.set_index("bar_end", inplace=True)
+        elif timestamp_format == "iso":
+            df["bar_end"] = df["bar_end"].apply(lambda x: epoch_ms_to_datetime(x).isoformat())
+            df.set_index("bar_end", inplace=True)
+        elif timestamp_format == "datetime":
+            df["bar_end"] = df["bar_end"].apply(epoch_ms_to_datetime)
+            df.set_index("bar_end", inplace=True)
+        else:
+            raise ValueError(f"Unsupported timestamp_format: {timestamp_format}")
+
+        return df
 
     def close(self):
         """

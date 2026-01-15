@@ -10,10 +10,10 @@ Why Tick Imbalance Bars?
 - Result: More homogeneous returns, better for machine learning
 
 Algorithm:
-1. Classify each tick: buy (+1) if price > prev_price, sell (-1) if price < prev_price
-2. Track cumulative imbalance: θ = sum of tick classifications
-3. Sample new bar when |θ| >= expected threshold
-4. Update expected values with exponential smoothing
+1. Classify each tick with the tick rule: buy (+1) or sell (-1)
+2. Track signed imbalance using tick rule * size
+3. Sample a bar when |imbalance| >= expected imbalance (EWMA)
+4. Update expected imbalance with exponential smoothing
 
 OOP Concepts:
 - Class with state: Tracks current bar being built
@@ -44,11 +44,11 @@ class TickImbalanceBarGenerator:
     Attributes:
         threshold (float): Imbalance threshold for sampling bars
         current_bar (Dict): Bar currently being built
-        cumulative_imbalance (float): Running sum of tick classifications
+        cumulative_imbalance (float): Running sum of signed size imbalance
         prev_price (float): Previous tick price (for classification)
         prev_direction (int): Previous tick direction (+1 or -1)
         ewma_alpha (float): Exponential smoothing factor (0-1)
-        expected_imbalance (float): Expected imbalance per bar (updated with EWMA)
+        expected_imbalance (float): Expected absolute imbalance per bar (EWMA)
 
     Example:
         >>> generator = TickImbalanceBarGenerator(threshold=100.0)
@@ -87,9 +87,9 @@ class TickImbalanceBarGenerator:
         # Current bar being built
         self.current_bar = None
 
-        # Imbalance tracking
+        # Imbalance tracking (signed size)
         self.cumulative_imbalance = 0.0
-        self.expected_imbalance = threshold  # Will adapt over time
+        self.expected_imbalance = threshold  # EWMA target (absolute)
 
         # Tick classification state
         self.prev_price = None
@@ -187,8 +187,9 @@ class TickImbalanceBarGenerator:
         # Classify tick
         direction = self._classify_tick(price)
 
-        # Update cumulative imbalance
-        self.cumulative_imbalance += direction
+        # Update cumulative imbalance (signed size)
+        signed_size = direction * size
+        self.cumulative_imbalance += signed_size
 
         # Initialize or update current bar
         if self.current_bar is None:
@@ -202,8 +203,8 @@ class TickImbalanceBarGenerator:
                 'close': price,
                 'volume': size,
                 'tick_count': 1,
-                'buy_ticks': 1 if direction == 1 else 0,
-                'sell_ticks': 1 if direction == -1 else 0
+                'buy_volume': size if direction == 1 else 0,
+                'sell_volume': size if direction == -1 else 0
             }
         else:
             # Update existing bar
@@ -214,12 +215,12 @@ class TickImbalanceBarGenerator:
             self.current_bar['volume'] += size
             self.current_bar['tick_count'] += 1
             if direction == 1:
-                self.current_bar['buy_ticks'] += 1
+                self.current_bar['buy_volume'] += size
             else:
-                self.current_bar['sell_ticks'] += 1
+                self.current_bar['sell_volume'] += size
 
         # Check if threshold exceeded
-        if abs(self.cumulative_imbalance) >= self.threshold:
+        if abs(self.cumulative_imbalance) >= self.expected_imbalance:
             # Threshold exceeded - sample this bar
             completed_bar = self._complete_bar()
 
@@ -257,13 +258,9 @@ class TickImbalanceBarGenerator:
         if self.current_bar is None:
             raise ValueError("No current bar to complete")
 
-        # Calculate imbalance for this bar
-        # Imbalance = (buy_ticks - sell_ticks) / tick_count
-        # Range: -1 (all sells) to +1 (all buys)
-        imbalance = (
-            (self.current_bar['buy_ticks'] - self.current_bar['sell_ticks']) /
-            self.current_bar['tick_count']
-        )
+        total_volume = self.current_bar['buy_volume'] + self.current_bar['sell_volume']
+        signed_volume = self.current_bar['buy_volume'] - self.current_bar['sell_volume']
+        imbalance = signed_volume / total_volume if total_volume else 0.0
 
         # Create final bar dict
         completed_bar = {
@@ -310,6 +307,7 @@ class TickImbalanceBarGenerator:
         self.cumulative_imbalance = 0.0
         self.prev_price = None
         self.prev_direction = 1
+        self.expected_imbalance = self.threshold
 
         logger.debug("Generator state reset")
 
@@ -329,7 +327,7 @@ class TickImbalanceBarGenerator:
         return {
             'total_bars': self.total_bars_generated,
             'total_ticks': self.total_ticks_processed,
-            'current_threshold': self.threshold,
+            'current_threshold': self.expected_imbalance,
             'expected_imbalance': self.expected_imbalance,
             'ticks_in_current_bar': self.current_bar['tick_count'] if self.current_bar else 0,
             'current_imbalance': self.cumulative_imbalance
@@ -338,7 +336,8 @@ class TickImbalanceBarGenerator:
 
 def generate_bars_from_ticks(
     ticks: List[Tuple[str, float, int]],
-    threshold: float = 100.0
+    threshold: float = 100.0,
+    ewma_alpha: float = 0.05
 ) -> List[Dict]:
     """
     Convenience function to generate bars from a list of ticks.
@@ -349,7 +348,8 @@ def generate_bars_from_ticks(
 
     Args:
         ticks: List of (timestamp, price, size) tuples
-        threshold: Imbalance threshold
+        threshold: Initial imbalance threshold
+        ewma_alpha: EWMA smoothing factor for threshold adaptation
 
     Returns:
         List of bar dictionaries
@@ -363,7 +363,7 @@ def generate_bars_from_ticks(
         >>> bars = generate_bars_from_ticks(ticks, threshold=100.0)
         >>> print(f"Generated {len(bars)} bars from {len(ticks)} ticks")
     """
-    generator = TickImbalanceBarGenerator(threshold=threshold)
+    generator = TickImbalanceBarGenerator(threshold=threshold, ewma_alpha=ewma_alpha)
     bars = []
 
     for timestamp, price, size in ticks:

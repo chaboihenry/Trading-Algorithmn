@@ -12,18 +12,36 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 # S3 bucket configuration (configurable via environment)
-S3_BUCKET = os.environ.get("MODEL_BUCKET", "risklabai-models")
-S3_REGION = os.environ.get("MODEL_REGION", "us-east-1")
-MODELS_DIR = Path(os.environ.get("MODELS_PATH", "/app/models"))
+try:
+    from config.aws_config import S3_MODEL_BUCKET, AWS_REGION, is_aws_configured
+except Exception:
+    S3_MODEL_BUCKET = None
+    AWS_REGION = None
+    is_aws_configured = lambda: False  # noqa: E731
+
+S3_BUCKET = (
+    os.environ.get("MODEL_BUCKET")
+    or os.environ.get("S3_MODEL_BUCKET")
+    or S3_MODEL_BUCKET
+    or "risklabai-models"
+)
+S3_REGION = (
+    os.environ.get("MODEL_REGION")
+    or os.environ.get("AWS_REGION")
+    or AWS_REGION
+    or "us-east-1"
+)
+MODELS_DIR = Path(os.environ.get("MODELS_PATH", "models"))
 
 
-def download_models(symbols: list = None, force: bool = False) -> int:
+def download_models(symbols: list = None, force: bool = False, require_s3: bool = False) -> int:
     """
     Download models from S3 if they don't exist locally.
     
     Args:
         symbols: List of symbols to download models for (None = all)
         force: If True, download even if local file exists
+        require_s3: If True, raise if S3 access isn't available
         
     Returns:
         Number of models downloaded
@@ -34,21 +52,29 @@ def download_models(symbols: list = None, force: bool = False) -> int:
         from botocore import UNSIGNED
         from botocore.config import Config
     except ImportError:
-        logger.warning(
+        message = (
             "boto3 not installed. Install with: pip install boto3\n"
             "Skipping model download - using local models only."
         )
+        if require_s3:
+            raise RuntimeError(message)
+        logger.warning(message)
         return 0
     
     # Create models directory if it doesn't exist
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Connect to S3 (no credentials needed for public bucket)
-    s3 = boto3.client(
-        's3',
-        region_name=S3_REGION,
-        config=Config(signature_version=UNSIGNED)  # Public bucket, no auth needed
-    )
+
+    use_signed = is_aws_configured()
+    if use_signed:
+        logger.info("Using signed S3 client (AWS credentials detected)")
+        s3 = boto3.client("s3", region_name=S3_REGION)
+    else:
+        logger.info("Using unsigned S3 client (public bucket access)")
+        s3 = boto3.client(
+            "s3",
+            region_name=S3_REGION,
+            config=Config(signature_version=UNSIGNED)
+        )
     
     downloaded = 0
     

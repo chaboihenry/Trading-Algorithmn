@@ -23,16 +23,15 @@ Triple Barrier Labeling Parameters:
 
 IMPORTANT - These are NOT percentages, they are MULTIPLIERS:
 ------------------------------------------------------------
-❌ WRONG: profit_taking_mult=2.0 means "2% profit target"
-✓ CORRECT: profit_taking_mult=2.0 means "2 × daily_volatility profit target"
+profit_taking_mult=2.0 means "2 x daily_volatility profit target"
 
 Example with 1% daily volatility:
-- profit_taking_mult = 2.0 → profit barrier at +2.0% (2 × 1%)
-- stop_loss_mult = 2.0     → loss barrier at -2.0% (2 × 1%)
+- profit_taking_mult = 2.0 → profit barrier at +2.0% (2 x 1%)
+- stop_loss_mult = 2.0     → loss barrier at -2.0% (2 x 1%)
 
 Example with 3% daily volatility (volatile market):
-- profit_taking_mult = 2.0 → profit barrier at +6.0% (2 × 3%)
-- stop_loss_mult = 2.0     → loss barrier at -6.0% (2 × 3%)
+- profit_taking_mult = 2.0 → profit barrier at +6.0% (2 x 3%)
+- stop_loss_mult = 2.0     → loss barrier at -6.0% (2 x 3%)
 
 This adaptive approach is superior because:
 1. Barriers automatically widen in volatile markets (avoiding noise)
@@ -41,14 +40,7 @@ This adaptive approach is superior because:
 
 Understanding max_holding_period:
 ---------------------------------
-This parameter controls how long we wait before giving up (neutral label).
-
-Impact on label distribution:
-- max_holding_period = 10  → ~52% neutral (too many timeouts)
-- max_holding_period = 30  → ~30-35% neutral (optimal balance)
-- max_holding_period = 100 → ~10% neutral (signals become stale)
-
-Rule of thumb: Neutral rate should be 30-35% for healthy model training.
+This parameter controls how long we wait before giving up (neutral label). A shorter period may lead to more neutral labels as there's less time for prices to hit the profit-taking or stop-loss barriers.
 ================================================================================
 """
 
@@ -318,9 +310,9 @@ class TripleBarrierLabeler:
             # Calculate and log label distribution percentages
             if 'bin' in labels.columns and len(labels) > 0:
                 n_total = len(labels)
-                n_long = (labels['bin'] == 1).sum()
-                n_short = (labels['bin'] == -1).sum()
-                n_neutral = (labels['bin'] == 0).sum()
+                n_long = (labels["bin"] == 1).sum()
+                n_short = (labels["bin"] == -1).sum()
+                n_neutral = (labels["bin"] == 0).sum()
 
                 logger.info("")
                 logger.info("=" * 60)
@@ -334,31 +326,7 @@ class TripleBarrierLabeler:
 
                 # Warn if neutral rate is too high
                 neutral_pct = n_neutral / n_total
-                if neutral_pct > 0.40:
-                    logger.warning("")
-                    logger.warning("⚠️  HIGH NEUTRAL LABEL RATE DETECTED")
-                    logger.warning(f"    Current: {neutral_pct*100:.1f}% neutral labels")
-                    logger.warning(f"    Target:  30-35% neutral labels")
-                    logger.warning(f"    Current max_holding_period: {self.max_holding_period} bars")
-                    logger.warning("")
-                    logger.warning("    RECOMMENDATION: Increase max_holding_period to give")
-                    logger.warning("    positions more time to hit profit/loss barriers.")
-                    logger.warning(f"    Try: max_holding_period = {self.max_holding_period * 2} bars")
-                    logger.warning("")
-                elif neutral_pct < 0.20:
-                    logger.warning("")
-                    logger.warning("⚠️  LOW NEUTRAL LABEL RATE DETECTED")
-                    logger.warning(f"    Current: {neutral_pct*100:.1f}% neutral labels")
-                    logger.warning(f"    Target:  30-35% neutral labels")
-                    logger.warning(f"    Current max_holding_period: {self.max_holding_period} bars")
-                    logger.warning("")
-                    logger.warning("    RECOMMENDATION: Decrease max_holding_period to avoid")
-                    logger.warning("    holding stale positions too long.")
-                    logger.warning(f"    Try: max_holding_period = {max(10, self.max_holding_period // 2)} bars")
-                    logger.warning("")
-                else:
-                    logger.info(f"✓ Good neutral label rate: {neutral_pct*100:.1f}% (target: 30-35%)")
-
+                
             return labels
 
         except Exception as e:

@@ -53,7 +53,7 @@ This isn't your typical moving-average bot. This system implements **institution
 - ✅ Works with or without tick database (auto-detects availability)
 - ✅ Docker-ready for any environment
 - ✅ Environment variables for all configuration
-- ✅ Models download automatically from GitHub releases
+- ✅ Models download automatically from S3 (with local cache)
 
 ---
 
@@ -113,33 +113,33 @@ This isn't your typical moving-average bot. This system implements **institution
 │   └── risklabai_combined.py        # Lumibot integration
 │
 ├── 📂 data/                         # Market data pipeline
+│   ├── model_storage.py             # Local + S3 model persistence
 │   ├── tick_storage.py              # SQLite tick database
 │   ├── tick_to_bars.py              # Imbalance bar generator
 │   └── alpaca_tick_client.py        # Real-time data fetching
 │
 ├── 📂 config/                       # Configuration
-│   ├── tick_config.py               # Optimal parameters
-│   └── all_symbols.py               # Symbol universe (tier_1-5)
+│   ├── tick_config.py               # Tick DB + trading parameters
+│   ├── universe.py                  # Universe builder
+│   ├── all_symbols.py               # Symbol universe (tier_1-5)
+│   └── liquidity_tiers.py           # Tiering + backfill rules
 │
-├── 📂 scripts/                      # Setup & Research Tools
-│   ├── setup/                       # Production setup scripts
-│   │   ├── master_setup.py          # End-to-end orchestration
-│   │   ├── fetch_all_symbols.py     # Symbol universe builder
-│   │   ├── backfill_ticks.py        # Historical data downloader
-│   │   ├── train_all_symbols.py     # Multi-symbol model training
-│   │   └── init_tick_tables.py      # Database initialization
-│   └── research/                    # Optimization & calibration
-│       ├── find_optimal_d.py        # Fractional differencing calibration
-│       ├── calibrate_threshold.py   # Tick bar threshold tuning
-│       ├── parameter_sweep_parallel.py  # Grid search optimization
-│       └── apply_optimal_params.py  # Best parameter results
+├── 📂 scripts/                      # Data + training pipeline
+│   ├── init_tick_tables.py          # DB initialization
+│   ├── migrate_tick_timestamps.py   # Epoch-ms migration
+│   ├── backfill_ticks.py            # Historical tick backfill
+│   ├── build_bars.py                # Imbalance bar builder
+│   ├── train_models.py              # Model training (per symbol)
+│   └── evaluate_backtest.py         # OOS backtest
 │
-├── 📂 test_suite/                   # Validation & backtesting
-│   ├── backtest_multi_symbol.py     # Comprehensive backtest
-│   └── test_prediction_logic.py     # Unit tests
+├── 📂 tests/                        # Unit tests
+│   ├── test_tick_storage.py
+│   ├── test_tick_to_bars.py
+│   ├── test_triple_barrier.py
+│   └── test_leakage_split.py
 │
-├── 📂 models/                       # Trained ML models (99 symbols)
-└── 📜 run_live_trading.py           # Main entry point
+├── 📜 run_live_trading.py           # Main entry point
+└── 📜 docker-compose.yml            # Container entry
 ```
 
 ---
@@ -209,16 +209,38 @@ ALPACA_API_SECRET=your_secret_here
 DATA_PATH=./data  # Optional: for tick data storage
 ```
 
-### Training Models
-
-Train models on historical tick data:
+## ✅ How to Run (Backfill → Bars → Train → Backtest → Live)
 
 ```bash
-# Train all tier_1 symbols (99 models, ~20-30 minutes)
-python scripts/setup/train_all_symbols.py --tier tier_1
+# 1. Initialize the tick database
+python -m scripts.init_tick_tables
+
+# 2. Backfill ticks (tier or single symbol)
+python -m scripts.backfill_ticks --tier tier_1 --max-symbols 50
+
+# 3. Build imbalance bars from ticks
+python -m scripts.build_bars --tier tier_1 --max-symbols 50
+
+# 4. Train models and upload to S3
+python -m scripts.train_models --tier tier_1 --max-symbols 50
+
+# 5. Evaluate out-of-sample backtest
+python -m scripts.evaluate_backtest --tier tier_1 --max-symbols 50 --cost-bps 1 --slippage-bps 1
+
+# 6. Run live (paper) trading
+python run_live_trading.py
+```
+
+### Training Models
+
+Train models from stored imbalance bars (after backfill + build):
+
+```bash
+# Train tier_1 models
+python -m scripts.train_models --tier tier_1
 
 # Train specific symbols
-python scripts/setup/train_all_symbols.py --symbols AAPL MSFT GOOGL
+python -m scripts.train_models --symbols AAPL,MSFT,GOOGL
 ```
 
 **Training Output:**
@@ -235,14 +257,13 @@ python scripts/setup/train_all_symbols.py --symbols AAPL MSFT GOOGL
 Validate strategy performance on unseen test data:
 
 ```bash
-# Backtest tier_1 symbols (uses held-out 30% test data)
-python test_suite/backtest_multi_symbol.py --tier tier_1
+# Backtest tier_1 symbols (uses held-out test data)
+python -m scripts.evaluate_backtest --tier tier_1
 
 # Custom parameters
-python test_suite/backtest_multi_symbol.py --tier tier_1 \
-    --capital 100000 \
-    --bars 1000 \
-    --kelly 0.1
+python -m scripts.evaluate_backtest --symbol SPY \
+    --cost-bps 1 \
+    --slippage-bps 1
 ```
 
 **Backtest Results:**
@@ -474,32 +495,28 @@ This ensures backtest results reflect **true out-of-sample performance**.
 
 ## 🧪 Testing & Validation
 
-### Test Suite
+### Unit Tests
 
 ```bash
 # Run all tests
-python test_suite/test_prediction_logic.py
+python -m unittest discover tests
 ```
 
 **Tests:**
-- ✅ Probability margin filtering (3% threshold)
-- ✅ Model loading & initialization
-- ✅ Feature generation pipeline
-- ✅ Signal mapping (2-class & 3-class models)
-- ✅ Position sizing calculations
+- ✅ Tick storage idempotency + epoch timestamps
+- ✅ Imbalance bar generation (EWMA threshold)
+- ✅ Triple-barrier labeling correctness
+- ✅ Leakage-aware split logic
 
-### Comprehensive Backtest
+### Backtest
 
 ```bash
-python test_suite/backtest_multi_symbol.py --tier tier_1
+python scripts/evaluate_backtest.py --tier tier_1
 ```
 
 **Validates:**
-- Multi-symbol portfolio simulation
-- Realistic order execution (next bar's open)
-- Kelly Criterion position sizing
-- Stop-loss & take-profit mechanics
-- Train/test split integrity
+- Out-of-sample performance with transaction costs
+- Leakage-aware train/test separation
 
 ---
 

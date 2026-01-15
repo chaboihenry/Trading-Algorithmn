@@ -4,7 +4,6 @@ Purged K-Fold Cross-Validation using RiskLabAI
 Prevents information leakage by purging overlapping samples.
 """
 
-from RiskLabAI.backtest.validation.purged_kfold import PurgedKFold as RiskLabPurgedKFold
 import pandas as pd
 import numpy as np
 from typing import Optional, Union, Dict, Iterator, Tuple
@@ -12,6 +11,19 @@ import logging
 from sklearn.metrics import get_scorer
 
 logger = logging.getLogger(__name__)
+
+
+def _get_risklab_purged_kfold():
+    try:
+        from RiskLabAI.backtest.validation.purged_kfold import (
+            PurgedKFold as RiskLabPurgedKFold
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "RiskLabAI PurgedKFold is required for this operation. "
+            "Install the RiskLabAI package or use iter_time_block_splits."
+        ) from exc
+    return RiskLabPurgedKFold
 
 
 class PurgedCrossValidator:
@@ -74,6 +86,7 @@ class PurgedCrossValidator:
         else:
             times = samples_info
 
+        RiskLabPurgedKFold = _get_risklab_purged_kfold()
         cv = RiskLabPurgedKFold(
             n_splits=self.n_splits,
             times=times,
@@ -132,7 +145,7 @@ class PurgedCrossValidator:
         """
         Generate time-contiguous splits and purge overlaps to reduce leakage.
 
-        This avoids stratified shuffling, which can make test windows span
+        This avoids random shuffling, which can make test windows span
         most of the timeline and purge nearly all training samples.
         """
         if isinstance(samples_info, pd.DataFrame):
@@ -205,7 +218,7 @@ class PurgedCrossValidator:
         """
         return self._time_block_purged_splits(X, y, samples_info)
 
-    def cross_val_score_purged_stratified(
+    def cross_val_score_purged_timeblock(
         self,
         model,
         X: pd.DataFrame,
@@ -267,7 +280,7 @@ class PurgedCrossValidator:
 
         scores = np.array(scores)
         if len(scores) == 0:
-            raise ValueError("All stratified purged folds were skipped due to missing classes.")
+            raise ValueError("All time-blocked purged folds were skipped due to missing classes.")
 
         logger.info(f"CV {scoring}: {scores.mean():.4f} ± {scores.std():.4f} (skipped: {skipped})")
         return scores
