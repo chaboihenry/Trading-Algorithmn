@@ -2,23 +2,21 @@ import sys
 import os
 import time
 import sqlite3
-from datetime import date, timedelta, datetime
+from datetime import date, timedelta
 import alpaca_trade_api as tradeapi
 
 # --- PATH SETUP ---
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
 sys.path.append(project_root)
 
-# --- IMPORTS ---
 import tick_storage
+from utils.market_calendar import is_trading_day
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, DB_PATH
 
 # --- API CONNECTION ---
-# We use the REST object. 
 api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url='https://paper-api.alpaca.markets')
 
 def get_symbols():
-    """Get all symbols from the DB, regardless of status."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("SELECT symbol FROM backfill_status")
@@ -30,58 +28,65 @@ def run_backfill():
     print(f"Connecting to DB at: {DB_PATH}")
     symbols = get_symbols()
     
-    # Define Date Range: 1 Year
-    end_date = date.today() - timedelta(days=1)  # Yesterday
-    start_date = end_date - timedelta(days=365)  # 1 Year ago
+    # --- CONFIG: 90 DAYS ---
+    end_date = date.today() - timedelta(days=1)
+    start_date = end_date - timedelta(days=90)
 
     print(f"Backfilling {len(symbols)} symbols.")
-    print(f"Range: {start_date} to {end_date}")
+    print(f"Window: {start_date} to {end_date}")
 
     for symbol in symbols:
         print(f"\n=== Processing {symbol} ===")
         
-        # Iterate through each day
         current_date = start_date
         while current_date <= end_date:
             
-            # Skip weekends
-            if current_date.weekday() < 5:
-                date_str = current_date.isoformat()
-                
-                try:
-                    # fetch trades
-                    # We use limit=10000. If QQQ has more, this grabs the first 10k. 
-                    # To get ALL ticks for QQQ requires complex pagination, but this 
-                    # is the simple, standard approach for a basic backfill.
-                    trades = api.get_trades(symbol, start=date_str, end=date_str, limit=10000)
+            # --- SMART CALENDAR CHECK ---
+            if not is_trading_day(current_date):
+                current_date += timedelta(days=1)
+                continue
 
-                    # 'trades' is an iterable object in the new SDK
-                    # We convert to list to check if empty
-                    trades_list = [t for t in trades]
-
-                    if trades_list:
-                        tick_storage.save_ticks(symbol, trades_list)
-                    else:
-                        # No data for this day (holiday or inactive)
-                        pass
-
-                except Exception as e:
-                    print(f"Error on {date_str} for {symbol}: {e}")
-                    time.sleep(1) 
-
-                # Sleep to prevent hitting API rate limits too hard
-                time.sleep(0.2)
+            date_str = current_date.isoformat()
+            print(f"   -> {date_str}: Fetching...", end="", flush=True)
             
-            # Move to next day
+            try:
+                # Ask for effectively unlimited trades (limit=10,000,000)
+                # The library will auto-paginate in chunks of 10k in the background.
+                trades_iter = api.get_trades(symbol, start=date_str, end=date_str, limit=10_000_000)
+                
+                batch = []
+                total_ticks_day = 0
+                
+                # Iterate through the stream of trades
+                for trade in trades_iter:
+                    batch.append(trade)
+                    
+                    # When batch hits 10k, save it
+                    if len(batch) >= 10000:
+                        tick_storage.save_ticks(symbol, batch)
+                        total_ticks_day += len(batch)
+                        print(".", end="", flush=True) # Visual progress
+                        batch = [] # Reset batch
+
+                # Save any remaining trades at the end of the day
+                if batch:
+                    tick_storage.save_ticks(symbol, batch)
+                    total_ticks_day += len(batch)
+                
+                print(f" Done. ({total_ticks_day} ticks)")
+
+            except Exception as e:
+                print(f"\n      Error on {date_str}: {e}")
+                time.sleep(1) # Back off slightly on error
+            
             current_date += timedelta(days=1)
         
-        print(f"Finished {symbol}")
-        
-        # Mark as completed in DB
+        # Mark Symbol Complete in DB
         conn = sqlite3.connect(DB_PATH)
         conn.execute("UPDATE backfill_status SET status = 'completed', last_backfilled_date = ? WHERE symbol = ?", (date.today(), symbol))
         conn.commit()
         conn.close()
+        print(f"Finished {symbol}")
 
 if __name__ == "__main__":
     run_backfill()
