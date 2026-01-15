@@ -1,46 +1,56 @@
 import sqlite3
+import sys
+import os
 
-DB_PATH = "market_data.db"
+# --- PATH SETUP ---
+# Database is one level up in the project root (or on Vault via symlink/config)
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
+sys.path.append(project_root)
 
-def save_ticks_to_db(symbol, ticks_data):
+from config.settings import DB_PATH
+
+def save_ticks(symbol, ticks):
     """
-    Saves a list of tick dictionaries to the specific table for that symbol.
+    Saves a list of Alpaca Trade objects to the database.
+    Uses Alpaca V2 single-letter attributes: t (time), p (price), s (size), c (cond), x (exchange)
     """
-    if not ticks_data:
-        print(f"[{symbol}] No data to save.")
+    if not ticks:
         return
 
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
 
-    # Determine table name dynamically
-    safe_symbol = symbol.replace(".", "_").replace("-", "_")
+    safe_symbol = symbol.replace('.', '_').replace('-', '_')
     table_name = f"ticks_{safe_symbol}"
 
-    # Prepare data for insertion
-    # Maps Polygon keys to DB columns: (symbol, timestamp, price, volume, conditions, tape)
-    formatted_data = []
-    for t in ticks_data:
-        ts = t.get('t')            # Timestamp
-        price = t.get('p')         # Price
-        size = t.get('s')          # Size/Volume
-        cond = str(t.get('c', [])) # Conditions (list to string)
-        tape = t.get('z', '')      # Tape
+    data_tuples = []
+    
+    for t in ticks:
+        # Map Alpaca V2 attributes to DB columns
+        # t.t -> Timestamp (usually a pandas Timestamp object)
+        # t.p -> Price
+        # t.s -> Size (Volume)
+        # t.c -> Conditions (list)
+        # t.x -> Exchange (Tape)
         
-        formatted_data.append((symbol, ts, price, size, cond, tape))
+        # We use .isoformat() on the timestamp to make it safe for SQLite
+        data_tuples.append((
+            t.t.isoformat(),
+            t.p,
+            t.s,
+            ",".join(t.c) if t.c else "",
+            t.x
+        ))
 
-    try:
-        # Bulk insert is very fast
-        cursor.executemany(f"""
-            INSERT INTO {table_name} (symbol, timestamp, price, volume, conditions, tape)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, formatted_data)
-        
-        conn.commit()
-        print(f"[{symbol}] Saved {cursor.rowcount} ticks to table '{table_name}'.")
-
-    except sqlite3.OperationalError as e:
-        print(f"[{symbol}] Database Error: {e}")
-        print(f"Hint: Did you run init_tick_tables.py? Table '{table_name}' might be missing.")
-    finally:
-        conn.close()
+    # Bulk Insert
+    # No try/except blocks here; if the DB is locked or broken, we want to know immediately.
+    query = f"""
+        INSERT INTO {table_name} (timestamp, price, volume, conditions, tape)
+        VALUES (?, ?, ?, ?, ?)
+    """
+    
+    cursor.executemany(query, data_tuples)
+    conn.commit()
+    conn.close()
+    
+    print(f"[{symbol}] Saved {len(ticks)} ticks to Vault.")
