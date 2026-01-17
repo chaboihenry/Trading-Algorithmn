@@ -51,7 +51,7 @@ class TripleBarrierLabeler:
             
         vol = self.get_volatility(close)
         
-        # Vertical Barrier (Time Limit)
+        # 1. Vertical Barrier (Time Limit)
         if 't1' not in events.columns:
             events['t1'] = vertical_barrier(
                 close=close, 
@@ -59,12 +59,20 @@ class TripleBarrierLabeler:
                 number_days=self.max_holding
             )
 
+        # 2. Prepare events dataframe
         events_ready = events[['t1']].copy()
-        events_ready['trgt'] = vol.loc[events_ready.index]
+        
+        # FIX 1: Alias columns for RiskLabAI compatibility
+        events_ready['End Time'] = events_ready['t1']  
+        vol_target = vol.loc[events_ready.index]
+        events_ready['trgt'] = vol_target
+        events_ready['Base Width'] = vol_target
+        
         events_ready = events_ready.dropna()
 
         ptsl = [self.pt_mult, self.sl_mult]
         
+        # 3. Apply Triple Barrier
         labels = triple_barrier(
             close=close,
             events=events_ready,
@@ -72,7 +80,25 @@ class TripleBarrierLabeler:
             molecule=list(events_ready.index)
         )
         
-        # Ensure 'bin' column exists and preserve Neutral class (0)
+        # FIX 2: Ensure 'ret' (Return) column exists
+        if 'ret' not in labels.columns:
+            # We must calculate returns manually: (Price_End / Price_Start) - 1
+            
+            # Determine End Time (Barrier Touch)
+            if 't1' in labels.columns:
+                touch_times = labels['t1']
+            else:
+                # Fallback to vertical barrier if not returned
+                touch_times = events_ready.loc[labels.index, 't1']
+            
+            # Get Prices
+            p_start = close.loc[labels.index]
+            p_end = close.loc[touch_times]
+            
+            # Align values for calculation
+            labels['ret'] = (p_end.values / p_start.values) - 1
+
+        # FIX 3: Ensure 'bin' (Label) column exists
         if 'bin' not in labels.columns:
             labels['bin'] = 0
             target_vol = events_ready.loc[labels.index, 'trgt']
@@ -80,10 +106,16 @@ class TripleBarrierLabeler:
             upper = target_vol * self.pt_mult
             lower = -target_vol * self.sl_mult
             
+            # Now safe to access 'ret'
             labels.loc[labels['ret'] > upper, 'bin'] = 1
             labels.loc[labels['ret'] < lower, 'bin'] = -1
 
         labels['bin'] = labels['bin'].fillna(0).astype(int)
+        
+        # Ensure t1 is preserved for PurgedKFold
+        if 't1' not in labels.columns:
+            labels['t1'] = events_ready.loc[labels.index, 't1']
+            
         return labels
 
 
@@ -105,18 +137,10 @@ class FractionalDifferentiator:
 
 
 class AdvancedFeatures:
-    """
-    Institutional-grade features for robust model training.
-    """
     @staticmethod
     def get_entropy(series: pd.Series, window=20) -> pd.Series:
-        """
-        Calculates Rolling Shannon Entropy.
-        High entropy indicates market chaos/crash risk.
-        """
         def _calc(window_data):
             try:
-                # Discretize data into bins to form a "message"
                 bins = pd.qcut(window_data, q=5, labels=False, duplicates='drop')
                 message = "".join(map(str, bins))
                 return shannon_entropy(message)
@@ -127,42 +151,25 @@ class AdvancedFeatures:
 
     @staticmethod
     def get_regime(close: pd.Series, window=50) -> pd.Series:
-        """
-        Detects Market Regime: 1 (Safe/Bull), -1 (Risk/Bear).
-        Uses Volatility and Trend logic to filter trades during crashes.
-        """
-        # 1. Volatility Regime
         returns = close.pct_change()
         vol = returns.rolling(window=window).std()
         avg_vol = vol.rolling(window=window*2).mean()
         
-        # 2. Trend Regime
         ma_fast = close.rolling(window=int(window/2)).mean()
         ma_slow = close.rolling(window=window).mean()
         
         regime = pd.Series(0, index=close.index)
-        
-        # Safe: Low Vol + Uptrend
         regime[(vol < avg_vol) & (ma_fast > ma_slow)] = 1
-        
-        # Risky: High Vol OR Downtrend
         regime[(vol > avg_vol) | (ma_fast < ma_slow)] = -1
-        
         return regime
 
 
 class ModelTuner:
-    """
-    Hyperparameter tuning using Purged Cross-Validation.
-    """
     def __init__(self, n_splits=5, embargo_pct=0.01):
         self.cv_engine = PurgedCrossValidator(n_splits, embargo_pct)
 
     def tune(self, model, X, y, t1, param_grid):
-        # Generate the purged CV splits
         cv_gen = self.cv_engine.get_cv(t1)
-        
-        # Grid Search with F1 score (balance precision/recall)
         search = GridSearchCV(
             estimator=model,
             param_grid=param_grid,

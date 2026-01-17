@@ -86,9 +86,19 @@ class RiskLabAIModel:
         df['ma_slow'] = df['close'].rolling(50).mean()
         df['trend_strength'] = (df['ma_fast'] - df['ma_slow']) / df['ma_slow']
 
-        # Cleanup
+        # Cleanup: Remove NaNs
         df = df.replace([np.inf, -np.inf], np.nan).dropna()
-        self.feature_names = [c for c in df.columns if c not in ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'regime']]
+        
+        # 7. CRITICAL FIX: Explicitly exclude 'bar_start' and any other non-numeric columns
+        # Random Forest will crash if it sees a Timestamp object.
+        excluded_cols = [
+            'timestamp', 'bar_start', 'bar_end', 
+            'open', 'high', 'low', 'close', 'volume', 'vwap', 
+            'regime'  # Exclude regime from training features (it's a filter, not a feature)
+        ]
+        
+        self.feature_names = [c for c in df.columns if c not in excluded_cols]
+        
         return df
 
     def train_from_ticks(self, symbol: str, min_samples=200, tune=False) -> Dict:

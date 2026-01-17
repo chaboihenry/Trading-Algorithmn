@@ -61,13 +61,12 @@ class TickStorage:
         cursor.execute(f"CREATE INDEX IF NOT EXISTS idx_{safe_symbol}_ts ON {table_name} (timestamp)")
 
         # 2. Prepare data generator (Memory Efficient)
-        # We process objects into tuples here
         data_tuples = []
         for t in ticks:
-            # Handle Timestamp
+            # Handle Timestamp (ensure ISO format)
             ts = t.t.isoformat() if hasattr(t.t, 'isoformat') else str(t.t)
             
-            # Handle Conditions (list -> string)
+            # Handle Conditions
             if hasattr(t, 'c') and isinstance(t.c, list):
                 cond = ",".join(t.c)
             elif hasattr(t, 'c'):
@@ -89,7 +88,6 @@ class TickStorage:
     def load_ticks(self, symbol, start_date=None, end_date=None) -> pd.DataFrame:
         """
         Loads ticks directly into a Pandas DataFrame.
-        This enables 50x faster processing by avoiding Python lists/tuples.
         """
         self._connect()
         
@@ -116,19 +114,19 @@ class TickStorage:
         query += " ORDER BY timestamp ASC"
         
         # OPTIMIZATION: Use pandas read_sql
-        # This executes in C and returns a ready-to-use DataFrame
         df = pd.read_sql_query(query, self.conn, params=params)
         
-        # Ensure timestamp is datetime (helpful for indexing later)
+        # FIX: Handle mixed ISO formats (with/without microseconds/Z)
         if not df.empty:
-            df['timestamp'] = pd.to_datetime(df['timestamp'])
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'], format='mixed')
+            except Exception as e:
+                # Fallback if mixed fails (rare)
+                df['timestamp'] = pd.to_datetime(df['timestamp'], infer_datetime_format=True)
         
         return df
 
 # --- Standalone wrapper for backfill scripts ---
 def save_ticks(symbol, ticks):
-    """
-    Wrapper so existing scripts calling save_ticks(sym, data) don't break.
-    """
     storage = TickStorage()
     storage.save_ticks(symbol, ticks)
