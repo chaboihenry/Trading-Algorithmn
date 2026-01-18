@@ -8,6 +8,14 @@ from typing import Dict, Tuple
 from lumibot.strategies.strategy import Strategy
 from lumibot.entities import Asset
 
+# --- ML Imports ---
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.impute import SimpleImputer
+from sklearn.base import clone
+
 # --- RiskLabAI Integration ---
 from utils.financial_ml import (
     CUSUMEventFilter, 
@@ -20,13 +28,6 @@ from utils.financial_ml import (
     FeatureImportance,
     HRPPortfolio
 )
-
-from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
-from sklearn.tree import DecisionTreeClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.base import clone
 
 from config.all_symbols import SYMBOLS
 from data.model_storage import ModelStorage
@@ -41,13 +42,16 @@ class RiskLabAIModel:
         self.primary_model = None
         self.meta_model = None
         self.scaler = StandardScaler()
+        self.label_encoder = LabelEncoder()
         self.feature_names = []
         
         self.cusum = CUSUMEventFilter(threshold=None) 
+        
+        # Max holding period reduced to 5 days to ensure labels can be generated
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=2.0, 
             stop_loss_mult=2.0,
-            max_holding_period=100
+            max_holding_period=5 
         )
         self.meta_labeler = MetaLabeler()
         self.frac_diff = FractionalDifferentiator(d=0.4)
@@ -108,7 +112,15 @@ class RiskLabAIModel:
         
         common_idx = labels.index.intersection(features_df.index)
         X = features_df.loc[common_idx, self.feature_names]
-        y = labels.loc[common_idx, 'bin']
+        
+        # --- FIX: Encode Labels for XGBoost ---
+        # XGBoost requires targets [0, 1, 2]. Our labels are [-1, 0, 1].
+        y_raw = labels.loc[common_idx, 'bin']
+        y_encoded = self.label_encoder.fit_transform(y_raw)
+        
+        # Wrap back to Series to preserve index for PurgedCV
+        y = pd.Series(y_encoded, index=common_idx)
+        
         t1 = labels.loc[common_idx, 't1'] if 't1' in labels.columns else pd.Series(index=common_idx, data=common_idx)
 
         # Normalize Timezones
@@ -120,15 +132,22 @@ class RiskLabAIModel:
 
         if len(y) < 50: return {'success': False, 'reason': 'insufficient_labels'}
 
+        # --- PRIMARY MODEL: XGBoost ---
         base_estimator = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
-            ('clf', RandomForestClassifier(n_estimators=100, class_weight='balanced_subsample', n_jobs=1))
+            ('scaler', StandardScaler()), 
+            ('clf', XGBClassifier(
+                n_estimators=100, 
+                max_depth=3, 
+                learning_rate=0.1, 
+                eval_metric='mlogloss', # Multi-class logloss
+                n_jobs=1
+            ))
         ])
 
         logger.info(f"[{symbol}] Purged CV for Meta-Labels...")
         cv = PurgedCrossValidator(n_splits=5, embargo_pct=0.01)
         
-        # Meta Labels Generation
         meta_features = np.zeros(len(y))
         valid_indices_mask = np.zeros(len(y), dtype=bool)
         
@@ -144,15 +163,13 @@ class RiskLabAIModel:
         self.primary_model = clone(base_estimator)
         self.primary_model.fit(X, y)
         
+        # --- META MODEL ---
+        # Predicts if the Primary Model's prediction (encoded) matches the True Label (encoded)
         X_meta = X.iloc[valid_indices_mask]
         y_meta_target = (meta_features[valid_indices_mask] == y.iloc[valid_indices_mask]).astype(int)
         
-        self.meta_model = BaggingClassifier(
-            estimator=DecisionTreeClassifier(max_depth=5),
-            n_estimators=50,
-            max_samples=0.6,
-            n_jobs=1
-        ).fit(X_meta, y_meta_target)
+        self.meta_model = LogisticRegression(class_weight='balanced', solver='liblinear')
+        self.meta_model.fit(X_meta, y_meta_target)
 
         return {'success': True, 'n_samples': len(X), 'n_features': len(self.feature_names)}
 
@@ -166,8 +183,23 @@ class RiskLabAIModel:
         if latest['regime'].iloc[0] == -1: return 0, 0.0
 
         X = latest[self.feature_names]
-        signal = self.primary_model.predict(X)[0]
-        confidence = self.meta_labeler.get_bet_size(self.meta_model, X).iloc[0]
+        
+        # 1. Primary Signal (Encoded: 0, 1, 2)
+        signal_encoded = self.primary_model.predict(X)[0]
+        
+        # 2. Decode Signal (Back to -1, 0, 1)
+        try:
+            signal = self.label_encoder.inverse_transform([signal_encoded])[0]
+        except:
+            signal = 0
+        
+        # 3. Meta Confidence
+        if hasattr(self.meta_model, "predict_proba"):
+            probs = self.meta_model.predict_proba(X)
+            # Prob of Class 1 (Correct Prediction)
+            confidence = probs[0][1] if probs.shape[1] > 1 else 0.0
+        else:
+            confidence = float(self.meta_model.predict(X)[0])
         
         return int(signal), float(confidence)
 
@@ -189,6 +221,7 @@ class RiskLabAIStrategy(Strategy):
                 self.models[sym].primary_model = data['primary_model']
                 self.models[sym].meta_model = data['meta_model']
                 self.models[sym].feature_names = data['feature_names']
+                self.models[sym].label_encoder = data['label_encoder'] # Ensure encoder is loaded
                 logger.info(f"Loaded {sym}")
 
     def on_trading_iteration(self):
@@ -204,7 +237,7 @@ class RiskLabAIStrategy(Strategy):
             signal, conf = model.predict(bars)
             pos = self.get_position(symbol)
             
-            if signal == 1 and conf > 0.8:
+            if signal == 1 and conf > 0.6:
                 if pos is None:
                     base_w = self.target_weights.get(symbol, 1.0/len(self.symbols))
                     scale = self._calculate_kelly(conf)
@@ -216,30 +249,22 @@ class RiskLabAIStrategy(Strategy):
                     if qty > 0:
                         self.submit_order(self.create_order(symbol, qty, "buy"))
 
-            elif signal == -1 and conf > 0.8:
+            elif signal == -1 and conf > 0.6:
                 if pos:
                     logger.info(f"[{symbol}] SELL (Conf: {conf:.2f})")
                     self.sell_all(symbol)
 
     def _update_hrp_weights(self):
-        """
-        Runs Hierarchical Risk Parity (HRP) optimization.
-        Uses RiskLabAI's portfolio optimization to allocate capital based on 
-        cluster-based risk rather than simple mean-variance.
-        """
         now = datetime.now()
-        # Run daily to avoid excessive API calls
         if self.last_rebalance and (now - self.last_rebalance) < timedelta(hours=24):
             return
 
         logger.info("Running HRP Optimization...")
         try:
             price_data = {}
-            # Limit universe for speed, or use full SYMBOLS list
             target_list = self.symbols[:50] 
             
             for sym in target_list:
-                # Fetch recent daily data for correlation analysis
                 bars = self.get_historical_prices(sym, 120, "day").df
                 if not bars.empty:
                     price_data[sym] = bars['close']
@@ -251,13 +276,9 @@ class RiskLabAIStrategy(Strategy):
             prices_df = pd.DataFrame(price_data)
             returns_df = prices_df.pct_change().dropna()
             
-            # RiskLabAI HRP Optimization
             self.target_weights = self.hrp_portfolio.optimize(returns_df).to_dict()
             self.last_rebalance = now
-            
-            # Log top allocations for verification
-            sorted_w = sorted(self.target_weights.items(), key=lambda x: x[1], reverse=True)[:5]
-            logger.info(f"HRP Weights Updated. Top 5: {sorted_w}")
+            logger.info(f"HRP Weights Updated.")
             
         except Exception as e:
             logger.error(f"HRP Failed: {e}. Defaulting to existing weights.")
@@ -266,5 +287,4 @@ class RiskLabAIStrategy(Strategy):
         if confidence <= 0.5: return 0.0
         p = confidence
         f = p - ((1-p)/win_loss)
-        # Use Half-Kelly for safety
         return max(0.0, min(f * 0.5, 1.0))

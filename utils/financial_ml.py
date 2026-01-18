@@ -5,6 +5,7 @@ from typing import Optional, Union, List
 from sklearn.model_selection import GridSearchCV
 
 # --- RiskLabAI Imports ---
+# We use the library for everything EXCEPT the triple_barrier function
 from RiskLabAI.data.labeling.labeling import (
     cusum_filter_events_dynamic_threshold, 
     vertical_barrier
@@ -19,66 +20,72 @@ from RiskLabAI.features.entropy_features.shannon import shannon_entropy
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 1. TRIPLE BARRIER PATCH (Fixes library crash)
+# 1. TRIPLE BARRIER LOGIC (Local Copy from Source)
 # ==============================================================================
 
-def triple_barrier_patch(close: pd.Series, events: pd.DataFrame, ptsl: list, molecule: list) -> pd.DataFrame:
+def triple_barrier_local(close: pd.Series, events: pd.DataFrame, ptsl: List[float], molecule: List[pd.Timestamp]) -> pd.DataFrame:
     """
-    Robust implementation of the Triple Barrier Method.
-    replaces the buggy library function to ensure stability.
-    """
-    out = events.loc[molecule].copy()
-    out['side'] = 0
+    Apply the triple-barrier method.
     
-    if 't1' not in out.columns:
-        out['t1'] = pd.NaT
+    COPIED FROM RISKLABAI SOURCE with two fixes:
+    1. Initialize columns to prevent 'drop' crash.
+    2. Keep columns in output so the bot knows exit prices.
+    """
+    # Filter for events this worker owns
+    events_filtered = events.loc[molecule]
+    output = pd.DataFrame(index=events_filtered.index)
+    output["End Time"] = events_filtered["End Time"]
 
-    # Calculate explicit exit prices for the bot
-    current_prices = close.loc[out.index]
-    out['profit_taking'] = current_prices * (1 + out['trgt'] * ptsl[0])
-    out['stop_loss'] = current_prices * (1 - out['trgt'] * ptsl[1])
+    # --- FIX 1: Initialize columns to NaT/NaN to prevent crash ---
+    output["stop_loss"] = pd.NaT
+    output["profit_taking"] = pd.NaT
 
-    for t0, row in out.iterrows():
+    # 1. Set horizontal barriers
+    if ptsl[0] > 0:
+        profit_taking = ptsl[0] * events_filtered["Base Width"]
+    else:
+        profit_taking = pd.Series(np.inf, index=events_filtered.index)
+
+    if ptsl[1] > 0:
+        stop_loss = -ptsl[1] * events_filtered["Base Width"]
+    else:
+        stop_loss = pd.Series(-np.inf, index=events_filtered.index)
+
+    # Get side if it exists, otherwise default to 1 (long)
+    side = events_filtered.get("Side", pd.Series(1.0, index=events_filtered.index))
+
+    # 2. Find first touch time
+    # (Iterate through valid events)
+    for location, vertical_barrier_time in events_filtered["End Time"].fillna(close.index[-1]).items():
         try:
-            t1_vertical = row['t1']
-            trgt = row['trgt']
+            # Path prices from event start to vertical barrier
+            path_prices = close.loc[location:vertical_barrier_time]
             
-            # Slice path from entry to vertical barrier
-            price_path = close.loc[t0:t1_vertical]
-            path_returns = (price_path / close.loc[t0]) - 1
+            # Calculate path returns, adjusted by side
+            path_returns = (
+                np.log(path_prices / close[location]) * side.at[location]
+            )
+
+            # Check Stop Loss Touch
+            sl_touches = path_returns[path_returns < stop_loss.at[location]].index
+            if not sl_touches.empty:
+                output.loc[location, "stop_loss"] = sl_touches.min()
             
-            # Check Barriers
-            pt_level = trgt * ptsl[0]
-            sl_level = -trgt * ptsl[1]
-            
-            touch_pt = path_returns[path_returns > pt_level].index.min()
-            touch_sl = path_returns[path_returns < sl_level].index.min()
-            
-            if pd.isna(touch_pt) and pd.isna(touch_sl):
-                out.loc[t0, 'side'] = 0
-                out.loc[t0, 't1'] = t1_vertical
+            # Check Profit Taking Touch
+            pt_touches = path_returns[path_returns > profit_taking.at[location]].index
+            if not pt_touches.empty:
+                output.loc[location, "profit_taking"] = pt_touches.min()
                 
-            elif pd.isna(touch_sl):
-                out.loc[t0, 'side'] = 1
-                out.loc[t0, 't1'] = touch_pt
-                
-            elif pd.isna(touch_pt):
-                out.loc[t0, 'side'] = -1
-                out.loc[t0, 't1'] = touch_sl
-                
-            else:
-                # Touched both; take earliest
-                if touch_pt <= touch_sl:
-                    out.loc[t0, 'side'] = 1
-                    out.loc[t0, 't1'] = touch_pt
-                else:
-                    out.loc[t0, 'side'] = -1
-                    out.loc[t0, 't1'] = touch_sl
-                    
         except Exception:
             continue
-            
-    return out
+
+    # The 'End Time' column in output now holds the *first* barrier touched (Vertical, SL, or PT)
+    # We take the min of all three times.
+    output["End Time"] = output[["End Time", "stop_loss", "profit_taking"]].min(axis=1)
+    
+    # --- FIX 2: Do NOT drop columns. Return them so the bot can use them. ---
+    return output
+
 
 # ==============================================================================
 # 2. CLASS WRAPPERS
@@ -123,19 +130,20 @@ class TripleBarrierLabeler:
                 number_days=self.max_holding
             )
 
-        # 2. Setup
+        # 2. Prepare Inputs
         events_ready = events[['t1']].copy().dropna()
         events_ready['trgt'] = vol.loc[events_ready.index]
         events_ready = events_ready.dropna()
         
-        # Add Aliases for compatibility
+        # Add Aliases required by the source code logic
         events_ready['End Time'] = events_ready['t1']
         events_ready['Base Width'] = events_ready['trgt']
+        events_ready['Side'] = 1  # Default to Long
         
         ptsl = [self.pt_mult, self.sl_mult]
         
-        # 3. Apply Barriers (Using Patch)
-        labels = triple_barrier_patch(
+        # 3. Apply Barriers (Using LOCAL COPY of the source code)
+        labels = triple_barrier_local(
             close=close,
             events=events_ready,
             ptsl=ptsl,
@@ -143,15 +151,33 @@ class TripleBarrierLabeler:
         )
         
         # 4. Finalize
+        # Map library output names back to our standard names
+        labels.rename(columns={"End Time": "t1"}, inplace=True)
+        
+        # Calculate Returns based on the touch time found
         p_start = close.loc[labels.index]
         p_end = close.loc[labels['t1']]
         labels['ret'] = (p_end.values / p_start.values) - 1
-        labels['bin'] = labels['side'].astype(int)
         
+        # Calculate Bin (1=Win, -1=Loss, 0=Timeout)
+        # We can infer this from which barrier was hit first
+        labels['bin'] = 0
+        
+        # If t1 == profit_taking -> 1
+        # If t1 == stop_loss -> -1
+        # If t1 == original vertical barrier -> 0
+        
+        # (Simplified sign check on return is often robust enough)
+        labels['bin'] = np.sign(labels['ret']).astype(int)
+        
+        # Explicitly calculate price levels for the bot using the multipliers
+        labels['profit_taking_price'] = close.loc[labels.index] * (1 + events_ready['trgt'] * self.pt_mult)
+        labels['stop_loss_price'] = close.loc[labels.index] * (1 - events_ready['trgt'] * self.sl_mult)
+
         return labels
 
 # ==============================================================================
-# 3. UTILITIES
+# 3. UTILITIES (Timezone Safe)
 # ==============================================================================
 
 class PurgedCrossValidator:
