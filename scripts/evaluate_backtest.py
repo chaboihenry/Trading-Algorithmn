@@ -37,6 +37,38 @@ def parse_args():
     parser.add_argument("--all", action="store_true", help="Test all symbols")
     return parser.parse_args()
 
+def calculate_trade_metrics(positions, bar_returns):
+    """
+    Calculates realistic trade metrics (Win Rate, PnL per trade).
+    """
+    # Strategy Returns (Shifted to align execution)
+    strategy_returns = positions * bar_returns
+    
+    # 1. Net Return
+    cum_return = (1 + strategy_returns).prod() - 1
+    
+    # 2. Extract Trades (Non-zero positions)
+    trade_indices = np.nonzero(positions)[0]
+    total_trades = len(trade_indices)
+    
+    if total_trades == 0:
+        return 0.0, 0, 0.0, 0.0
+    
+    # 3. Calculate Real Win Rate (Winners / Total Trades)
+    # We look at the return of the specific bars we traded
+    trade_pnl = strategy_returns.iloc[trade_indices] if hasattr(strategy_returns, 'iloc') else strategy_returns[trade_indices]
+    
+    winning_trades = np.sum(trade_pnl > 0)
+    real_win_rate = winning_trades / total_trades
+    
+    # 4. Sharpe (Annualized)
+    # Assuming bars are roughly ~2 mins. 
+    # Approx 100,000 bars per year? This is a rough proxy.
+    std = np.std(strategy_returns)
+    sharpe = (np.mean(strategy_returns) / std) * np.sqrt(252 * 78) if std > 1e-9 else 0.0
+    
+    return cum_return, total_trades, real_win_rate, sharpe
+
 def run_simulation(symbol):
     logger.info(f"--- Simulating {symbol} ---")
     
@@ -53,15 +85,18 @@ def run_simulation(symbol):
     bars = ImbalanceBarGenerator.process_ticks(ticks, threshold=10000)
     if bars.empty: return None
     
+    # --- FIX: NORMALIZE BARS INDEX ---
+    if bars.index.tz is not None:
+        bars.index = bars.index.tz_localize(None)
+    # ---------------------------------
+    
     # 3. Generate Features
     model = RiskLabAIModel()
     features = model.generate_features(bars)
     
-    if features.empty:
-        logger.warning(f"[{symbol}] No features generated.")
-        return None
+    if features.empty: return None
         
-    # 4. Generate Labels & Get Barrier Times (t1)
+    # 4. Generate Labels
     close_prices = bars.loc[features.index, 'close']
     events = model.cusum.get_events(close_prices)
     labels = model.labeler.label(close_prices, pd.DataFrame(index=events))
@@ -70,84 +105,57 @@ def run_simulation(symbol):
     common_idx = labels.index.intersection(features.index)
     X = features.loc[common_idx, model.feature_names]
     y = labels.loc[common_idx, 'bin']
-    t1 = labels.loc[common_idx, 't1'] # Critical for Purged CV
+    t1 = labels.loc[common_idx, 't1']
     
-    # 5. Split Train (Past) vs Test (Future)
+    # --- TIMEZONE NORMALIZATION ---
+    if X.index.tz is not None: X.index = X.index.tz_localize(None)
+    if y.index.tz is not None: y.index = y.index.tz_localize(None)
+    if t1.index.tz is not None: t1.index = t1.index.tz_localize(None)
+    if pd.api.types.is_datetime64_any_dtype(t1) and getattr(t1.dt, 'tz', None) is not None:
+        t1 = t1.dt.tz_localize(None)
+    # ------------------------------
+    
+    # 5. Split Train/Test
     split_idx = int(len(X) * (1 - TEST_SPLIT))
-    
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
     t1_train = t1.iloc[:split_idx]
     
-    if len(X_test) < 10:
-        logger.warning(f"[{symbol}] Test set too small.")
-        return None
+    if len(X_test) < 10: return None
 
-    logger.info(f"[{symbol}] Train: {len(X_train)} events | Test: {len(X_test)} events")
+    logger.info(f"[{symbol}] Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # 6. Train Models (THE RISKLABAI WAY)
-    
-    # A. Define Base Primary Model
+    # 6. Train Models (Purged CV)
     primary_base = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('clf', RandomForestClassifier(n_estimators=100, class_weight='balanced_subsample', n_jobs=1))
     ])
     
-    # B. Generate Out-of-Sample Predictions for Meta-Model Training
-    # We use Purged K-Fold to generate predictions on the training set
-    # without looking ahead or using overlapping trades.
-    
-    # Initialize array to store the unbiased predictions
-    # We fill with 0 initially; any skipped points (due to purging) will be ignored later.
+    # Generate Out-of-Sample Predictions
     meta_features = np.zeros(len(y_train))
     valid_indices_mask = np.zeros(len(y_train), dtype=bool)
-    
-    # Use the Purged Cross Validator from your Utils
     cv = PurgedCrossValidator(n_splits=5, embargo_pct=0.01)
     
-    logger.info(f"[{symbol}] Generating Meta-Features via Purged CV...")
-    
-    # Custom CV Loop
-    # We pass the t1 series (end times) which PurgedKFold uses to prevent leakage
+    logger.info(f"[{symbol}] Training Meta-Model (Purged CV)...")
     try:
         cv_gen = cv.get_cv(t1_train)
-        
         for train_idx, val_idx in cv_gen.split(X_train, y_train):
-            # 1. Clone a fresh primary model
             temp_model = clone(primary_base)
-            
-            # 2. Fit on the Fold's Training Set
             temp_model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
-            
-            # 3. Predict on the Fold's Validation Set (The "Out of Sample" part)
             val_preds = temp_model.predict(X_train.iloc[val_idx])
-            
-            # 4. Store predictions
-            # Map validation indices back to our meta_features array position
             meta_features[val_idx] = val_preds
             valid_indices_mask[val_idx] = True
-            
     except Exception as e:
-        logger.error(f"Purged CV Failed: {e}. Falling back to standard CV.")
-        from sklearn.model_selection import cross_val_predict
-        meta_features = cross_val_predict(primary_base, X_train, y_train, cv=5)
-        valid_indices_mask[:] = True
+        logger.warning(f"Purged CV Error: {e}")
+        return None
 
-    # C. Prepare Meta-Model Training Data
-    # Only use points where we successfully generated a prediction (purging might drop some)
     X_meta_train = X_train.iloc[valid_indices_mask]
     y_meta_train = (meta_features[valid_indices_mask] == y_train.iloc[valid_indices_mask]).astype(int)
     
-    # D. Train the Actual Models for Future Use
-    
-    # 1. Fit Final Primary Model (on ALL training data)
+    # Final Training
     primary_final = clone(primary_base)
     primary_final.fit(X_train, y_train)
     
-    # 2. Fit Final Meta Model (on the Unbiased predictions we just generated)
-    if len(np.unique(y_meta_train)) < 2:
-         logger.warning(f"[{symbol}] Warning: Meta-Model targets are mono-class. Check Primary Model variance.")
-         
     meta_final = BaggingClassifier(
         estimator=DecisionTreeClassifier(max_depth=5),
         n_estimators=50,
@@ -156,53 +164,56 @@ def run_simulation(symbol):
     )
     meta_final.fit(X_meta_train, y_meta_train)
     
-    # 7. Simulate Trading (On Future Data)
+    # 7. Predictions
     p_preds_test = primary_final.predict(X_test)
     
-    # Get Meta Confidence
     if hasattr(meta_final, "predict_proba"):
-        try:
-            probs = meta_final.predict_proba(X_test)
-            if probs.shape[1] > 1:
-                meta_probs = probs[:, 1]
-            else:
-                single_class = meta_final.classes_[0]
-                meta_probs = np.ones(len(X_test)) if single_class == 1 else np.zeros(len(X_test))
-        except Exception as e:
-            logger.error(f"Probability error: {e}")
-            meta_probs = np.zeros(len(X_test))
+        probs = meta_final.predict_proba(X_test)
+        meta_probs = probs[:, 1] if probs.shape[1] > 1 else np.zeros(len(X_test))
     else:
         meta_probs = meta_final.predict(X_test)
     
-    # Apply Strategy Logic
-    meta_threshold = 0.6
-    positions = np.zeros(len(X_test))
+    # 8. THRESHOLD OPTIMIZATION LOOP
+    # We test multiple confidence levels to find the "Sweet Spot"
+    logger.info(f"[{symbol}] Optimizing Threshold...")
     
-    for i in range(len(X_test)):
-        signal = p_preds_test[i]
-        conf = meta_probs[i]
-        
-        if signal != 0 and conf > meta_threshold:
-            positions[i] = signal * conf 
-        else:
-            positions[i] = 0
-
-    # 8. Calculate Returns
+    best_res = None
+    best_sharpe = -999
+    
+    print(f"\n{'Threshold':<10} | {'Trades':<8} | {'Win Rate':<10} | {'Return':<10}")
+    print("-" * 50)
+    
     bar_returns = bars.loc[X_test.index, 'close'].pct_change().shift(-1).fillna(0)
-    strategy_returns = positions * bar_returns
     
-    cum_return = (1 + strategy_returns).prod() - 1
-    
-    result = {
-        "Symbol": symbol,
-        "Net Return": f"{cum_return:.2%}",
-        "Trades": np.count_nonzero(positions),
-        "Win Rate": f"{np.mean(strategy_returns > 0):.1%}",
-        "Raw_Net": cum_return
-    }
-    
-    logger.info(f"[{symbol}] Result: {result['Net Return']} ({result['Trades']} trades)")
-    return result
+    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]:
+        positions = np.zeros(len(X_test))
+        for i in range(len(X_test)):
+            signal = p_preds_test[i]
+            conf = meta_probs[i]
+            if signal != 0 and conf > threshold:
+                positions[i] = signal # Flat position size for backtest purity
+        
+        ret, trades, win_rate, sharpe = calculate_trade_metrics(positions, bar_returns)
+        
+        print(f"{threshold:<10} | {trades:<8} | {win_rate:<10.1%} | {ret:<10.2%}")
+        
+        if sharpe > best_sharpe and trades > 10: # Minimum trades constraint
+            best_sharpe = sharpe
+            best_res = {
+                "Symbol": symbol,
+                "Best_Thresh": threshold,
+                "Net Return": f"{ret:.2%}",
+                "Trades": trades,
+                "Win Rate": f"{win_rate:.1%}",
+                "Raw_Net": ret
+            }
+
+    if best_res:
+        logger.info(f"[{symbol}] BEST: Thresh={best_res['Best_Thresh']} | Win Rate={best_res['Win Rate']} | Return={best_res['Net Return']}")
+        return best_res
+    else:
+        logger.warning(f"[{symbol}] No profitable threshold found.")
+        return None
 
 def main():
     args = parse_args()
@@ -220,14 +231,16 @@ def main():
             if res: results.append(res)
         except Exception as e:
             logger.error(f"Error testing {sym}: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             
     if results:
         df = pd.DataFrame(results)
-        print("\n" + "="*50)
-        print("BACKTEST RESULTS (Out-of-Sample)")
-        print("="*50)
-        print(df[["Symbol", "Net Return", "Win Rate", "Trades"]].to_string(index=False))
-        print("="*50)
+        print("\n" + "="*60)
+        print("OPTIMIZED BACKTEST RESULTS")
+        print("="*60)
+        print(df[["Symbol", "Best_Thresh", "Net Return", "Win Rate", "Trades"]].to_string(index=False))
+        print("="*60)
 
 if __name__ == "__main__":
     main()

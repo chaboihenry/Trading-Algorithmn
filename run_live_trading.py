@@ -11,7 +11,7 @@ sys.path.append(project_root)
 
 from lumibot.brokers import Alpaca
 from lumibot.traders import Trader
-from strategies.risklabai_bot import RiskLabAIStrategy
+from strategies.risklabai_bot import RiskLabAIStrategy  # <--- Correct Class Name
 from config.logging_config import setup_logging
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, DB_PATH
 from config.all_symbols import SYMBOLS

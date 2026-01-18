@@ -21,11 +21,10 @@ class ModelStorage:
     
     1. Attempts to save directly to S3 (In-Memory).
     2. Falls back to local disk ONLY if S3 fails or is not configured.
-    3. Maintains version history in S3 (e.g., QQQ_model_2026-01-17.joblib).
+    3. Maintains granular version history (e.g., QQQ_model_2026-01-17_1430.joblib).
     """
     def __init__(self, local_dir="models"):
         self.local_dir = Path(local_dir)
-        # We only create the local folder if we actually need to use the fallback
         self.s3_client = None
         self.bucket = None
         
@@ -44,83 +43,64 @@ class ModelStorage:
         """
         Uploads model to S3 directly from memory.
         """
-        # Generate filenames
-        date_str = datetime.now().strftime("%Y-%m-%d")
-        filename_versioned = f"{symbol}_model_{date_str}.joblib"
+        # Generate filenames with Hour:Minute precision
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M")
+        filename_versioned = f"{symbol}_model_{timestamp}.joblib"
         filename_latest = f"{symbol}_latest.joblib"
         
-        # S3 Paths
         s3_key_versioned = f"models/{symbol}/{filename_versioned}"
         s3_key_latest = f"models/{symbol}/{filename_latest}"
 
-        # ---------------------------------------------------------
-        # OPTION A: S3 UPLOAD (In-Memory) - PREFERRED
-        # ---------------------------------------------------------
+        # OPTION A: S3 UPLOAD (In-Memory)
         if upload_to_s3 and self.s3_client:
             try:
-                # 1. Write model to RAM buffer
                 with io.BytesIO() as buffer:
                     joblib.dump(model_data, buffer)
-                    buffer.seek(0)  # Reset pointer to start of file
-                    
-                    # 2. Upload Versioned File (History)
+                    buffer.seek(0)
                     self.s3_client.upload_fileobj(buffer, self.bucket, s3_key_versioned)
                     
-                    # 3. Upload Latest File (Overwrite)
-                    buffer.seek(0)  # Reset pointer again
+                    buffer.seek(0)
                     self.s3_client.upload_fileobj(buffer, self.bucket, s3_key_latest)
 
-                logger.info(f"[{symbol}] ☁️ Uploaded to S3 (RAM): {s3_key_versioned}")
+                logger.info(f"[{symbol}] ☁️ Uploaded: {filename_versioned}")
                 return True
 
             except Exception as e:
                 logger.error(f"[{symbol}] ❌ S3 Upload Failed: {e}")
                 logger.info(f"[{symbol}] Falling back to local disk...")
-                # Proceed to Option B below
 
-        # ---------------------------------------------------------
-        # OPTION B: LOCAL SAVE - FALLBACK
-        # ---------------------------------------------------------
+        # OPTION B: LOCAL SAVE
         self.local_dir.mkdir(parents=True, exist_ok=True)
         local_path = self.local_dir / filename_latest
         
         try:
             joblib.dump(model_data, local_path)
-            logger.warning(f"[{symbol}] 💾 Saved locally (Fallback): {local_path}")
+            logger.warning(f"[{symbol}] 💾 Saved locally: {local_path}")
             return True
         except Exception as e:
             logger.error(f"[{symbol}] ❌ Local Save Failed: {e}")
             return False
 
     def load_model(self, symbol, prefer_s3=True):
-        """
-        Loads model. Tries to stream from S3 first, then checks local.
-        """
+        """Loads model (Always tries to get the 'latest' version)."""
         filename = f"{symbol}_latest.joblib"
         s3_key = f"models/{symbol}/{filename}"
         local_path = self.local_dir / filename
 
-        # 1. Try S3 Download (In-Memory)
         if prefer_s3 and self.s3_client:
             try:
                 with io.BytesIO() as buffer:
                     self.s3_client.download_fileobj(self.bucket, s3_key, buffer)
                     buffer.seek(0)
                     model = joblib.load(buffer)
-                    logger.info(f"[{symbol}] ☁️ Loaded from S3 (RAM).")
+                    logger.info(f"[{symbol}] ☁️ Loaded from S3.")
                     return model
-            except Exception as e:
-                # If file missing or network error, silently fall through to local
-                pass 
+            except: pass 
 
-        # 2. Load Local
         if local_path.exists():
             try:
-                model = joblib.load(local_path)
-                logger.info(f"[{symbol}] 💾 Loaded from Local Disk.")
-                return model
+                return joblib.load(local_path)
             except Exception as e:
                 logger.error(f"[{symbol}] Corrupt local file: {e}")
                 return None
-        
         return None
