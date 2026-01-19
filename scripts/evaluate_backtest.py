@@ -10,7 +10,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.base import clone
 
-# --- UPDATED IMPORTS (Matching the Bot) ---
+# --- UPDATED IMPORTS ---
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
 
@@ -31,8 +31,7 @@ from utils.financial_ml import PurgedCrossValidator
 logger = setup_logging(script_name="backtest")
 
 TEST_SPLIT = 0.20
-# 0.0002 = 2 basis points (approx spread + fee on liquid ETFs like QQQ)
-TRANSACTION_COST = 0.0002 
+TRANSACTION_COST = 0.0002 # 2 bps (Spread + Slippage)
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backtest RiskLabAI Strategy")
@@ -40,49 +39,86 @@ def parse_args():
     parser.add_argument("--all", action="store_true", help="Test all symbols")
     return parser.parse_args()
 
-def calculate_trade_metrics(positions, bar_returns):
+def simulate_triple_barrier_trades(prices, signals, confidences, volatility, threshold, pt_mult, sl_mult, time_limit_bars):
     """
-    Calculates metrics including Transaction Costs.
+    Stateful event loop simulation.
     """
-    # 1. Gross Returns
-    gross_returns = positions * bar_returns
+    trades = []
+    active_trade = None
     
-    # 2. Calculate Costs
-    # We pay a fee every time the position CHANGES (Buy or Sell)
-    # prepend=0 assumes we start flat.
-    position_changes = np.abs(np.diff(positions, prepend=0))
-    costs = position_changes * TRANSACTION_COST
-    
-    # 3. Net Returns
-    net_strategy_returns = gross_returns - costs
-    cum_return = (1 + net_strategy_returns).prod() - 1
-    
-    # 4. Trade Stats
-    # A "trade" is arguably an entry, so we count when position goes 0 -> 1/ -1
-    # or just count total turnover. Let's count non-zero bars for exposure.
-    trade_indices = np.nonzero(positions)[0]
-    total_trades = np.sum(position_changes > 0) # Count execution events
-    
-    if total_trades == 0:
-        return 0.0, 0, 0.0, 0.0
-    
-    # 5. Win Rate (on bars where we held a position)
-    # Note: This is per-bar win rate, hard to do per-trade in vectorization
-    # We will approximate by looking at positive return bars vs total active bars
-    winning_bars = np.sum(net_strategy_returns > 0)
-    total_active_bars = len(trade_indices)
-    real_win_rate = winning_bars / total_active_bars if total_active_bars > 0 else 0
-    
-    # 6. Sharpe
-    std = np.std(net_strategy_returns)
-    sharpe = (np.mean(net_strategy_returns) / std) * np.sqrt(252 * 78) if std > 1e-9 else 0.0
-    
-    return cum_return, total_trades, real_win_rate, sharpe
+    for i in range(len(prices)):
+        price = prices.iloc[i]
+        current_time = prices.index[i]
+        
+        # 1. Manage Active Trade
+        if active_trade:
+            entry_price = active_trade['entry_price']
+            side = active_trade['side']
+            
+            # Check Barriers
+            hit_tp = (price >= active_trade['tp']) if side == 1 else (price <= active_trade['tp'])
+            hit_sl = (price <= active_trade['sl']) if side == 1 else (price >= active_trade['sl'])
+            time_expired = (i - active_trade['entry_idx']) >= time_limit_bars
+            
+            exit_price = None
+            exit_reason = None
+            
+            if hit_tp:
+                exit_price = active_trade['tp']
+                exit_reason = 'TP'
+            elif hit_sl:
+                exit_price = active_trade['sl']
+                exit_reason = 'SL'
+            elif time_expired:
+                exit_price = price
+                exit_reason = 'TIME'
+            
+            if exit_price:
+                # Calculate Return (Gross)
+                gross_ret = (exit_price - entry_price) / entry_price * side
+                # Net Return (Deduct entry + exit fees)
+                net_ret = gross_ret - (TRANSACTION_COST * 2) 
+                
+                trades.append({
+                    'entry_time': active_trade['entry_time'],
+                    'exit_time': current_time,
+                    'side': side,
+                    'ret': net_ret,
+                    'reason': exit_reason
+                })
+                active_trade = None
+                continue
+
+        # 2. Check for New Entry
+        if active_trade is None:
+            sig = signals.iloc[i]
+            conf = confidences.iloc[i]
+            
+            if sig != 0 and conf > threshold:
+                vol = volatility.iloc[i]
+                
+                if sig == 1:
+                    tp = price * (1 + vol * pt_mult)
+                    sl = price * (1 - vol * sl_mult)
+                else:
+                    tp = price * (1 - vol * pt_mult)
+                    sl = price * (1 + vol * sl_mult)
+                
+                active_trade = {
+                    'entry_price': price,
+                    'entry_time': current_time,
+                    'entry_idx': i,
+                    'side': sig,
+                    'tp': tp,
+                    'sl': sl
+                }
+
+    return pd.DataFrame(trades)
 
 def run_simulation(symbol):
     logger.info(f"--- Simulating {symbol} ---")
     
-    # 1. Load Data
+    # 1. Data Loading
     storage = TickStorage(DB_PATH)
     ticks = storage.load_ticks(symbol)
     storage.close()
@@ -91,72 +127,56 @@ def run_simulation(symbol):
         logger.warning(f"[{symbol}] Not enough data.")
         return None
 
-    # 2. Generate Bars
     bars = ImbalanceBarGenerator.process_ticks(ticks, threshold=10000)
     if bars.empty: return None
+    if bars.index.tz is not None: bars.index = bars.index.tz_localize(None)
     
-    if bars.index.tz is not None:
-        bars.index = bars.index.tz_localize(None)
-    
-    # 3. Generate Features
+    # 2. Features & Labels
     model = RiskLabAIModel()
     features = model.generate_features(bars)
-    
     if features.empty: return None
         
-    # 4. Generate Labels
     close_prices = bars.loc[features.index, 'close']
+    volatility = model.labeler.get_volatility(close_prices)
+    
     events = model.cusum.get_events(close_prices)
     labels = model.labeler.label(close_prices, pd.DataFrame(index=events))
     
-    # Align Data
     common_idx = labels.index.intersection(features.index)
     X = features.loc[common_idx, model.feature_names]
     
-    # --- FIX: Encode Labels for XGBoost (Same as Bot) ---
+    # Encode Labels [-1, 0, 1] -> [0, 1, 2]
     le = LabelEncoder()
     y_raw = labels.loc[common_idx, 'bin']
     y_encoded = le.fit_transform(y_raw)
     y = pd.Series(y_encoded, index=common_idx)
-    
     t1 = labels.loc[common_idx, 't1']
     
     # Normalize Timezones
     if X.index.tz is not None: X.index = X.index.tz_localize(None)
-    if y.index.tz is not None: y.index = y.index.tz_localize(None)
-    if t1.index.tz is not None: t1.index = t1.index.tz_localize(None)
-    if pd.api.types.is_datetime64_any_dtype(t1) and hasattr(t1, 'dt') and getattr(t1.dt, 'tz', None) is not None:
-        t1 = t1.dt.tz_localize(None)
     
-    # 5. Split Train/Test
+    # 3. Split
     split_idx = int(len(X) * (1 - TEST_SPLIT))
     X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
     y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
     t1_train = t1.iloc[:split_idx]
     
     if len(X_test) < 10: return None
-
     logger.info(f"[{symbol}] Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # 6. Train Models (XGBoost + LogisticRegression)
+    # 4. Training (Primary + Meta)
     primary_base = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
         ('scaler', StandardScaler()),
-        ('clf', XGBClassifier(
-            n_estimators=100, 
-            max_depth=3, 
-            learning_rate=0.1, 
-            eval_metric='mlogloss', 
-            n_jobs=1
-        ))
+        ('clf', XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, n_jobs=1))
     ])
     
-    # Generate Out-of-Sample Predictions
+    # Generate Meta-Features via Purged CV
+    logger.info(f"[{symbol}] Training Meta-Model...")
     meta_features = np.zeros(len(y_train))
     valid_indices_mask = np.zeros(len(y_train), dtype=bool)
     cv = PurgedCrossValidator(n_splits=5, embargo_pct=0.01)
     
-    logger.info(f"[{symbol}] Training Meta-Model (Purged CV)...")
     try:
         cv_gen = cv.get_cv(t1_train)
         for train_idx, val_idx in cv_gen.split(X_train, y_train):
@@ -169,97 +189,105 @@ def run_simulation(symbol):
         logger.warning(f"Purged CV Error: {e}")
         return None
 
-    X_meta_train = X_train.iloc[valid_indices_mask]
-    y_meta_train = (meta_features[valid_indices_mask] == y_train.iloc[valid_indices_mask]).astype(int)
-    
-    # Final Training
+    # Fit Final Models
     primary_final = clone(primary_base)
     primary_final.fit(X_train, y_train)
     
-    # Meta Model: Logistic Regression
     meta_final = LogisticRegression(class_weight='balanced', solver='liblinear')
+    X_meta_train = X_train.iloc[valid_indices_mask]
+    y_meta_train = (meta_features[valid_indices_mask] == y_train.iloc[valid_indices_mask]).astype(int)
     meta_final.fit(X_meta_train, y_meta_train)
     
-    # 7. Predictions
+    # 5. Predict on Test
     p_preds_encoded = primary_final.predict(X_test)
+    signals = pd.Series(le.inverse_transform(p_preds_encoded), index=X_test.index)
     
-    # Decode signals back to -1, 0, 1
-    p_preds_test = le.inverse_transform(p_preds_encoded)
-    
-    # Meta Confidence
     if hasattr(meta_final, "predict_proba"):
-        probs = meta_final.predict_proba(X_test)
-        meta_probs = probs[:, 1] if probs.shape[1] > 1 else np.zeros(len(X_test))
+        conf_arr = meta_final.predict_proba(X_test)[:, 1]
     else:
-        meta_probs = meta_final.predict(X_test)
+        conf_arr = meta_final.predict(X_test)
+    confidences = pd.Series(conf_arr, index=X_test.index)
+
+    # 6. Simulation & Metrics
+    logger.info(f"[{symbol}] Running Simulation & Benchmarking...")
     
-    # 8. THRESHOLD OPTIMIZATION LOOP
-    logger.info(f"[{symbol}] Optimizing Threshold (With Fees)...")
+    # Calculate Benchmark (Buy & Hold) for the test period
+    test_prices = close_prices.loc[X_test.index]
+    bh_return = (test_prices.iloc[-1] / test_prices.iloc[0]) - 1
     
+    test_vol = volatility.loc[X_test.index]
+    # Approx 5-day hold in bars
+    avg_bars_per_day = len(bars) / 90 
+    time_limit_bars = int(avg_bars_per_day * 5)
+
     best_res = None
-    best_sharpe = -999
+    best_ret = -999
     
-    print(f"\n{'Threshold':<10} | {'Trades':<8} | {'Win Rate':<10} | {'Net Return':<10}")
-    print("-" * 55)
+    print(f"\n{'Threshold':<10} | {'Trades':<6} | {'Win%':<6} | {'Return':<8} | {'L/S Ratio':<10}")
+    print("-" * 60)
     
-    bar_returns = bars.loc[X_test.index, 'close'].pct_change().shift(-1).fillna(0)
-    
-    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]:
-        positions = np.zeros(len(X_test))
-        for i in range(len(X_test)):
-            signal = p_preds_test[i]
-            conf = meta_probs[i]
-            if signal != 0 and conf > threshold:
-                positions[i] = signal 
+    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]:
+        trade_log = simulate_triple_barrier_trades(
+            prices=test_prices,
+            signals=signals,
+            confidences=confidences,
+            volatility=test_vol,
+            threshold=threshold,
+            pt_mult=model.labeler.pt_mult,
+            sl_mult=model.labeler.sl_mult,
+            time_limit_bars=time_limit_bars
+        )
         
-        ret, trades, win_rate, sharpe = calculate_trade_metrics(positions, bar_returns)
+        if trade_log.empty:
+            continue
+            
+        cum_ret = (1 + trade_log['ret']).prod() - 1
+        win_rate = len(trade_log[trade_log['ret'] > 0]) / len(trade_log)
         
-        print(f"{threshold:<10} | {trades:<8} | {win_rate:<10.1%} | {ret:<10.2%}")
+        # Calc Long/Short ratio
+        n_longs = len(trade_log[trade_log['side'] == 1])
+        n_shorts = len(trade_log[trade_log['side'] == -1])
+        ls_ratio = f"{n_longs}/{n_shorts}"
         
-        if sharpe > best_sharpe and trades > 10:
-            best_sharpe = sharpe
+        print(f"{threshold:<10} | {len(trade_log):<6} | {win_rate:<6.1%} | {cum_ret:<8.2%} | {ls_ratio:<10}")
+        
+        if cum_ret > best_ret and len(trade_log) > 5:
+            best_ret = cum_ret
             best_res = {
                 "Symbol": symbol,
                 "Best_Thresh": threshold,
-                "Net Return": f"{ret:.2%}",
-                "Trades": trades,
+                "Net Return": f"{cum_ret:.2%}",
+                "Trades": len(trade_log),
                 "Win Rate": f"{win_rate:.1%}",
-                "Raw_Net": ret
+                "L_S": ls_ratio,
+                "Benchmark": f"{bh_return:.2%}"
             }
 
     if best_res:
-        logger.info(f"[{symbol}] BEST: Thresh={best_res['Best_Thresh']} | Return={best_res['Net Return']}")
+        print("\n" + "="*60)
+        print(f"RESULTS FOR {symbol}")
+        print(f"Benchmark (Buy & Hold): {best_res['Benchmark']}")
+        print(f"Bot Best Return:        {best_res['Net Return']} (Thresh: {best_res['Best_Thresh']})")
+        print(f"Win Rate:               {best_res['Win Rate']}")
+        print(f"Trades (Long/Short):    {best_res['L_S']}")
+        print("="*60)
         return best_res
-    else:
-        logger.warning(f"[{symbol}] No profitable threshold found.")
-        return None
+    
+    return None
 
 def main():
     args = parse_args()
-    targets = []
-    if args.symbol: targets = [args.symbol.upper()]
-    elif args.all: targets = SYMBOLS
-    else: 
-        logger.error("Please specify --symbol <TICKER> or --all")
-        return
-
+    targets = [args.symbol.upper()] if args.symbol else SYMBOLS
+    
     results = []
     for sym in targets:
         try:
             res = run_simulation(sym)
             if res: results.append(res)
         except Exception as e:
-            logger.error(f"Error testing {sym}: {e}")
+            logger.error(f"Error {sym}: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            
-    if results:
-        df = pd.DataFrame(results)
-        print("\n" + "="*60)
-        print("OPTIMIZED BACKTEST RESULTS (Net of Fees)")
-        print("="*60)
-        print(df[["Symbol", "Best_Thresh", "Net Return", "Win Rate", "Trades"]].to_string(index=False))
-        print("="*60)
 
 if __name__ == "__main__":
     main()

@@ -8,7 +8,7 @@ from typing import Dict, Tuple
 from lumibot.strategies.strategy import Strategy
 from lumibot.entities import Asset
 
-# --- ML Imports ---
+# ML Libraries
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -16,17 +16,11 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.base import clone
 
-# --- RiskLabAI Integration ---
+# Financial ML Utils
 from utils.financial_ml import (
-    CUSUMEventFilter, 
-    TripleBarrierLabeler, 
-    MetaLabeler, 
-    FractionalDifferentiator,
-    AdvancedFeatures,
-    ModelTuner,
-    PurgedCrossValidator,
-    FeatureImportance,
-    HRPPortfolio
+    CUSUMEventFilter, TripleBarrierLabeler, MetaLabeler, 
+    FractionalDifferentiator, AdvancedFeatures, ModelTuner, 
+    PurgedCrossValidator, HRPPortfolio
 )
 
 from config.all_symbols import SYMBOLS
@@ -45,13 +39,12 @@ class RiskLabAIModel:
         self.label_encoder = LabelEncoder()
         self.feature_names = []
         
+        # Event Filters & Labeling
         self.cusum = CUSUMEventFilter(threshold=None) 
-        
-        # Max holding period reduced to 5 days to ensure labels can be generated
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=2.0, 
             stop_loss_mult=2.0,
-            max_holding_period=5 
+            max_holding_period=5 # 5-day horizon for swing trading
         )
         self.meta_labeler = MetaLabeler()
         self.frac_diff = FractionalDifferentiator(d=0.4)
@@ -72,12 +65,12 @@ class RiskLabAIModel:
         df['bb_width'] = (bb_high - bb_low) / df['close']
         df['bb_position'] = (df['close'] - bb_low) / (bb_high - bb_low)
 
-        # 3. Advanced Features
+        # 3. Advanced Features (Fractional Diff, Entropy, Regime)
         df['frac_close'] = self.frac_diff.transform(df['close'])
         df['entropy'] = AdvancedFeatures.get_entropy(df['close'], window=20)
         df['regime'] = AdvancedFeatures.get_regime(df['close'], window=50)
         
-        # 4. Microstructure
+        # 4. Microstructure Features
         df['tick_rule'] = np.where(df['close'] > df['close'].shift(1), 1, -1)
         df['imbalance'] = df['tick_rule'] * df['volume']
         df['cumulative_imbalance'] = df['imbalance'].rolling(10).sum()
@@ -96,8 +89,10 @@ class RiskLabAIModel:
         ticks = TickStorage().load_ticks(symbol)
         if ticks.empty: return {'success': False, 'reason': 'no_data'}
 
-        logger.info(f"[{symbol}] Generating Bars...")
-        bars = ImbalanceBarGenerator.process_ticks(ticks, batch_size=1000000)
+        logger.info(f"[{symbol}] Generating Dollar Imbalance Bars...")
+        # Uses dynamic thresholding automatically
+        bars = ImbalanceBarGenerator.process_ticks(ticks)
+        
         if bars.empty or len(bars) < min_samples: return {'success': False, 'reason': 'insufficient_bars'}
 
         if isinstance(bars.index, pd.DatetimeIndex) and bars.index.tz is not None:
@@ -113,12 +108,9 @@ class RiskLabAIModel:
         common_idx = labels.index.intersection(features_df.index)
         X = features_df.loc[common_idx, self.feature_names]
         
-        # --- FIX: Encode Labels for XGBoost ---
-        # XGBoost requires targets [0, 1, 2]. Our labels are [-1, 0, 1].
+        # Encode Labels for XGBoost (-1, 0, 1 -> 0, 1, 2)
         y_raw = labels.loc[common_idx, 'bin']
         y_encoded = self.label_encoder.fit_transform(y_raw)
-        
-        # Wrap back to Series to preserve index for PurgedCV
         y = pd.Series(y_encoded, index=common_idx)
         
         t1 = labels.loc[common_idx, 't1'] if 't1' in labels.columns else pd.Series(index=common_idx, data=common_idx)
@@ -132,16 +124,13 @@ class RiskLabAIModel:
 
         if len(y) < 50: return {'success': False, 'reason': 'insufficient_labels'}
 
-        # --- PRIMARY MODEL: XGBoost ---
+        # Primary Model: XGBoost Classifier
         base_estimator = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler()), 
             ('clf', XGBClassifier(
-                n_estimators=100, 
-                max_depth=3, 
-                learning_rate=0.1, 
-                eval_metric='mlogloss', # Multi-class logloss
-                n_jobs=1
+                n_estimators=100, max_depth=3, learning_rate=0.1, 
+                eval_metric='mlogloss', n_jobs=1
             ))
         ])
 
@@ -163,8 +152,8 @@ class RiskLabAIModel:
         self.primary_model = clone(base_estimator)
         self.primary_model.fit(X, y)
         
-        # --- META MODEL ---
-        # Predicts if the Primary Model's prediction (encoded) matches the True Label (encoded)
+        # Meta Model: Logistic Regression
+        # Predicts probability that the Primary Model is correct
         X_meta = X.iloc[valid_indices_mask]
         y_meta_target = (meta_features[valid_indices_mask] == y.iloc[valid_indices_mask]).astype(int)
         
@@ -184,19 +173,16 @@ class RiskLabAIModel:
 
         X = latest[self.feature_names]
         
-        # 1. Primary Signal (Encoded: 0, 1, 2)
+        # Primary Signal
         signal_encoded = self.primary_model.predict(X)[0]
-        
-        # 2. Decode Signal (Back to -1, 0, 1)
         try:
             signal = self.label_encoder.inverse_transform([signal_encoded])[0]
         except:
             signal = 0
         
-        # 3. Meta Confidence
+        # Meta Confidence
         if hasattr(self.meta_model, "predict_proba"):
             probs = self.meta_model.predict_proba(X)
-            # Prob of Class 1 (Correct Prediction)
             confidence = probs[0][1] if probs.shape[1] > 1 else 0.0
         else:
             confidence = float(self.meta_model.predict(X)[0])
@@ -221,7 +207,7 @@ class RiskLabAIStrategy(Strategy):
                 self.models[sym].primary_model = data['primary_model']
                 self.models[sym].meta_model = data['meta_model']
                 self.models[sym].feature_names = data['feature_names']
-                self.models[sym].label_encoder = data['label_encoder'] # Ensure encoder is loaded
+                self.models[sym].label_encoder = data['label_encoder']
                 logger.info(f"Loaded {sym}")
 
     def on_trading_iteration(self):
@@ -237,25 +223,40 @@ class RiskLabAIStrategy(Strategy):
             signal, conf = model.predict(bars)
             pos = self.get_position(symbol)
             
-            if signal == 1 and conf > 0.6:
-                if pos is None:
+            # Use 0.6 confidence threshold for trade execution
+            if conf > 0.6:
+                current_price = bars['close'].iloc[-1]
+                vol = model.labeler.get_volatility(bars['close']).iloc[-1]
+                
+                # Entry Logic: Bracket Order
+                if signal == 1 and pos is None:
+                    # Dynamic Exit Pricing
+                    tp_price = current_price * (1 + vol * model.labeler.pt_mult)
+                    sl_price = current_price * (1 - vol * model.labeler.sl_mult)
+                    
                     base_w = self.target_weights.get(symbol, 1.0/len(self.symbols))
                     scale = self._calculate_kelly(conf)
-                    
                     budget = self.get_portfolio_value() * base_w * scale
-                    qty = max(1, int(budget // bars['close'].iloc[-1]))
+                    qty = max(1, int(budget // current_price))
                     
-                    logger.info(f"[{symbol}] BUY | HRP: {base_w:.2%} | Kelly: {scale:.2f} | Qty: {qty}")
                     if qty > 0:
+                        logger.info(f"[{symbol}] BUY | Vol: {vol:.4f} | TP: {tp_price:.2f} | SL: {sl_price:.2f}")
+                        
+                        # Market Buy with automated TP/SL
+                        self.create_order(
+                            symbol, qty, "buy", 
+                            take_profit_price=tp_price, 
+                            stop_loss_price=sl_price
+                        )
                         self.submit_order(self.create_order(symbol, qty, "buy"))
 
-            elif signal == -1 and conf > 0.6:
-                if pos:
-                    logger.info(f"[{symbol}] SELL (Conf: {conf:.2f})")
+                elif signal == -1 and pos:
+                    logger.info(f"[{symbol}] SELL SIGNAL (Conf: {conf:.2f}) - Closing Position")
                     self.sell_all(symbol)
 
     def _update_hrp_weights(self):
         now = datetime.now()
+        # Daily Rebalance
         if self.last_rebalance and (now - self.last_rebalance) < timedelta(hours=24):
             return
 
