@@ -54,13 +54,18 @@ class ModelStorage:
         # OPTION A: S3 UPLOAD (In-Memory)
         if upload_to_s3 and self.s3_client:
             try:
+                # 1. Dump model to bytes buffer
                 with io.BytesIO() as buffer:
                     joblib.dump(model_data, buffer)
-                    buffer.seek(0)
-                    self.s3_client.upload_fileobj(buffer, self.bucket, s3_key_versioned)
-                    
-                    buffer.seek(0)
-                    self.s3_client.upload_fileobj(buffer, self.bucket, s3_key_latest)
+                    model_bytes = buffer.getvalue()
+
+                # 2. Upload Versioned File (Use fresh stream)
+                with io.BytesIO(model_bytes) as stream1:
+                    self.s3_client.upload_fileobj(stream1, self.bucket, s3_key_versioned)
+                
+                # 3. Upload Latest File (Use fresh stream)
+                with io.BytesIO(model_bytes) as stream2:
+                    self.s3_client.upload_fileobj(stream2, self.bucket, s3_key_latest)
 
                 logger.info(f"[{symbol}] ☁️ Uploaded: {filename_versioned}")
                 return True

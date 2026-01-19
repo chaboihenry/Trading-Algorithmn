@@ -7,9 +7,12 @@ import pandas as pd
 from pathlib import Path
 from sklearn.pipeline import Pipeline
 from sklearn.impute import SimpleImputer
-from sklearn.ensemble import RandomForestClassifier, BaggingClassifier
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.base import clone
+
+# --- UPDATED IMPORTS (Matching the Bot) ---
+from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
 
 # --- PATH SETUP ---
 file_path = Path(__file__).resolve()
@@ -23,13 +26,13 @@ from config.logging_config import setup_logging
 from data.tick_storage import TickStorage
 from data.tick_to_bars import ImbalanceBarGenerator
 from strategies.risklabai_bot import RiskLabAIModel
-
-# Import the Purged Validator from your utils
 from utils.financial_ml import PurgedCrossValidator
 
 logger = setup_logging(script_name="backtest")
 
 TEST_SPLIT = 0.20
+# 0.0002 = 2 basis points (approx spread + fee on liquid ETFs like QQQ)
+TRANSACTION_COST = 0.0002 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Backtest RiskLabAI Strategy")
@@ -39,33 +42,40 @@ def parse_args():
 
 def calculate_trade_metrics(positions, bar_returns):
     """
-    Calculates realistic trade metrics (Win Rate, PnL per trade).
+    Calculates metrics including Transaction Costs.
     """
-    # Strategy Returns (Shifted to align execution)
-    strategy_returns = positions * bar_returns
+    # 1. Gross Returns
+    gross_returns = positions * bar_returns
     
-    # 1. Net Return
-    cum_return = (1 + strategy_returns).prod() - 1
+    # 2. Calculate Costs
+    # We pay a fee every time the position CHANGES (Buy or Sell)
+    # prepend=0 assumes we start flat.
+    position_changes = np.abs(np.diff(positions, prepend=0))
+    costs = position_changes * TRANSACTION_COST
     
-    # 2. Extract Trades (Non-zero positions)
+    # 3. Net Returns
+    net_strategy_returns = gross_returns - costs
+    cum_return = (1 + net_strategy_returns).prod() - 1
+    
+    # 4. Trade Stats
+    # A "trade" is arguably an entry, so we count when position goes 0 -> 1/ -1
+    # or just count total turnover. Let's count non-zero bars for exposure.
     trade_indices = np.nonzero(positions)[0]
-    total_trades = len(trade_indices)
+    total_trades = np.sum(position_changes > 0) # Count execution events
     
     if total_trades == 0:
         return 0.0, 0, 0.0, 0.0
     
-    # 3. Calculate Real Win Rate (Winners / Total Trades)
-    # We look at the return of the specific bars we traded
-    trade_pnl = strategy_returns.iloc[trade_indices] if hasattr(strategy_returns, 'iloc') else strategy_returns[trade_indices]
+    # 5. Win Rate (on bars where we held a position)
+    # Note: This is per-bar win rate, hard to do per-trade in vectorization
+    # We will approximate by looking at positive return bars vs total active bars
+    winning_bars = np.sum(net_strategy_returns > 0)
+    total_active_bars = len(trade_indices)
+    real_win_rate = winning_bars / total_active_bars if total_active_bars > 0 else 0
     
-    winning_trades = np.sum(trade_pnl > 0)
-    real_win_rate = winning_trades / total_trades
-    
-    # 4. Sharpe (Annualized)
-    # Assuming bars are roughly ~2 mins. 
-    # Approx 100,000 bars per year? This is a rough proxy.
-    std = np.std(strategy_returns)
-    sharpe = (np.mean(strategy_returns) / std) * np.sqrt(252 * 78) if std > 1e-9 else 0.0
+    # 6. Sharpe
+    std = np.std(net_strategy_returns)
+    sharpe = (np.mean(net_strategy_returns) / std) * np.sqrt(252 * 78) if std > 1e-9 else 0.0
     
     return cum_return, total_trades, real_win_rate, sharpe
 
@@ -85,10 +95,8 @@ def run_simulation(symbol):
     bars = ImbalanceBarGenerator.process_ticks(ticks, threshold=10000)
     if bars.empty: return None
     
-    # --- FIX: NORMALIZE BARS INDEX ---
     if bars.index.tz is not None:
         bars.index = bars.index.tz_localize(None)
-    # ---------------------------------
     
     # 3. Generate Features
     model = RiskLabAIModel()
@@ -104,16 +112,21 @@ def run_simulation(symbol):
     # Align Data
     common_idx = labels.index.intersection(features.index)
     X = features.loc[common_idx, model.feature_names]
-    y = labels.loc[common_idx, 'bin']
+    
+    # --- FIX: Encode Labels for XGBoost (Same as Bot) ---
+    le = LabelEncoder()
+    y_raw = labels.loc[common_idx, 'bin']
+    y_encoded = le.fit_transform(y_raw)
+    y = pd.Series(y_encoded, index=common_idx)
+    
     t1 = labels.loc[common_idx, 't1']
     
-    # --- TIMEZONE NORMALIZATION ---
+    # Normalize Timezones
     if X.index.tz is not None: X.index = X.index.tz_localize(None)
     if y.index.tz is not None: y.index = y.index.tz_localize(None)
     if t1.index.tz is not None: t1.index = t1.index.tz_localize(None)
-    if pd.api.types.is_datetime64_any_dtype(t1) and getattr(t1.dt, 'tz', None) is not None:
+    if pd.api.types.is_datetime64_any_dtype(t1) and hasattr(t1, 'dt') and getattr(t1.dt, 'tz', None) is not None:
         t1 = t1.dt.tz_localize(None)
-    # ------------------------------
     
     # 5. Split Train/Test
     split_idx = int(len(X) * (1 - TEST_SPLIT))
@@ -125,10 +138,17 @@ def run_simulation(symbol):
 
     logger.info(f"[{symbol}] Train: {len(X_train)} | Test: {len(X_test)}")
 
-    # 6. Train Models (Purged CV)
+    # 6. Train Models (XGBoost + LogisticRegression)
     primary_base = Pipeline([
         ('imputer', SimpleImputer(strategy='median')),
-        ('clf', RandomForestClassifier(n_estimators=100, class_weight='balanced_subsample', n_jobs=1))
+        ('scaler', StandardScaler()),
+        ('clf', XGBClassifier(
+            n_estimators=100, 
+            max_depth=3, 
+            learning_rate=0.1, 
+            eval_metric='mlogloss', 
+            n_jobs=1
+        ))
     ])
     
     # Generate Out-of-Sample Predictions
@@ -156,17 +176,17 @@ def run_simulation(symbol):
     primary_final = clone(primary_base)
     primary_final.fit(X_train, y_train)
     
-    meta_final = BaggingClassifier(
-        estimator=DecisionTreeClassifier(max_depth=5),
-        n_estimators=50,
-        max_samples=0.6,
-        n_jobs=1
-    )
+    # Meta Model: Logistic Regression
+    meta_final = LogisticRegression(class_weight='balanced', solver='liblinear')
     meta_final.fit(X_meta_train, y_meta_train)
     
     # 7. Predictions
-    p_preds_test = primary_final.predict(X_test)
+    p_preds_encoded = primary_final.predict(X_test)
     
+    # Decode signals back to -1, 0, 1
+    p_preds_test = le.inverse_transform(p_preds_encoded)
+    
+    # Meta Confidence
     if hasattr(meta_final, "predict_proba"):
         probs = meta_final.predict_proba(X_test)
         meta_probs = probs[:, 1] if probs.shape[1] > 1 else np.zeros(len(X_test))
@@ -174,14 +194,13 @@ def run_simulation(symbol):
         meta_probs = meta_final.predict(X_test)
     
     # 8. THRESHOLD OPTIMIZATION LOOP
-    # We test multiple confidence levels to find the "Sweet Spot"
-    logger.info(f"[{symbol}] Optimizing Threshold...")
+    logger.info(f"[{symbol}] Optimizing Threshold (With Fees)...")
     
     best_res = None
     best_sharpe = -999
     
-    print(f"\n{'Threshold':<10} | {'Trades':<8} | {'Win Rate':<10} | {'Return':<10}")
-    print("-" * 50)
+    print(f"\n{'Threshold':<10} | {'Trades':<8} | {'Win Rate':<10} | {'Net Return':<10}")
+    print("-" * 55)
     
     bar_returns = bars.loc[X_test.index, 'close'].pct_change().shift(-1).fillna(0)
     
@@ -191,13 +210,13 @@ def run_simulation(symbol):
             signal = p_preds_test[i]
             conf = meta_probs[i]
             if signal != 0 and conf > threshold:
-                positions[i] = signal # Flat position size for backtest purity
+                positions[i] = signal 
         
         ret, trades, win_rate, sharpe = calculate_trade_metrics(positions, bar_returns)
         
         print(f"{threshold:<10} | {trades:<8} | {win_rate:<10.1%} | {ret:<10.2%}")
         
-        if sharpe > best_sharpe and trades > 10: # Minimum trades constraint
+        if sharpe > best_sharpe and trades > 10:
             best_sharpe = sharpe
             best_res = {
                 "Symbol": symbol,
@@ -209,7 +228,7 @@ def run_simulation(symbol):
             }
 
     if best_res:
-        logger.info(f"[{symbol}] BEST: Thresh={best_res['Best_Thresh']} | Win Rate={best_res['Win Rate']} | Return={best_res['Net Return']}")
+        logger.info(f"[{symbol}] BEST: Thresh={best_res['Best_Thresh']} | Return={best_res['Net Return']}")
         return best_res
     else:
         logger.warning(f"[{symbol}] No profitable threshold found.")
@@ -237,7 +256,7 @@ def main():
     if results:
         df = pd.DataFrame(results)
         print("\n" + "="*60)
-        print("OPTIMIZED BACKTEST RESULTS")
+        print("OPTIMIZED BACKTEST RESULTS (Net of Fees)")
         print("="*60)
         print(df[["Symbol", "Best_Thresh", "Net Return", "Win Rate", "Trades"]].to_string(index=False))
         print("="*60)
