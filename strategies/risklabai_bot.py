@@ -5,10 +5,11 @@ from ta import momentum, volatility
 from datetime import datetime, timedelta
 from typing import Dict, Tuple
 
+# Lumibot
 from lumibot.strategies.strategy import Strategy
 from lumibot.entities import Asset
 
-# ML Libraries
+# Machine Learning
 from xgboost import XGBClassifier
 from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import Pipeline
@@ -23,6 +24,7 @@ from utils.financial_ml import (
     PurgedCrossValidator, HRPPortfolio
 )
 
+# Data & Config
 from config.all_symbols import SYMBOLS
 from data.model_storage import ModelStorage
 from data.tick_storage import TickStorage
@@ -44,7 +46,7 @@ class RiskLabAIModel:
         self.labeler = TripleBarrierLabeler(
             profit_taking_mult=2.0, 
             stop_loss_mult=2.0,
-            max_holding_period=5 # 5-day horizon for swing trading
+            max_holding_period=5 
         )
         self.meta_labeler = MetaLabeler()
         self.frac_diff = FractionalDifferentiator(d=0.4)
@@ -84,14 +86,24 @@ class RiskLabAIModel:
         self.feature_names = [c for c in df.columns if c not in excluded_cols]
         return df
 
-    def train_from_ticks(self, symbol: str, min_samples=200, tune=False) -> Dict:
-        logger.info(f"[{symbol}] Loading ticks...")
-        ticks = TickStorage().load_ticks(symbol)
+    def train_from_ticks(self, symbol: str, days=365, min_samples=200, tune=False) -> Dict:
+        """
+        Trains the model on a ROLLING WINDOW of data.
+        :param days: Number of past days to train on (default 365).
+        """
+        # Calculate Rolling Window Start Date
+        start_date = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d')
+        
+        logger.info(f"[{symbol}] Loading ticks (Rolling Window: {start_date} -> Now)...")
+        
+        # --- ENFORCE ROLLING WINDOW HERE ---
+        # We pass start_date to load_ticks so we ignore old data in the DB
+        ticks = TickStorage().load_ticks(symbol, start_date=start_date)
+        
         if ticks.empty: return {'success': False, 'reason': 'no_data'}
 
         logger.info(f"[{symbol}] Generating Dollar Imbalance Bars...")
-        # Uses dynamic thresholding automatically
-        bars = ImbalanceBarGenerator.process_ticks(ticks)
+        bars = ImbalanceBarGenerator.process_ticks(ticks, threshold=None)
         
         if bars.empty or len(bars) < min_samples: return {'success': False, 'reason': 'insufficient_bars'}
 
@@ -108,7 +120,7 @@ class RiskLabAIModel:
         common_idx = labels.index.intersection(features_df.index)
         X = features_df.loc[common_idx, self.feature_names]
         
-        # Encode Labels for XGBoost (-1, 0, 1 -> 0, 1, 2)
+        # Encode Labels
         y_raw = labels.loc[common_idx, 'bin']
         y_encoded = self.label_encoder.fit_transform(y_raw)
         y = pd.Series(y_encoded, index=common_idx)
@@ -124,7 +136,7 @@ class RiskLabAIModel:
 
         if len(y) < 50: return {'success': False, 'reason': 'insufficient_labels'}
 
-        # Primary Model: XGBoost Classifier
+        # PRIMARY MODEL: XGBoost
         base_estimator = Pipeline([
             ('imputer', SimpleImputer(strategy='median')),
             ('scaler', StandardScaler()), 
@@ -136,7 +148,6 @@ class RiskLabAIModel:
 
         logger.info(f"[{symbol}] Purged CV for Meta-Labels...")
         cv = PurgedCrossValidator(n_splits=5, embargo_pct=0.01)
-        
         meta_features = np.zeros(len(y))
         valid_indices_mask = np.zeros(len(y), dtype=bool)
         
@@ -152,8 +163,7 @@ class RiskLabAIModel:
         self.primary_model = clone(base_estimator)
         self.primary_model.fit(X, y)
         
-        # Meta Model: Logistic Regression
-        # Predicts probability that the Primary Model is correct
+        # META MODEL: Logistic Regression
         X_meta = X.iloc[valid_indices_mask]
         y_meta_target = (meta_features[valid_indices_mask] == y.iloc[valid_indices_mask]).astype(int)
         
@@ -223,14 +233,11 @@ class RiskLabAIStrategy(Strategy):
             signal, conf = model.predict(bars)
             pos = self.get_position(symbol)
             
-            # Use 0.6 confidence threshold for trade execution
             if conf > 0.6:
                 current_price = bars['close'].iloc[-1]
                 vol = model.labeler.get_volatility(bars['close']).iloc[-1]
                 
-                # Entry Logic: Bracket Order
                 if signal == 1 and pos is None:
-                    # Dynamic Exit Pricing
                     tp_price = current_price * (1 + vol * model.labeler.pt_mult)
                     sl_price = current_price * (1 - vol * model.labeler.sl_mult)
                     
@@ -241,13 +248,7 @@ class RiskLabAIStrategy(Strategy):
                     
                     if qty > 0:
                         logger.info(f"[{symbol}] BUY | Vol: {vol:.4f} | TP: {tp_price:.2f} | SL: {sl_price:.2f}")
-                        
-                        # Market Buy with automated TP/SL
-                        self.create_order(
-                            symbol, qty, "buy", 
-                            take_profit_price=tp_price, 
-                            stop_loss_price=sl_price
-                        )
+                        self.create_order(symbol, qty, "buy", take_profit_price=tp_price, stop_loss_price=sl_price)
                         self.submit_order(self.create_order(symbol, qty, "buy"))
 
                 elif signal == -1 and pos:
@@ -256,7 +257,6 @@ class RiskLabAIStrategy(Strategy):
 
     def _update_hrp_weights(self):
         now = datetime.now()
-        # Daily Rebalance
         if self.last_rebalance and (now - self.last_rebalance) < timedelta(hours=24):
             return
 

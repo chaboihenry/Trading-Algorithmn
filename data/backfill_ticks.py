@@ -2,13 +2,26 @@ import sys
 import os
 import time
 import sqlite3
+import logging
+import argparse
+import threading
+import queue
 from datetime import date, timedelta
-import alpaca_trade_api as tradeapi
+from concurrent.futures import ThreadPoolExecutor, wait
+
+from dotenv import load_dotenv
+load_dotenv()
+
+import requests
+import requests.adapters
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockTradesRequest
 
 project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../"))
-sys.path.append(project_root)
+if str(project_root) not in sys.path:
+    sys.path.append(str(project_root))
 
-import data.tick_storage as tick_storage
+from data.tick_storage import TickStorage
 from utils.market_calendar import is_trading_day
 from config.settings import ALPACA_API_KEY, ALPACA_SECRET_KEY, DB_PATH
 from config.all_symbols import SYMBOLS
@@ -16,139 +29,217 @@ from config.logging_config import setup_logging
 
 logger = setup_logging(script_name="backfill_ticks")
 
-# --- CONFIGURATION ---
-# Changed from 90 to 365 to capture a full year of market regimes (Bull, Bear, Chop)
-TARGET_WINDOW_DAYS = 365 
-BATCH_SIZE = 10000
+# --- CONFIG ---
+TARGET_WINDOW_DAYS = 365
+# Increased Batch Size for faster throughput
+BATCH_SIZE = 50000 
+MAX_WORKERS = 4 
 
-# Connect to Alpaca
-api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url='https://paper-api.alpaca.markets')
+db_write_queue = queue.Queue()
 
-def get_prioritized_symbols():
-    """
-    Returns symbols sorted by 'least recently updated' to ensure fairness.
-    """
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    # Ensure status table exists
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS backfill_status (
-            symbol TEXT PRIMARY KEY,
-            status TEXT,
-            last_backfilled_date TEXT
-        )
-    """)
-    conn.commit()
+session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=MAX_WORKERS, pool_maxsize=MAX_WORKERS, max_retries=3)
+session.mount('https://', adapter)
+
+client = StockHistoricalDataClient(ALPACA_API_KEY, ALPACA_SECRET_KEY)
+print_lock = threading.Lock()
+
+class TradeDataAdapter:
+    def __init__(self, trade):
+        self.t = trade.timestamp
+        self.p = trade.price
+        self.s = trade.size
+        self.c = trade.conditions
+        self.x = trade.exchange
+
+def init_db():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.execute("PRAGMA journal_mode=WAL;") 
+        # SPEED HACK: Don't wait for disk flush
+        conn.execute("PRAGMA synchronous=OFF;") 
+        conn.execute("PRAGMA cache_size=-64000;") # 64MB Cache
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS backfill_status (
+                symbol TEXT PRIMARY KEY,
+                status TEXT,
+                last_backfilled_date TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.warning(f"DB Init Warning: {e}")
+
+def db_writer_worker():
+    storage = TickStorage(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=OFF;") # Critical for speed
     
-    cursor.execute("SELECT symbol, last_backfilled_date FROM backfill_status")
-    db_status = {row[0]: row[1] for row in cursor.fetchall()}
+    writes_since_checkpoint = 0
+    
+    while True:
+        try:
+            item = db_write_queue.get()
+            if item is None: break
+            
+            task_type, payload = item
+            
+            if task_type == 'TICKS':
+                symbol, batch = payload
+                storage.save_ticks(symbol, batch)
+                writes_since_checkpoint += 1
+                
+            elif task_type == 'STATUS':
+                symbol, date_str = payload
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO backfill_status (symbol, status, last_backfilled_date) VALUES (?, ?, ?)",
+                        (symbol, 'active', date_str)
+                    )
+            
+            # Less frequent checkpointing (every 50 batches instead of 20)
+            if writes_since_checkpoint >= 50:
+                conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+                writes_since_checkpoint = 0
+            
+            db_write_queue.task_done()
+            
+        except Exception as e:
+            with print_lock:
+                print(f"❌ DB Writer Error: {e}")
+    
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE);") 
     conn.close()
+    print("💾 DB Writer Thread Finished.")
 
-    final_list = []
-    for sym in SYMBOLS:
-        last_date = db_status.get(sym)
-        # Default to a very old date if never backfilled
-        sort_date = last_date if last_date else "1900-01-01"
-        final_list.append((sym, last_date, sort_date))
+def check_date_exists(conn, symbol, date_obj):
+    safe_symbol = symbol.replace('.', '_').replace('-', '_')
+    table_name = f"ticks_{safe_symbol}"
+    start_ts = date_obj.strftime("%Y-%m-%d")
+    next_day = (date_obj + timedelta(days=1)).strftime("%Y-%m-%d")
+    try:
+        cursor = conn.cursor()
+        cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+        if not cursor.fetchone(): return False
+        query = f"SELECT 1 FROM {table_name} WHERE timestamp >= ? AND timestamp < ? LIMIT 1"
+        cursor.execute(query, (start_ts, next_day))
+        return cursor.fetchone() is not None
+    except Exception:
+        return False
 
-    # Sort by date (oldest first)
-    final_list.sort(key=lambda x: x[2])
-    return final_list
-
-def run_backfill():
-    logger.info(f"Connecting to DB at: {DB_PATH}")
-    priority_queue = get_prioritized_symbols()
+def backfill_symbol(symbol):
+    end_date = date.today() - timedelta(days=1)
+    start_date = end_date - timedelta(days=TARGET_WINDOW_DAYS)
+    read_conn = sqlite3.connect(DB_PATH, timeout=30)
     
-    target_end_date = date.today() - timedelta(days=1)
-    default_start_date = target_end_date - timedelta(days=TARGET_WINDOW_DAYS)
-
-    logger.info("=" * 60)
-    logger.info(f"SMART BACKFILL (PRIORITY QUEUE)")
-    logger.info(f"  Target Window: {TARGET_WINDOW_DAYS} Days")
-    logger.info(f"  Start Date:    {default_start_date}")
-    logger.info(f"  Queue Size:    {len(priority_queue)} Symbols")
-    logger.info("=" * 60)
-
-    for symbol, last_date_str, _ in priority_queue:
-        # Determine where to resume from
-        if last_date_str:
-            last_date = date.fromisoformat(last_date_str)
-            start_date = last_date + timedelta(days=1)
-            # If the database has older data than our 365 target, we just append recent data.
-            # If the database is missing the deep history, we might want to force start_date back.
-            # For now, we assume we want to fill GAPS forward.
-            if start_date < default_start_date:
-                start_date = default_start_date
-        else:
-            start_date = default_start_date
-
-        if start_date > target_end_date:
-            logger.info(f"✓ {symbol} is up to date ({last_date_str}).")
+    current_date = start_date
+    skipped_count = 0
+    
+    while current_date <= end_date:
+        if not is_trading_day(current_date):
+            current_date += timedelta(days=1)
             continue
 
-        logger.info(f">>> Processing {symbol} (Last: {last_date_str or 'NEVER'})")
-        logger.info(f"    Target: {start_date} -> {target_end_date}")
+        date_str = current_date.isoformat()
+        
+        if check_date_exists(read_conn, symbol, current_date):
+            skipped_count += 1
+            current_date += timedelta(days=1)
+            continue
+        
+        if skipped_count > 0:
+            with print_lock:
+                print(f"[{symbol}] Skipped {skipped_count} existing days. Downloading {date_str}...")
+            skipped_count = 0
+            
+        try:
+            request = StockTradesRequest(
+                symbol_or_symbols=symbol,
+                start=current_date,
+                end=current_date + timedelta(days=1),
+                limit=None
+            )
+            trades_generator = client.get_stock_trades(request)
+            
+            trades_list = []
+            if hasattr(trades_generator, 'data'):
+                trades_list = trades_generator.data.get(symbol, [])
+            elif isinstance(trades_generator, dict):
+                trades_list = trades_generator.get(symbol, [])
 
-        current_date = start_date
-        while current_date <= target_end_date:
-            if not is_trading_day(current_date):
+            if not trades_list:
                 current_date += timedelta(days=1)
                 continue
 
-            date_str = current_date.isoformat()
+            batch = []
+            day_total = 0
             
-            try:
-                # Fetch trades for the single day
-                # limit=None usually implies auto-pagination in recent SDKs, but we use high number
-                trades_iter = api.get_trades(symbol, start=date_str, end=date_str, limit=None)
+            for trade in trades_list:
+                wrapper = TradeDataAdapter(trade)
+                batch.append(wrapper)
                 
-                batch = []
-                count = 0
-                
-                for trade in trades_iter:
-                    # Convert to dictionary for storage compatibility
-                    t_dict = {
-                        'timestamp': trade.t.isoformat() if hasattr(trade, 't') else trade.timestamp,
-                        'price': float(trade.p) if hasattr(trade, 'p') else float(trade.price),
-                        'size': float(trade.s) if hasattr(trade, 's') else float(trade.size),
-                        'exchange': trade.x if hasattr(trade, 'x') else getattr(trade, 'exchange', ''),
-                        'conditions': ",".join(trade.c) if hasattr(trade, 'c') else str(getattr(trade, 'conditions', ''))
-                    }
-                    batch.append(t_dict)
-                    
-                    if len(batch) >= BATCH_SIZE:
-                        tick_storage.save_ticks(symbol, batch)
-                        count += len(batch)
-                        batch = []
+                if len(batch) >= BATCH_SIZE:
+                    db_write_queue.put(('TICKS', (symbol, list(batch))))
+                    day_total += len(batch)
+                    batch = []
 
-                if batch:
-                    tick_storage.save_ticks(symbol, batch)
-                    count += len(batch)
-                
-                if count > 0:
-                    logger.info(f"    -> {date_str}: Done ({count} ticks)")
-                else:
-                    logger.info(f"    -> {date_str}: No data found")
+            if batch:
+                db_write_queue.put(('TICKS', (symbol, list(batch))))
+                day_total += len(batch)
 
-                # Update Status in DB
-                conn = sqlite3.connect(DB_PATH)
-                conn.execute(
-                    "INSERT OR REPLACE INTO backfill_status (symbol, status, last_backfilled_date) VALUES (?, ?, ?)", 
-                    (symbol, 'active', date_str)
-                )
-                conn.commit()
-                conn.close()
+            db_write_queue.put(('STATUS', (symbol, date_str)))
 
-            except KeyboardInterrupt:
-                logger.warning("STOPPING safely. Progress saved.")
-                sys.exit(0)
-            except Exception as e:
-                logger.error(f"Error processing {symbol} on {date_str}: {e}")
-                time.sleep(2) # Backoff
+            with print_lock:
+                # Less verbose: Only print total for the day
+                print(f"[{symbol}] {date_str}: +{day_total} ticks")
             
-            current_date += timedelta(days=1)
+        except Exception as e:
+            if "429" in str(e):
+                with print_lock:
+                    print(f"[{symbol}] ⚠️ Rate Limit. Sleeping 20s...")
+                time.sleep(20)
+            else:
+                with print_lock:
+                    print(f"[{symbol}] ❌ Error on {date_str}: {e}")
+                time.sleep(1)
+        
+        current_date += timedelta(days=1)
+    
+    read_conn.close()
+    return f"[{symbol}] ✅ Complete."
 
-    logger.info("ALL SYMBOLS UP TO DATE")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", help="Backfill single symbol")
+    parser.add_argument("--all", action="store_true", help="Backfill ALL symbols")
+    parser.add_argument("--workers", type=int, default=MAX_WORKERS, help="Parallel workers")
+    args = parser.parse_args()
+
+    init_db()
+    
+    writer_thread = threading.Thread(target=db_writer_worker, daemon=True)
+    writer_thread.start()
+    
+    targets = []
+    if args.symbol:
+        targets = [args.symbol.upper()]
+    elif args.all:
+        targets = SYMBOLS
+    else:
+        logger.error("Please specify --symbol or --all")
+        return
+
+    logger.info(f"Starting Speed Backfill (Synchronous=OFF)")
+    
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {executor.submit(backfill_symbol, sym): sym for sym in targets}
+        wait(futures)
+
+    db_write_queue.put(None)
+    writer_thread.join()
+    print("All tasks complete.")
 
 if __name__ == "__main__":
-    run_backfill()
+    main()

@@ -7,49 +7,42 @@ logger = logging.getLogger(__name__)
 class ImbalanceBarGenerator:
     """
     Generates Dollar Imbalance Bars with DYNAMIC Thresholds.
-    Adapts to the liquidity of the symbol (QQQ vs Small Cap).
     """
     @staticmethod
     def get_dynamic_threshold(ticks: pd.DataFrame, target_bars_per_day=50) -> float:
-        """
-        Calculates a threshold that results in approx 'target_bars_per_day'.
-        """
-        total_dollar_vol = (ticks['price'] * ticks['size']).sum()
+        """Calculates adaptive threshold based on daily dollar volume."""
+        if ticks.empty: return 1_000_000
         
-        # Calculate number of days in the dataset
+        total_dollar_vol = (ticks['price'] * ticks['size']).sum()
         time_span = ticks.index[-1] - ticks.index[0]
         days = max(1, time_span.days)
         
         avg_daily_dollar_vol = total_dollar_vol / days
-        
-        # Threshold = Average Dollar Volume per Bar
         threshold = avg_daily_dollar_vol / target_bars_per_day
         
-        # Safety floor to prevent tiny bars on bad data
-        return max(threshold, 10_000) 
+        # Clamp to reasonable minimum to avoid noise explosion
+        return max(threshold, 10_000)
 
     @staticmethod
     def process_ticks(ticks: pd.DataFrame, threshold: float = None) -> pd.DataFrame:
         if ticks.empty:
             return pd.DataFrame()
 
-        # Ensure sorted
         ticks = ticks.sort_index()
         
-        # --- DYNAMIC THRESHOLD CALCULATION ---
+        # Auto-calculate threshold if not provided
         if threshold is None:
             threshold = ImbalanceBarGenerator.get_dynamic_threshold(ticks)
-            # logger.info(f"Dynamic Threshold calculated: ${threshold:,.2f}")
         
         # 1. Tick Rule
         price_diff = ticks['price'].diff()
         tick_signs = price_diff.apply(np.sign)
         tick_signs = tick_signs.replace(0, np.nan).ffill().fillna(1)
         
-        # 2. Signed Flow
+        # 2. Signed Dollar Flow
         signed_dollar_flow = tick_signs * ticks['price'] * ticks['size']
         
-        # 3. Bar Generation Loop
+        # 3. Fast Iteration (Numpy)
         cum_theta = 0
         bars = []
         
@@ -64,7 +57,6 @@ class ImbalanceBarGenerator:
             'start_time': ticks.index[0]
         }
         
-        # Numpy arrays for speed
         prices = ticks['price'].values
         sizes = ticks['size'].values
         imbalances = signed_dollar_flow.values
@@ -78,7 +70,7 @@ class ImbalanceBarGenerator:
             
             cum_theta += imbalance
             
-            # Update stats
+            # Update Bar Stats
             if p > current_bar['high']: current_bar['high'] = p
             if p < current_bar['low']: current_bar['low'] = p
             current_bar['close'] = p
@@ -97,7 +89,7 @@ class ImbalanceBarGenerator:
                     'volume': current_bar['volume'],
                     'vwap': current_bar['dollar_val'] / current_bar['volume'] if current_bar['volume'] > 0 else p,
                     'ticks': current_bar['ticks'],
-                    'threshold_used': threshold # Useful for debugging
+                    'threshold_used': threshold
                 })
                 
                 cum_theta = 0
