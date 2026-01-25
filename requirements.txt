@@ -1,46 +1,46 @@
-# Core Trading Framework
-lumibot>=2.8.0
+# --- 1. Critical Build Fixes (Must come first) ---
+# Fixes 'AttributeError: cython_sources' on Python 3.12+
+PyYAML>=6.0.1
+setuptools>=69.0.0
+wheel>=0.42.0
 
-# Broker Integration
-alpaca-py>=0.9.0
-alpaca-trade-api>=3.0.0
-
-# Data Processing
+# --- 2. Core Math (Pinned for Stability) ---
+# Pinned <2.0.0 because yfinance, tensorflow, and lumibot rely on Numpy 1.x
+numpy<2.0.0
 pandas>=2.0.0
-numpy>=1.24.0
 scipy>=1.10.0
 
-# Machine Learning
+# --- 3. Data Pipeline (S3 & Parquet) ---
+s3fs>=2023.6.0
+boto3>=1.28.0
+pyarrow>=14.0.0
+fastparquet>=2023.8.0
+
+# --- 4. Trading & Brokerage ---
+lumibot>=2.8.0
+alpaca-py>=0.9.0
+alpaca-trade-api>=3.0.0
+yfinance>=0.2.28
+pandas_market_calendars>=4.0.0
+exchange_calendars>=4.0.0
+
+# --- 5. Machine Learning & Stats ---
 scikit-learn>=1.3.0
 xgboost>=2.0.0
-tensorflow>=2.15.0
 statsmodels>=0.14.0
+tensorflow>=2.15.0
+# Pinned OpenCV to match Numpy 1.x compatibility
+opencv-python<=4.9.0.80
 
-# Market Data
-yfinance>=0.2.28
-
-# RiskLabAI and Dependencies
-RiskLabAI>=1.0.7
-memory-profiler>=0.61.0
-sympy>=1.12
-numba>=0.58.0
+# --- 6. Analysis & Utilities ---
 ta>=0.11.0
+ta-lib>=0.4.0
+RiskLabAI>=1.0.7
 quantecon>=0.7.0
-
-# Visualization
-matplotlib>=3.7.0
-seaborn>=0.12.0
-
-# Utilities
 python-dotenv>=1.0.0
 joblib>=1.3.0
 requests>=2.31.0
 coloredlogs>=15.0
-
-#Technical Indicators (Optional: requires binary installation)
-ta-lib>=0.4.0
-
-holidays
-
-# AWS Cloud infrastructure
-boto3>=1.28.0
+tqdm>=4.66.0
+holidays>=0.30
+memory-profiler>=0.61.0

@@ -25,9 +25,8 @@ def train_symbol(symbol):
     # Instantiate the model architecture
     model = RiskLabAIModel(symbol)
     
-    # Train the model
-    # This handles data loading, dollar bar generation, and the ML pipeline internally
-    result = model.train_from_ticks(symbol)
+    # Train the model (Uses Parquet Bars if available)
+    result = model.train(symbol)
     
     if result['success']:
         logger.info(f"[{symbol}] Saving Model...")

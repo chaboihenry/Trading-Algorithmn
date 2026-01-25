@@ -2,69 +2,112 @@ import argparse
 import logging
 import os
 import sys
+import boto3
+import io
 import numpy as np
 import pandas as pd
 from pathlib import Path
+from dotenv import load_dotenv
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.base import clone
-
-# ML Imports
-from xgboost import XGBClassifier
-from sklearn.linear_model import LogisticRegression
 
 # Path Setup
 file_path = Path(__file__).resolve()
 project_root = file_path.parent.parent
+env_path = project_root / "config" / ".env"
+if env_path.exists(): load_dotenv(dotenv_path=env_path)
+else: load_dotenv()
+
 if str(project_root) not in sys.path:
     sys.path.append(str(project_root))
 
-from config.settings import DB_PATH
 from config.all_symbols import SYMBOLS
 from config.logging_config import setup_logging
-from data.tick_storage import TickStorage
-from data.tick_to_bars import ImbalanceBarGenerator
+from config.aws_config import AWS_REGION, S3_MODEL_BUCKET
 from strategies.risklabai_bot import RiskLabAIModel
-from utils.financial_ml import PurgedCrossValidator
+from data.model_storage import ModelStorage
 
 logger = setup_logging(script_name="backtest")
 
-TEST_SPLIT = 0.20
-TRANSACTION_COST = 0.0002 
+TEST_SPLIT = 0.20 # Last 20% of data for Out-of-Sample testing
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--symbol", help="Symbol to test")
-    parser.add_argument("--all", action="store_true")
-    return parser.parse_args()
+def get_s3_client():
+    key_id = os.getenv("AWS_ACCESS_KEY_ID")
+    secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+    if not key_id or not secret_key: return None
+    return boto3.client(
+        's3',
+        region_name=os.getenv("AWS_REGION", "us-east-1"),
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret_key
+    )
+
+def load_bars_from_s3(symbol):
+    s3 = get_s3_client()
+    if not s3:
+        logger.error("AWS Credentials missing.")
+        return pd.DataFrame()
+
+    bucket = os.getenv("S3_MODEL_BUCKET", "trading-agent-models")
+    key = f"{symbol}/bars/{symbol}_dollar_bars.parquet"
+    
+    try:
+        logger.info(f"[{symbol}] Downloading bars from s3://{bucket}/{key} ...")
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        with io.BytesIO(obj['Body'].read()) as buffer:
+            bars = pd.read_parquet(buffer)
+        
+        # Ensure Index is clean
+        if not isinstance(bars.index, pd.DatetimeIndex):
+            if 'timestamp' in bars.columns: bars.set_index('timestamp', inplace=True)
+            else: bars.index = pd.to_datetime(bars.index)
+        
+        if bars.index.tz is not None: bars.index = bars.index.tz_localize(None)
+        
+        return bars
+    except Exception as e:
+        logger.error(f"[{symbol}] Failed to load bars from S3: {e}")
+        return pd.DataFrame()
 
 def calculate_alpaca_fees(price, qty, side):
+    """
+    Estimates costs: Slippage + Regulatory Fees
+    """
     notional = price * qty
-    slippage = notional * 0.0001
+    # Assume 1 basis point slippage (0.01%)
+    slippage = notional * 0.0001 
+    
     reg_fees = 0.0
-    if side == -1:
+    if side == -1: # Sell side fees
         sec_fee = notional * (8.00 / 1_000_000)
         taf_fee = min(qty * 0.000166, 8.30)
         reg_fees = sec_fee + taf_fee
+        
     return slippage + reg_fees
 
-def simulate_triple_barrier_trades(prices, signals, confidences, volatility, threshold, pt_mult, sl_mult, time_limit_bars):
+def simulate_trades(prices, signals, confidences, volatility, threshold, pt_mult, sl_mult, time_limit_bars):
     trades = []
     active_trade = None
     
+    # Iterate through the test set
     for i in range(len(prices)):
         price = prices.iloc[i]
         current_time = prices.index[i]
         
+        # 1. Manage Active Trade
         if active_trade:
             entry_price = active_trade['entry_price']
             side = active_trade['side']
             qty = active_trade['qty']
             
+            # Check Exit Conditions
             hit_tp = (price >= active_trade['tp']) if side == 1 else (price <= active_trade['tp'])
             hit_sl = (price <= active_trade['sl']) if side == 1 else (price >= active_trade['sl'])
-            time_expired = (i - active_trade['entry_idx']) >= time_limit_bars
+            
+            # Calculate time elapsed in bars
+            bars_held = i - active_trade['entry_idx']
+            time_expired = bars_held >= time_limit_bars
             
             exit_price = None
             exit_reason = None
@@ -80,10 +123,12 @@ def simulate_triple_barrier_trades(prices, signals, confidences, volatility, thr
                 exit_reason = 'TIME'
             
             if exit_price:
+                # Calculate PnL
                 gross_pnl = (exit_price - entry_price) * qty * side
                 exit_cost = calculate_alpaca_fees(exit_price, qty, -side)
                 total_cost = active_trade['entry_cost'] + exit_cost
                 net_pnl = gross_pnl - total_cost
+                
                 notional = entry_price * qty
                 net_ret = net_pnl / notional
                 
@@ -92,19 +137,23 @@ def simulate_triple_barrier_trades(prices, signals, confidences, volatility, thr
                     'exit_time': current_time,
                     'side': side,
                     'ret': net_ret,
-                    'reason': exit_reason
+                    'reason': exit_reason,
+                    'conf': active_trade['conf']
                 })
                 active_trade = None
-                continue
+                continue # Trade closed, move to next bar
 
+        # 2. Check for New Entry (if flat)
         if active_trade is None:
             sig = signals.iloc[i]
             conf = confidences.iloc[i]
             
+            # Check Threshold
             if sig != 0 and conf > threshold:
                 vol = volatility.iloc[i]
-                qty = 100 
+                qty = 100 # Fixed size for sim
                 
+                # Dynamic Barriers based on Volatility
                 if sig == 1:
                     tp = price * (1 + vol * pt_mult)
                     sl = price * (1 - vol * sl_mult)
@@ -122,162 +171,150 @@ def simulate_triple_barrier_trades(prices, signals, confidences, volatility, thr
                     'tp': tp,
                     'sl': sl,
                     'qty': qty,
-                    'entry_cost': entry_cost
+                    'entry_cost': entry_cost,
+                    'conf': conf
                 }
 
     return pd.DataFrame(trades)
 
 def run_simulation(symbol):
-    logger.info(f"--- Simulating {symbol} ---")
+    logger.info(f"--- Backtesting {symbol} ---")
     
-    storage = TickStorage(DB_PATH)
-    ticks = storage.load_ticks(symbol)
-    storage.close()
-    
-    if ticks.empty or len(ticks) < 1000:
-        logger.warning(f"[{symbol}] Not enough data (Need backfill).")
-        return None
+    # 1. Load Data
+    bars = load_bars_from_s3(symbol)
+    if bars.empty: return
 
-    # Dynamic Dollar Bars
-    bars = ImbalanceBarGenerator.process_ticks(ticks, threshold=None)
-    if bars.empty: return None
-    if bars.index.tz is not None: bars.index = bars.index.tz_localize(None)
-    
-    model = RiskLabAIModel()
-    features = model.generate_features(bars)
-    if features.empty: return None
+    # 2. Load Trained Model
+    storage = ModelStorage()
+    model_data = storage.load_model(symbol)
+    if not model_data:
+        logger.error(f"[{symbol}] No trained model found.")
+        return
         
-    close_prices = bars.loc[features.index, 'close']
-    volatility = model.labeler.get_volatility(close_prices)
-    events = model.cusum.get_events(close_prices)
-    labels = model.labeler.label(close_prices, pd.DataFrame(index=events))
-    
-    common_idx = labels.index.intersection(features.index)
-    X = features.loc[common_idx, model.feature_names]
-    
-    le = LabelEncoder()
-    y_raw = labels.loc[common_idx, 'bin']
-    y_encoded = le.fit_transform(y_raw)
-    y = pd.Series(y_encoded, index=common_idx)
-    t1 = labels.loc[common_idx, 't1']
-    
-    if X.index.tz is not None: X.index = X.index.tz_localize(None)
-    
-    split_idx = int(len(X) * (1 - TEST_SPLIT))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
-    t1_train = t1.iloc[:split_idx]
-    
-    if len(X_test) < 10: return None
-    logger.info(f"[{symbol}] Train: {len(X_train)} | Test: {len(X_test)}")
+    # Reconstruct the RiskLabAIModel wrapper
+    rl_model = RiskLabAIModel(symbol)
+    rl_model.primary_model = model_data['primary_model']
+    rl_model.meta_model = model_data['meta_model']
+    rl_model.feature_names = model_data['feature_names']
+    rl_model.label_encoder = model_data['label_encoder']
 
-    primary_base = Pipeline([
-        ('imputer', SimpleImputer(strategy='median')),
-        ('scaler', StandardScaler()),
-        ('clf', XGBClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, n_jobs=1))
-    ])
+    # 3. Prepare Test Data
+    # We must generate features exactly like training
+    logger.info(f"[{symbol}] Generating Features for Backtest...")
+    features = rl_model.generate_features(bars)
+    if features.empty: return
     
-    meta_features = np.zeros(len(y_train))
-    valid_indices_mask = np.zeros(len(y_train), dtype=bool)
-    cv = PurgedCrossValidator(n_splits=5, embargo_pct=0.01)
+    # Split Data (OOS Test)
+    split_idx = int(len(features) * (1 - TEST_SPLIT))
+    test_features = features.iloc[split_idx:]
+    test_bars = bars.loc[test_features.index]
     
+    if len(test_features) < 100:
+        logger.warning("Not enough test data.")
+        return
+
+    logger.info(f"[{symbol}] Testing on {len(test_features)} bars ({test_bars.index[0]} -> {test_bars.index[-1]})")
+
+    # 4. Generate Signals
+    logger.info(f"[{symbol}] Predicting Signals...")
     try:
-        cv_gen = cv.get_cv(t1_train)
-        for train_idx, val_idx in cv_gen.split(X_train, y_train):
-            temp_model = clone(primary_base)
-            temp_model.fit(X_train.iloc[train_idx], y_train.iloc[train_idx])
-            val_preds = temp_model.predict(X_train.iloc[val_idx])
-            meta_features[val_idx] = val_preds
-            valid_indices_mask[val_idx] = True
-    except Exception: return None
+        X_test = test_features[rl_model.feature_names]
+        
+        # Primary Signal (Argmax)
+        # Use predict_proba + argmax to be robust
+        probs = rl_model.primary_model.predict_proba(X_test)
+        pred_indices = np.argmax(probs, axis=1)
+        signals = rl_model.label_encoder.inverse_transform(pred_indices)
+        
+        # Meta Confidence
+        confidences = np.zeros(len(signals))
+        if rl_model.meta_model:
+            if hasattr(rl_model.meta_model, "predict_proba"):
+                confidences = rl_model.meta_model.predict_proba(X_test)[:, 1]
+            else:
+                confidences = rl_model.meta_model.predict(X_test)
+        
+    except Exception as e:
+        logger.error(f"Prediction failed: {e}")
+        return
 
-    primary_final = clone(primary_base)
-    primary_final.fit(X_train, y_train)
+    # 5. Run Sim Loop
+    # Align signals to DataFrame index
+    signals_series = pd.Series(signals, index=test_features.index)
+    conf_series = pd.Series(confidences, index=test_features.index)
+    close_prices = test_bars['close']
     
-    meta_final = LogisticRegression(class_weight='balanced', solver='liblinear')
-    X_meta_train = X_train.iloc[valid_indices_mask]
-    y_meta_train = (meta_features[valid_indices_mask] == y_train.iloc[valid_indices_mask]).astype(int)
-    meta_final.fit(X_meta_train, y_meta_train)
+    # Calculate volatility for dynamic barriers (replicate Labeler logic)
+    # Using simple EWM std dev matching training
+    volatility = close_prices.pct_change().ewm(span=100).std()
     
-    p_preds_encoded = primary_final.predict(X_test)
-    signals = pd.Series(le.inverse_transform(p_preds_encoded), index=X_test.index)
+    # Benchmarks
+    bh_return = (close_prices.iloc[-1] / close_prices.iloc[0]) - 1
     
-    if hasattr(meta_final, "predict_proba"):
-        conf_arr = meta_final.predict_proba(X_test)[:, 1]
-    else:
-        conf_arr = meta_final.predict(X_test)
-    confidences = pd.Series(conf_arr, index=X_test.index)
-
-    logger.info(f"[{symbol}] Running Stateful Simulation...")
-    
-    test_prices = close_prices.loc[X_test.index]
-    bh_return = (test_prices.iloc[-1] / test_prices.iloc[0]) - 1
-    test_vol = volatility.loc[X_test.index]
-    
-    # 5 Days Approx
-    avg_bars_per_day = len(bars) / 90 
-    time_limit_bars = int(avg_bars_per_day * 5)
-
     best_res = None
-    best_ret = -999
+    best_net_ret = -999
     
-    print(f"\n{'Threshold':<10} | {'Trades':<6} | {'Win%':<6} | {'Return':<8} | {'L/S Ratio':<10}")
-    print("-" * 60)
+    print(f"\n{'Threshold':<10} | {'Trades':<6} | {'Win%':<6} | {'Net Return':<10} | {'Sharpe':<8} | {'Benchmark':<10}")
+    print("-" * 75)
     
-    for threshold in [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8]:
-        trade_log = simulate_triple_barrier_trades(
-            prices=test_prices,
-            signals=signals,
-            confidences=confidences,
-            volatility=test_vol,
-            threshold=threshold,
-            pt_mult=model.labeler.pt_mult,
-            sl_mult=model.labeler.sl_mult,
-            time_limit_bars=time_limit_bars
+    # Test different confidence thresholds
+    for thresh in [0.5, 0.55, 0.6, 0.65, 0.7]:
+        trade_log = simulate_trades(
+            prices=close_prices,
+            signals=signals_series,
+            confidences=conf_series,
+            volatility=volatility,
+            threshold=thresh,
+            pt_mult=rl_model.labeler.pt_mult,
+            sl_mult=rl_model.labeler.sl_mult,
+            # FIXED: Use .max_holding instead of .max_holding_period
+            time_limit_bars=rl_model.labeler.max_holding
         )
         
-        if trade_log.empty: continue
+        if trade_log.empty:
+            continue
             
+        # Stats
         cum_ret = (1 + trade_log['ret']).prod() - 1
         win_rate = len(trade_log[trade_log['ret'] > 0]) / len(trade_log)
         
-        n_longs = len(trade_log[trade_log['side'] == 1])
-        n_shorts = len(trade_log[trade_log['side'] == -1])
-        ls_ratio = f"{n_longs}/{n_shorts}"
+        # Sharpe (approx)
+        if trade_log['ret'].std() > 0:
+            # Approx annualization: 252 days * 50 bars/day (rough estimate for imbalance bars)
+            sharpe = (trade_log['ret'].mean() / trade_log['ret'].std()) * np.sqrt(252 * 50) 
+        else:
+            sharpe = 0
+            
+        print(f"{thresh:<10} | {len(trade_log):<6} | {win_rate:<6.1%} | {cum_ret:<10.2%} | {sharpe:<8.2f} | {bh_return:<10.2%}")
         
-        print(f"{threshold:<10} | {len(trade_log):<6} | {win_rate:<6.1%} | {cum_ret:<8.2%} | {ls_ratio:<10}")
-        
-        if cum_ret > best_ret and len(trade_log) > 5:
-            best_ret = cum_ret
+        if cum_ret > best_net_ret:
+            best_net_ret = cum_ret
             best_res = {
-                "Symbol": symbol,
-                "Best_Thresh": threshold,
-                "Net Return": f"{cum_ret:.2%}",
-                "Trades": len(trade_log),
-                "Win Rate": f"{win_rate:.1%}",
-                "L_S": ls_ratio,
-                "Benchmark": f"{bh_return:.2%}"
+                "thresh": thresh,
+                "ret": cum_ret,
+                "trades": len(trade_log),
+                "win": win_rate
             }
 
     if best_res:
         print("\n" + "="*60)
-        print(f"RESULTS FOR {symbol}")
-        print(f"Benchmark (Buy & Hold): {best_res['Benchmark']}")
-        print(f"Bot Best Return:        {best_res['Net Return']} (Thresh: {best_res['Best_Thresh']})")
-        print(f"Trades (Long/Short):    {best_res['L_S']}")
+        print(f"BEST RESULT for {symbol}")
+        print(f"Threshold:    {best_res['thresh']}")
+        print(f"Net Return:   {best_res['ret']:.2%}")
+        print(f"Trades:       {best_res['trades']}")
+        print(f"Win Rate:     {best_res['win']:.1%}")
         print("="*60)
-        return best_res
-    
-    return None
+    else:
+        print(f"\n[{symbol}] No profitable trades found.")
 
 def main():
-    args = parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--symbol", help="Symbol to test")
+    args = parser.parse_args()
+    
     targets = [args.symbol.upper()] if args.symbol else SYMBOLS
     for sym in targets:
-        try:
-            run_simulation(sym)
-        except Exception as e:
-            logger.error(f"Error {sym}: {e}")
+        run_simulation(sym)
 
 if __name__ == "__main__":
     main()
